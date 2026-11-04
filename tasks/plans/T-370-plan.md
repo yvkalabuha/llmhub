@@ -413,19 +413,19 @@ class HttpInferenceBackend:
 - [x] A3 `examples/config.cloud.example.yaml` + тест «пример грузится».
 
 ### Поток B — загрузчик пода (sonnet; файлы: `infer-image/llmhub_infer/{plan,speed,fetch,progress}.py`, `tests/i_fakes.py`, `tests/test_i_plan.py`, `tests/test_i_speed.py`, `tests/test_i_fetch.py`)
-- B1 `tests/i_fakes.py` — `FakeWeightsServer` (ThreadingHTTPServer в потоке, порт 0, опционально TLS по сертификату из фикстуры `openssl`; без `openssl` — skip). Knobs:
+- [x] B1 `tests/i_fakes.py` — `FakeWeightsServer` (ThreadingHTTPServer в потоке, порт 0, опционально TLS по сертификату из фикстуры `openssl`; без `openssl` — skip). Knobs:
   - `files: dict[path, bytes]`, `range_support`, `ignore_range` (отвечает 200);
   - `status_for: dict[path, int]`, `fail_first_n`;
   - `throttle_bps`, `drop_after_bytes` (обрыв), `corrupt` (подмена байта);
   - `redirect_to` (другой хост);
   - журнал запросов (путь, заголовки `Range` и `Authorization`).
-- B2 `test_i_plan.py` → `plan.py`: валидный план; неизвестная версия, нет `model`, повтор id, путь с `..`, `http://` → `PlanError`; сообщение не содержит токена.
-- B3 `test_i_speed.py` → `speed.py` на фейковых часах:
+- [x] B2 `test_i_plan.py` → `plan.py`: валидный план; неизвестная версия, нет `model`, повтор id, путь с `..`, `http://` → `PlanError`; сообщение не содержит токена.
+- [x] B3 `test_i_speed.py` → `speed.py` на фейковых часах:
   - до grace — никогда не медленно;
   - после grace средняя за окно < порога → медленно;
   - всплеск после паузы считается по окну;
   - `min_bps = 0` → никогда.
-- B4 `test_i_fetch.py` → `fetch.py`, по одному тесту на сценарий (данные — 64–256 КиБ, без реальной сети):
+- [x] B4 `test_i_fetch.py` → `fetch.py`, по одному тесту на сценарий (данные — 64–256 КиБ, без реальной сети):
   1. happy path, один источник: sha совпал, маркер записан, `.part` удалён;
   2. **Range-докачка**: обрыв после N байт → повтор с `Range: bytes=N-`, итог верный, префикс перехеширован;
   3. сервер игнорирует Range (200) → файл начат заново, итог верный;
@@ -446,10 +446,10 @@ class HttpInferenceBackend:
       - в логах (caplog) нет токена;
   14. «прилипание» источника: после перехода на 2-м файле 1-й не запрашивается;
   15. `on_progress` монотонен по `done`, `total` = сумма размеров.
-- B5 `progress.py`: атомарная запись, права 0600, чтение битого файла → `None`.
+- [x] B5 `progress.py`: атомарная запись, права 0600, чтение битого файла → `None`.
 
 ### Поток C — фронт, супервизор, образ (sonnet; файлы: `infer-image/llmhub_infer/{front,supervisor,__main__}.py`, `infer-image/{Dockerfile,requirements.in,requirements.txt,.dockerignore}`, `tests/i_llama_fake.py`, `tests/test_i_front.py`, `tests/test_i_supervisor.py`, `tests/test_i_image.py`)
-- C1 `test_i_front.py` → `front.py` (httpx ASGITransport + фейковый upstream — ASGI-приложение):
+- [x] C1 `test_i_front.py` → `front.py` (httpx ASGITransport + фейковый upstream — ASGI-приложение):
   - `/ping` 204 без ключа;
   - `/health` без ключа 401, неверный ключ 401;
   - фазы loading → 503 с прогрессом; failed → 500; ok → 200 только при upstream `/health` 200; upstream 503 «Loading model» → 503 `phase=llama_load`;
@@ -457,17 +457,17 @@ class HttpInferenceBackend:
   - до READY → 503;
   - неизвестный путь → 404;
   - сравнение ключа через `hmac.compare_digest` (тест через monkeypatch-шпион).
-- C2 `test_i_supervisor.py` → `supervisor.py`:
+- [x] C2 `test_i_supervisor.py` → `supervisor.py`:
   - `read_env`: нет ключа, неверный транспорт, `direct` без сертификата → `EnvError` без значений;
   - `llama_argv` = бинарник + доп. аргументы + `-m … -md … --host 127.0.0.1 --port 8081`; запрещённые флаги отвергаются;
   - `child_env` без `LLMHUB_API_KEY`, `LLMHUB_WEIGHTS_TOKEN`, `LLMHUB_TLS_*`, `HF_TOKEN`;
   - сертификат и ключ записаны в `/run/llmhub` (tmp в тесте) с правами 0600.
-- C3 Интеграционный тест супервизора (`tests/i_llama_fake.py` — скрипт, слушает порт, `/health` 503 → 200 через 0,5 с; `llama_bin` подменяется только аргументом `main(..., llama_bin=...)`, не через env образа). Сценарии:
+- [x] C3 Интеграционный тест супервизора (`tests/i_llama_fake.py` — скрипт, слушает порт, `/health` 503 → 200 через 0,5 с; `llama_bin` подменяется только аргументом `main(..., llama_bin=...)`, не через env образа). Сценарии:
   - фейковый сервер весов → загрузка → запуск фейковой llama → `/health` 200;
   - llama завершилась → один перезапуск → второй выход → `failed`;
   - SIGTERM → дочерний процесс остановлен, код 0;
   - `direct`: uvicorn с TLS, клиент с `cadata=cert` подключается, с чужим CA — нет.
-- C4 Образ:
+- [x] C4 Образ:
   - `requirements.in` (starlette, uvicorn, httpx — версии из `uv.lock`);
   - `uv pip compile --generate-hashes --python-version 3.12 infer-image/requirements.in -o infer-image/requirements.txt` (сеть PyPI допустима, платного нет);
   - `Dockerfile`:
@@ -488,7 +488,7 @@ class HttpInferenceBackend:
   - есть `HEALTHCHECK NONE`, `ENTRYPOINT` модуля;
   - `requirements.txt` содержит `--hash=` для каждой строки;
   - версии в `requirements.txt` = версиям в `uv.lock`.
-- C5 Ручная проверка (не pytest; только если есть docker, вывод — в журнал задачи):
+- [x] C5 Ручная проверка (не pytest; только если есть docker, вывод — в журнал задачи):
   1. `docker run --rm -i hadolint/hadolint:v2.12.0 < infer-image/Dockerfile` — замечаний уровня warning нет или каждое обосновано в Dockerfile;
   2. `nice -n 10 docker build -t llmhub-infer:dev infer-image/` (~2,5 ГБ базы, push запрещён);
   3. `docker run --rm --entrypoint /app/llama-server llmhub-infer:dev --help | grep -E 'draft-mtp|spec-draft-n-max'` — подтверждает флаги MTP в b12063; если флагов нет → стоп, вопрос координатору (запасной вариант R10);
@@ -496,8 +496,8 @@ class HttpInferenceBackend:
 
   GPU локально нет: llama-server в контейнере не запускается — это проверка этапа 4.
 
-### Поток D — токены, валидатор, nginx (sonnet; файлы: `src/llmhub/weights/{tokens,auth_app}.py`, `deploy/{nginx-weights.conf,gen-weights-cert.sh}`, `tests/test_w_tokens.py`, `tests/test_w_auth_app.py`, `tests/test_w_nginx_conf.py`)
-- D1 `test_w_tokens.py` → `tokens.py`:
+### Поток D — токены, валидатор, nginx (sonnet; файлы: `src/llmhub/weights/{tokens,auth_app}.py`, `deploy/{nginx-weights.conf,gen_weights_cert.py}`, `tests/test_w_tokens.py`, `tests/test_w_auth_app.py`, `tests/test_w_nginx_conf.py`)
+- [x] D1 `test_w_tokens.py` → `tokens.py`:
   - выдача детерминирована;
   - верный токен в LOADING_MODEL → OK;
   - **повтор после READY** (и после ERROR, STOPPING, STOPPED) → REVOKED;
@@ -509,20 +509,20 @@ class HttpInferenceBackend:
   - путь не из `allowed` или с `..` → PATH;
   - сравнение через `hmac.compare_digest`;
   - `token_expiry` = created_at + сумма трёх таймаутов.
-- D2 `test_w_auth_app.py` → `auth_app.py` на временной БД со схемой T-368 (`persistence.db`):
+- [x] D2 `test_w_auth_app.py` → `auth_app.py` на временной БД со схемой T-368 (`persistence.db`):
   - 204, 401, 403 для сценариев D1;
   - БД открыта только на чтение (запись падает);
   - заблокированная БД → 503;
   - caplog: есть `op_id` и verdict, нет токена;
   - `main` читает `weights.auth_listen` и не стартует без `LLMHUB_WEIGHTS_SECRET`.
-- D3 `deploy/gen_weights_cert.py` + тест (без skip): сертификат в tmp, разбор через `cryptography` показывает IP SAN, CA:FALSE, serverAuth; ключ 0600; Python-клиент с `cadata=cert` подключается к тестовому TLS-серверу по `127.0.0.1` (как в R4).
-- D4 `test_w_nginx_conf.py`:
+- [x] D3 `deploy/gen_weights_cert.py` + тест (без skip): сертификат в tmp, разбор через `cryptography` показывает IP SAN, CA:FALSE, serverAuth; ключ 0600; Python-клиент с `cadata=cert` подключается к тестовому TLS-серверу по `127.0.0.1` (как в R4).
+- [x] D4 `test_w_nginx_conf.py`:
   - статика шаблона: нет `0.0.0.0`, нет `10.8.0.1`, `listen` с плейсхолдером IP;
   - в `log_format` нет `$request`, `$args`, `$http_authorization`, `$request_uri`;
   - есть `limit_conn w_all __SEGMENTS__`, `limit_conn w_op __SEGMENTS__`, второй лог `acct`, `limit_rate`, `auth_request`, `disable_symlinks on`, `limit_except GET`;
   - regex `location` отвергает `../x.gguf`, `a/../../etc/passwd`, `x.txt`, `/w/<не hex>/…` (проверка самим regex через `re` с переводом PCRE-синтаксиса);
   - `@pytest.mark.docker` (skip без docker или без локального образа `nginx:1.25-alpine` — он уже есть локально, тест не тянет образы): рендер шаблона (IP 127.0.0.1, сертификат из D3), `docker run --rm -v … nginx:1.25-alpine nginx -t -c /etc/nginx/weights.conf` → код 0.
-- D5 (**обязателен при наличии docker**, `@pytest.mark.docker`; без docker — причина в журнал; раздел 2a) e2e: контейнер nginx (`--network host`, порт из свободных) + `auth_app` uvicorn на хосте + каталог с маленькими `.gguf`. Сценарии:
+- [x] D5 (**обязателен при наличии docker**, `@pytest.mark.docker`; без docker — причина в журнал; раздел 2a) e2e: контейнер nginx (`--network host`, порт из свободных) + `auth_app` uvicorn на хосте + каталог с маленькими `.gguf`. Сценарии:
   - `Fetcher` (поток B) скачивает через nginx с токеном;
   - после перевода инстанса в READY та же докачка получает 403 → failover на фейковый «hf»;
   - второе одновременное соединение (при `__SEGMENTS__`=1) → 503;
@@ -670,5 +670,5 @@ class HttpInferenceBackend:
 - Тесты задачи (`tests/test_w_*.py`, `tests/test_i_*.py`, `tests/test_g_*.py`) и регрессия E5 зелёные; `-m docker` зелёные или пропущены с причиной в журнале.
 - `uv run ruff check` и `uv run pyright` по всему дереву чисто.
 - Каждый сценарий B4 (1–15), D1, C1, G4 — отдельный тест; чек-лист раздела 9 закрыт.
-- C5 выполнен или в журнале указана причина пропуска (нет docker или сети).
+- [x] C5 выполнен или в журнале указана причина пропуска (нет docker или сети).
 - Нет открытых blocker/major у ревьюера; ≤ 3 раунда. Сложные части — загрузчик (B4), токены + провижининг (D1, E4, E5) и отображение ошибок `run` (G4) — по 2 независимых цикла ревью (логика и гонки; сбои и перезапуски).
