@@ -94,7 +94,8 @@ class Submitter:
     # --- helpers ---------------------------------------------------------------
     def _check_client_limit(self, principal: Principal, opts: RequestOptions) -> None:
         """SEC-L4: `clients.<id>.max_active_jobs` queued+running jobs per client -> 429.
-        A repeat of an existing Idempotency-Key is never limited (it creates nothing)."""
+        A repeat of an existing Idempotency-Key is not limited when it returns that job (it
+        creates nothing); a retry of a retryable failure creates a job and is limited."""
         cfg = self.rt.cfg
         client = cfg.clients.get(principal.client_id)
         if client is None:
@@ -106,11 +107,20 @@ class Submitter:
         ).fetchone()[0])  # fmt: skip
         if active < client.max_active_jobs:
             return
-        if opts.idem_key is not None and self.rt.conn.execute(
-            "SELECT 1 FROM jobs WHERE client_id=? AND idem_key=?",
-            (principal.client_id, opts.idem_key),
-        ).fetchone() is not None:  # fmt: skip
-            return
+        if opts.idem_key is not None:
+            row: sqlite3.Row | None = self.rt.conn.execute(
+                "SELECT id, status, error_code, fallback_reason, idem_expires_at FROM jobs"
+                " WHERE client_id=? AND idem_key=?",
+                (principal.client_id, opts.idem_key),
+            ).fetchone()
+            now = self.rt.clock.now()
+            expired = row is not None and row["idem_expires_at"] is not None and (
+                float(row["idem_expires_at"]) <= now
+            )
+            # REV2-4: a retryable failed job (or an expired key) makes `submit` create a NEW
+            # job, so only a repeat that returns the existing job bypasses the limit
+            if row is not None and not expired and not _retryable_failure(row):
+                return
         raise ApiError(
             ErrorCode.RATE_LIMITED,
             f"too many active jobs for this client (limit {client.max_active_jobs})",

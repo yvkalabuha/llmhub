@@ -229,7 +229,7 @@ class LocalBackendClient:
             latency_s=latency,
         )
 
-    async def _get(self, path: str) -> httpx.Response | None:
+    async def _get_once(self, path: str) -> httpx.Response | None:
         try:
             return await bounded(
                 self._clock,
@@ -238,6 +238,14 @@ class LocalBackendClient:
             )
         except (TimeoutError, httpx.HTTPError):
             return None
+
+    async def _get(self, path: str) -> httpx.Response | None:
+        """One GET; a 401 re-reads a rotated llama key (rate-limited) and retries once (REV2-1:
+        llama-server closes /slots with --api-key, so probes must recover by themselves)."""
+        resp = await self._get_once(path)
+        if resp is not None and resp.status_code == 401 and self._may_reload() and self._reload_key():
+            resp = await self._get_once(path)
+        return resp
 
     async def probe(self) -> ProbeResult:
         """One GET: never a completion or any other method (F8)."""
@@ -255,10 +263,12 @@ class LocalBackendClient:
             elif resp.status_code == 200:
                 try:
                     slots = resp.json()
-                    busy = sum(1 for s in slots if isinstance(s, dict) and s.get("is_processing"))
-                    return ProbeResult(True, busy, len(slots), 200)
-                except (ValueError, TypeError):
+                except ValueError:
                     return ProbeResult(False, 0, None, 200)
+                if not isinstance(slots, list):  # REV2-2: {"error": ...} or a string
+                    return ProbeResult(False, 0, None, 200)
+                busy = sum(1 for s in slots if isinstance(s, dict) and s.get("is_processing"))
+                return ProbeResult(True, busy, len(slots), 200)
             else:
                 return ProbeResult(False, 0, None, resp.status_code)
         resp = await self._get("/health")

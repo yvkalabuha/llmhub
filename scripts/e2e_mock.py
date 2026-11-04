@@ -15,8 +15,9 @@ Phases:
   create -> renew -> close, two long cloud tasks saved to `--state` for the restart.
 - `post-restart`: the saved tasks still exist and reach `completed`; no orphan/unknown
   resource incidents.
-- `kill`: client prewarm lease -> instance up -> admin kill -> 0 live instances within 60 s ->
-  resume (an admin hold keeps a live GPU warm but never launches one).
+- `kill`: client prewarm lease -> instance up -> admin kill (report `completed`, no
+  `remaining`) -> 0 live and 0 STOPPING/PENDING_DELETE/LEAKED rows within 60 s, no
+  `kill_incomplete`/`leak` incidents -> resume (an admin hold keeps a live GPU warm but never launches one).
 - `prewarm` / `close-lease --lease ID`: S10w helper (a BOOTING Mock instance for the probe).
 
 Keys are read from files (first line) and never printed; the report (stdout, JSON) carries
@@ -233,6 +234,25 @@ def _live_instances(api: Api) -> int | None:
                and p["instance"].get("state") not in ("STOPPED", None))  # fmt: skip
 
 
+def _teardown_rows(api: Api) -> int | None:
+    """STOPPING / PENDING_DELETE / LEAKED rows (a resource may still exist); None = unknown."""
+    r = api.admin("GET", "/admin/status")
+    if r.status_code != 200:
+        return None
+    rows = r.json().get("teardown")
+    if not isinstance(rows, dict):
+        return None
+    return sum(int(n) for n in rows.values())
+
+
+def _kill_incidents(api: Api) -> list[str] | None:
+    r = api.admin("GET", "/admin/status")
+    if r.status_code != 200:
+        return None
+    kinds = [str(i.get("kind")) for i in r.json().get("incidents", [])]
+    return [k for k in kinds if k == "kill_incomplete" or "leak" in k]
+
+
 def _prewarm(api: Api, a: argparse.Namespace, rep: Report) -> str | None:
     """A client prewarm lease launches a GPU (an admin hold only keeps a live one warm)."""
     r = api.req("POST", "/v1/leases", body={"model": a.cloud_model, "ttl_s": 600, "prewarm": True})
@@ -246,10 +266,29 @@ def phase_kill(api: Api, a: argparse.Namespace, rep: Report) -> None:
     rep.add("instance_up", up is not None)
     t0 = time.monotonic()
     r = api.admin("POST", "/admin/kill", {"reason": "e2e"})
+    report = r.json() if r.status_code == 200 else {}
     rep.add("kill_call", r.status_code == 200, status=r.status_code)
-    gone = wait_until(lambda: _live_instances(api) == 0, 60, step=0.5)
+    # REV2-3: the kill report itself must confirm zero resources (destroy acknowledged)
+    remaining = report.get("remaining")
+    rep.add("kill_completed", report.get("completed") is True and remaining == [],
+            completed=report.get("completed"), remaining=remaining)  # fmt: skip
+    # live rows AND rows still being torn down (PENDING_DELETE / LEAKED are hidden from pools)
+    unknown = False
+
+    def zero() -> bool:
+        nonlocal unknown
+        rows = _teardown_rows(api)
+        unknown = rows is None  # an API without the teardown view cannot prove zero
+        return unknown or (rows == 0 and _live_instances(api) == 0)
+
+    gone = wait_until(zero, 60, step=0.5)
+    if unknown:
+        gone = None
     elapsed = round(time.monotonic() - t0, 1)
-    rep.add("zero_resources_le_60s", gone is not None and elapsed <= 60, seconds=elapsed)
+    rep.add("zero_resources_le_60s", gone is not None and elapsed <= 60, seconds=elapsed,
+            teardown_rows=_teardown_rows(api))  # fmt: skip
+    bad = _kill_incidents(api)
+    rep.add("no_kill_incidents", bad == [], incidents=bad)
     r = api.admin("POST", "/admin/resume", {})
     rep.add("resume", r.status_code == 200 and r.json().get("halted") is False,
             status=r.status_code)  # fmt: skip

@@ -150,6 +150,7 @@ def test_log_formats_have_no_secrets() -> None:
 def test_required_directives() -> None:
     for need in (
         "limit_conn w_all __MAX_DL__;",
+        "limit_conn_zone $server_port zone=w_all:1m;",
         "limit_conn w_op __SEGMENTS__;",
         "limit_rate __RATE__;",
         "auth_request /_auth;",
@@ -326,7 +327,7 @@ class Rig:
 def rig(tmp_path: Path) -> Iterator[Callable[..., Rig]]:
     stops: list[Callable[[], None]] = []
 
-    def make(rate: str = "80m", segments: int = 1) -> Rig:
+    def make(rate: str = "80m", segments: int = 1, max_dl: int | None = None) -> Rig:
         r = Rig()
         w = _workdir(tmp_path)
         r.w = w
@@ -371,7 +372,8 @@ def rig(tmp_path: Path) -> Iterator[Callable[..., Rig]]:
         # nginx
         r.port = _free_port()
         (w / "weights.conf").write_text(
-            _render("127.0.0.1", r.port, rate=rate, segments=segments, auth=f"127.0.0.1:{aport}")
+            _render("127.0.0.1", r.port, rate=rate, segments=segments, auth=f"127.0.0.1:{aport}",
+                    max_dl=max_dl)
         )
         name = f"llmhub-test-w-{uuid.uuid4().hex[:8]}"
         subprocess.run(
@@ -504,6 +506,21 @@ def test_e2e_two_segments_allow_two_connections(rig: Callable[..., Rig]) -> None
                     assert (
                         c3.get(f"/w/{OP}/qwen/draft.gguf", headers=r.headers()).status_code == 503
                     )
+
+
+@docker
+@needs_docker
+def test_e2e_global_cap_w_all_limits_below_per_op(rig: Callable[..., Rig]) -> None:
+    """SEC-D3 on the real template: w_op allows 2, w_all (__MAX_DL__ = 1) refuses the 2nd
+    concurrent download. With the old `$server_name` key (empty) the 2nd one got 200."""
+    r = rig(rate="1k", segments=2, max_dl=1)
+    with r.client() as c1, r.client() as c2:  # noqa: SIM117
+        with c1.stream("GET", f"/w/{OP}/qwen/big.gguf", headers=r.headers()) as a:
+            assert a.status_code == 200
+            it = a.iter_raw(1024)
+            next(it)
+            second = c2.get(f"/w/{OP}/qwen/draft.gguf", headers=r.headers())
+            assert second.status_code == 503
 
 
 @docker

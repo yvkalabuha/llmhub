@@ -1,6 +1,6 @@
 # Runbook llmhub (сервер 65.109.95.35)
 
-> TL;DR: Как эксплуатировать llmhub в Docker на 65.109.95.35. Работают четыре контейнера `llmhub-*` (все `--network host`); журналы лежат в journald, CLI вызывается через `docker exec -i … --admin-key-file /dev/stdin`. Здесь собраны инциденты (`weights_config`, `db_corrupt`, код 75, KILL, `tls_pin_mismatch`, `low_memory`), бэкап и восстановление, ротация ключей и сертификата, обновление и откат (S14). Шаги установки — `deploy/README.md` и план T-371 §6.
+> TL;DR: Как эксплуатировать llmhub в Docker на 65.109.95.35 (релиз 0.2.1, конфиг в каталоге `/etc/llmhub/conf/`). Работают четыре контейнера `llmhub-*` (все `--network host`); журналы лежат в journald, CLI вызывается через `docker exec -i … --admin-key-file /dev/stdin`. Здесь собраны инциденты (`weights_config`, `db_corrupt`, код 75, KILL, `tls_pin_mismatch`, `low_memory`), бэкап и восстановление, ротация ключей и сертификата, обновление и откат (S14). Шаги установки — `deploy/README.md` и план T-371 §6.
 
 ## 1. Что где
 | Что | Где |
@@ -9,9 +9,9 @@
 | reaper (сторож облака) | `llmhub-reaper`; heartbeat `/var/lib/llmhub/reaper.hb` |
 | валидатор токенов весов | `llmhub-weights-auth`, `127.0.0.1:8096` |
 | nginx весов | `llmhub-weights-nginx`, `65.109.95.35:9443` (HTTPS, только `.gguf`, 80m, 1 загрузка) |
-| конфиг | `/etc/llmhub/config.yaml` (0640 `root:llmhub`); шаблон — `deploy/config.example.yaml` |
+| конфиг | `/etc/llmhub/conf/config.yaml` (0640 `root:llmhub`, каталог `conf/` 0750 `root:llmhub`); шаблон — `deploy/config.example.yaml`. Контейнеры монтируют **каталог** `conf/` (SEC-D2): после `mv` внутри него работающий контейнер видит новый файл. Копии прежних версий — `/etc/llmhub/config.yaml.bak-<ts>` (вне монтирования) |
 | секреты | `/etc/llmhub/secrets/{label,instance,weights}` (0640), `providers` (0600, пустой); `/etc/llmhub/admin.key` (0600) |
-| данные | `/var/lib/llmhub` (`state.db*` 0640, `backup/`), `/var/lib/llmhub-weights-auth` |
+| данные | `/var/lib/llmhub` (`state.db*` 0640, `backup/` — единственный каталог копий, §4), `/var/lib/llmhub-weights-auth` |
 | учёт весов | `/var/log/llmhub/weights-acct.log` (0640 `llmhub-wnginx:llmhub`), `/etc/logrotate.d/llmhub-acct` |
 | релизы | `/root/llmhub-dist/<ver>/` (`image.id`, `nginx.id`, tar-образы, `llmhub-deploy.sh`, `run-args/`) |
 | маркеры шагов | `/var/lib/llmhub-deploy/` (`hashes.txt` — только sha256 ключей, `preflight/baseline`) |
@@ -20,6 +20,7 @@
 
 ## 2. Состояние
 - `docker ps --filter name=llmhub- --format '{{.Names}} {{.Status}}'` показывает `healthy` у всех четырёх.
+- Перед шагами с `daemon-reload` (`s6`, `s6 rollback`, `s14`) скрипт сам проверяет `systemctl show llama-server* -p NeedDaemonReload` и останавливается при `yes` (I1): правки юнитов llama, не применённые их владельцем, не активируются побочно.
 - Журналы: `journalctl CONTAINER_NAME=llmhub-api -n 100` (так же для `llmhub-reaper`, `llmhub-weights-auth`, `llmhub-weights-nginx`). `docker logs` не используется: у контейнеров log driver journald, ротацию делает journald.
 - CLI (ключ идёт через stdin, в argv и env не попадает):
   `docker exec -i llmhub-api python -m llmhub status --admin-key-file /dev/stdin < /etc/llmhub/admin.key`
@@ -41,30 +42,44 @@
 | reaper `unhealthy` / выход 70 | Самосторож: проход не завершился за `max(3×loop, 45+2×loop)` с. Docker перезапускает контейнер. Если повторяется — смотреть журнал (зависший вызов провайдера, блокировка БД) |
 
 ## 4. Бэкап и восстановление
-- Ежедневно `llmhub-backup.timer` запускает `llmhub-backup.service`, а тот выполняет `docker exec llmhub-api python -m llmhub backup … --keep 14`. Копия делается через SQLite online backup в `*.tmp`, проверяется `integrity_check`, файлы получают права 0640. Результат: `/var/lib/llmhub/backup/state-<UTC>.db`. Вручную: `systemctl start llmhub-backup.service`.
-- Восстановление:
-  1. `docker stop llmhub-api llmhub-reaper` (только эти два).
-  2. Сохранить текущие `state.db*` рядом (`mv state.db state.db.before-restore-<ts>`, так же `-wal`/`-shm`).
-  3. `install -m 0640 -o llmhub -g llmhub backup/state-<ts>.db /var/lib/llmhub/state.db`.
-  4. `docker start llmhub-api llmhub-reaper`; проверить `status` и `healthy`.
-- Облачные ресурсы, созданные после времени копии, контроллер найдёт как orphan по HMAC-метке и удалит (reconcile при старте).
+- Все копии лежат в одном каталоге `/var/lib/llmhub/backup/` (REV2-7), у каждого источника свой префикс и своя ротация:
+  - `state-<UTC>.db` — `llmhub-backup.timer` (ежедневно) → `llmhub-backup.service` → `docker exec llmhub-api python -m llmhub backup … --keep 14`. Online backup в `*.tmp`, `integrity_check`, права 0640. Вручную: `systemctl start llmhub-backup.service`.
+  - `controller-<UTC>.db` — собственная суточная копия контроллера (keep 7), делается без таймера.
+  - Обе копии в режиме `journal_mode=DELETE` (REV2-5): если открыть копию для осмотра, рядом не появятся `-wal`/`-shm`.
+- Восстановление. Строка в БД — единственное доказательство, что облачный ресурс наш. Если после времени копии создавались ресурсы, у них верная HMAC-метка, но строки в копии нет. Контроллер такой ресурс **не** удаляет: он записывает инцидент `unknown_owned_resource` (critical) и ставит **HALT**. reaper удалит ресурс примерно через 30 мин (REV2-6). Поэтому:
+  1. Перед восстановлением выполнить `kill` (через API, ждёт до 60 с) и убедиться, что в `status` `teardown` пуст, а `pools.*.instance` равен `null`. Тогда облачных ресурсов нет. Если API недоступен — `kill --file`, затем дождаться reaper.
+  2. `docker stop llmhub-api llmhub-reaper` (только эти два).
+  3. Сохранить текущие `state.db*` рядом (`mv state.db state.db.before-restore-<ts>`, так же `-wal`/`-shm`).
+  4. `install -m 0640 -o llmhub -g llmhub backup/state-<ts>.db /var/lib/llmhub/state.db` (или `controller-<ts>.db`).
+  5. `docker start llmhub-api llmhub-reaper`; проверить `status` и `healthy`.
+  6. Если `kill` в шаге 1 не выполнялся (или ресурс всё же нашёлся), ждать HALT с `unknown_owned_resource`. Разобрать инцидент: ресурс наш и создан после копии → дождаться удаления reaper'ом или удалить через `kill`. Только после этого — `resume`. Если перед восстановлением был `kill --file`, сначала удалить `/var/lib/llmhub/KILL`.
 
 ## 5. Ротация ключей и секретов
-- **admin**: `python -m llmhub keys new --name admin --out <новый файл>` через `docker run --rm --network none --user 0 -v /etc/llmhub/keys:/out <image id> …`. Новый sha256 записать в `/var/lib/llmhub-deploy/hashes.txt` (строка `admin`), затем `llmhub-deploy.sh s5 apply`. Новый admin-ключ начинает действовать после `reload-clients` (он применяет и `admin_key_sha256`) или `docker restart llmhub-api`. Старый файл удалить `shred -u`.
-- **клиенты** (`voicebot`, `gamedev`, `agents`): удалить `/etc/llmhub/keys/<n>.key`, выполнить `llmhub-deploy.sh s4 apply` (создаёт недостающие ключи и обновляет хеши), затем `s5 apply` и `reload-clients`. Ключ передать клиенту файлом 0600 (способ — Q6) и на сервере `shred -u`.
+Конфиг лежит в смонтированном каталоге `/etc/llmhub/conf/` (SEC-D2). Если `s5 apply` (а также `s8b`, `s10x`) изменил `config.yaml`, скрипт сам перезапускает `llmhub-api`, `llmhub-reaper` и `llmhub-weights-auth` (те, что существуют) и ждёт `healthy`. `reload-clients` нужен только при правке конфига вручную.
+- **admin**: `shred -u /etc/llmhub/admin.key`, затем `llmhub-deploy.sh s4 apply` (создаёт недостающий ключ и пишет его sha256 в `/var/lib/llmhub-deploy/hashes.txt`), затем `s5 apply` (новый `admin_key_sha256`, перезапуск api). Проверка: `admin_call status` новым ключом проходит, старым — 401.
+- **клиенты** (`voicebot`, `gamedev`, `agents`): сохранить старый ключ для проверки (`install -m 0600 /etc/llmhub/keys/<n>.key /root/<n>.old`), удалить `/etc/llmhub/keys/<n>.key`, выполнить `llmhub-deploy.sh s4 apply` (новый ключ и хеши), затем `s5 apply` (конфиг меняется → api перезапускается). **Проверить, что работающий API отверг старый ключ**:
+  `docker exec -i llmhub-api python -c "import sys, httpx; k = sys.stdin.readline().strip(); print(httpx.get('http://10.8.0.1:8095/v1/models', headers={'Authorization': 'Bearer ' + k}).status_code)" </root/<n>.old` → `401`, с новым ключом → `200`. Затем `shred -u /root/<n>.old`. Новый ключ передать клиенту файлом 0600 (способ — Q6) и на сервере `shred -u`.
+- `s10x` (удаление `e2e`) делает такую проверку сам: до `shred` ключа он требует `401` от работающего API, а `s10x check` спрашивает `client list` у API, а не только файл.
 - **секреты `label`/`instance`/`weights`** без отдельного решения не ротировать: `label` подписывает метки облачных ресурсов (старые ресурсы перестанут распознаваться), `instance` выводит ключи и TLS подов.
 
 ## 6. Сертификат весов и порт 9443
-- Перевыпуск: `llmhub-deploy.sh s8a rollback && s8a apply` (новый fingerprint в `/var/lib/llmhub-deploy/weights.fp`), затем `s8b apply` (api перечитает `ca_pem_file`) и `docker restart llmhub-weights-nginx`.
+- Перевыпуск: `llmhub-deploy.sh s8a rollback && s8a apply` (новый fingerprint в `/var/lib/llmhub-deploy/weights.fp`), затем `docker restart llmhub-api llmhub-weights-nginx`. Путь `ca_pem_file` в конфиге не меняется, поэтому `s8b apply` конфиг не перепишет и api сам не перезапустит (I3); api читает `ca_pem_file` только при старте.
 - Закрыть порт: `llmhub-deploy.sh s9 rollback` (удаляет только правило `llmhub weights`). Поды перейдут на HF.
-- Проверка снаружи (F9): `/w/000000000000/qwen/x.gguf` без токена должен отвечать `401` (путь совпадает с regex location). Путь вне regex отвечает `404`, TLS 1.2 не принимается. Это делает `s9 check`.
+- Проверка (F9): `/w/000000000000/qwen/x.gguf` без токена должен отвечать `401` (путь совпадает с regex location). Путь вне regex отвечает `404`, TLS 1.2 не принимается. `s9 check` проверяет это **с самого сервера**, то есть через `lo`, и правило ufw на `enp9s0` при этом не участвует (L7).
+- **S9 с внешнего хоста — обязательно** (рабочая станция без VPN или любой внешний хост; нужен только публичный `weights-cert.pem`):
+  ```
+  curl -s -o /dev/null -w '%{http_code}\n' --cacert weights-cert.pem https://65.109.95.35:9443/w/000000000000/qwen/x.gguf   # 401
+  curl -s -o /dev/null -w '%{http_code}\n' --cacert weights-cert.pem https://65.109.95.35:9443/w/000000000000/bench/run.py  # 404
+  curl -s -o /dev/null --cacert weights-cert.pem --tls-max 1.2 https://65.109.95.35:9443/ ; echo "exit $?"                   # exit != 0
+  timeout 5 bash -c '</dev/tcp/65.109.95.35/8095' ; echo "exit $?"                                                            # != 0 (API не виден снаружи)
+  ```
 
 ## 7. Обновление релиза и откат
 1. На рабочей станции: `nice -n 10 deploy/docker/build.sh` → `dist/<ver>/`. Скопировать каталог в `/root/llmhub-dist/<ver>/` и выполнить `llmhub-deploy.sh s1 check` (SHA256SUMS).
-2. `s3 apply` нового релиза (`docker load`, сверка Id с `image.id`).
+2. `s3 apply` нового релиза (`docker load`, сверка Id тегов `llmhub:<ver>` и `llmhub-nginx:<ver>` с `image.id`/`nginx.id`). `s3 rollback` снимает только эти теги (SEC-D5): Id нашего nginx совпадает с upstream `nginx:1.27-alpine`, и образ под чужим тегом остаётся.
 3. Контейнеры по новому Id: `s6 rollback` → `s6 apply` из нового каталога (данные остаются), для окна 2 так же `s8c`.
 4. Откат: те же `s6`/`s8c`, но скриптом из `/root/llmhub-dist/<prev>/` (в его `image.id` старый Id).
-- **Полный откат (S14)**: `llmhub-deploy.sh s14 apply`. Удаляются только `llmhub-*` контейнеры, оба правила ufw, таймер бэкапа и logrotate. `/etc/llmhub`, `/var/lib/llmhub*` и `/var/log/llmhub` архивируются в `/root/llmhub-rollback-<ts>.tgz` (0600) и **удаляются**. Затем удаляются образы и пользователи. В конце выполняется `s11`.
+- **Полный откат (S14)**: `llmhub-deploy.sh s14 apply`. Удаляются только `llmhub-*` контейнеры, правила ufw, которые добавил сам скрипт (`/var/lib/llmhub-deploy/ufw-*.added`, L1), таймер бэкапа и logrotate. `/etc/llmhub`, `/var/lib/llmhub*` и `/var/log/llmhub` архивируются в `/root/llmhub-rollback-<ts>.tgz` (0600) и **удаляются**. Затем снимаются наши теги образов и удаляются пользователи и группы, записанные в `s2.created` (L2). В конце выполняется `s11`: новые слушатели на 0.0.0.0/`[::]` и чужие адреса на 8095/8096/9443 считаются ошибкой (L3).
 - **Переустановка после S14** (F13): `s2 apply` создаёт пользователей с теми же фиксированными uid/gid 64100–64102, поэтому владельцы файлов из архива остаются верными. Восстановление: `tar xzf … -C /`, затем `s2`…`s9 apply`.
 
 ## 8. Перед T-372 (реальный провайдер)

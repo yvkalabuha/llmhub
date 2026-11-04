@@ -105,9 +105,19 @@ def test_run_args_hardening(name: str) -> None:
             assert v.endswith(":ro"), v
         if src == "/etc/llama/api-key":
             assert name == "llmhub-api" and v.endswith(":ro")
-        if src.startswith("/etc/llmhub/secrets/") or src == "/etc/llmhub/config.yaml":
+        if src.startswith(("/etc/llmhub/secrets/", "/etc/llmhub/conf")):
             assert v.endswith(":ro"), v
         assert not src.startswith("/var/run/docker.sock")
+
+
+@pytest.mark.parametrize("name", NAMES[:3])
+def test_config_is_mounted_as_directory(name: str) -> None:
+    """SEC-D2: a single-file bind mount keeps the old inode after `mv`; the directory mount
+    shows a renamed config.yaml to the running container."""
+    args = _lines(ARGS / f"{name}.args")
+    assert "/etc/llmhub/conf:/etc/llmhub/conf:ro" in _pairs(args, "-v")
+    assert not any(v.startswith("/etc/llmhub/config.yaml") for v in _pairs(args, "-v"))
+    assert _pairs(args, "--config") == ["/etc/llmhub/conf/config.yaml"]
 
 
 def test_llama_key_only_in_api() -> None:
@@ -143,7 +153,7 @@ def test_api_command_has_no_docs_and_image_by_id() -> None:
     args = _lines(ARGS / "llmhub-api.args")
     i = args.index("@IMAGE@")
     assert args[i + 1 :] == ["python", "-m", "llmhub", "serve", "--config",
-                             "/etc/llmhub/config.yaml", "--no-docs"]  # fmt: skip
+                             "/etc/llmhub/conf/config.yaml", "--no-docs"]  # fmt: skip
     reaper = _lines(ARGS / "llmhub-reaper.args")
     assert "--heartbeat" in reaper and "--loop" in reaper
 
@@ -229,7 +239,7 @@ def test_every_step_has_check_apply_rollback() -> None:
 
 def test_script_uses_fixed_ids_and_rules() -> None:
     for need in ("UID_API=64100", "UID_NGINX=64101", "UID_WAUTH=64102",
-                 "comment 'llmhub api'", "comment 'llmhub weights'",
+                 "ufw_add api 'llmhub api'", "ufw_add weights 'llmhub weights'",
                  "/w/000000000000/qwen/x.gguf", "shred -u"):  # fmt: skip
         assert need in CODE, need
 
@@ -262,5 +272,6 @@ def test_build_script() -> None:
     text = (DOCKER / "build.sh").read_text()
     subprocess.run(["bash", "-n", str(DOCKER / "build.sh")], check=True)
     for need in ("--pull=false", "--require-hashes", "--only-binary :all:", "uv export --frozen",
-                 "docker save", "image.id", "SHA256SUMS"):  # fmt: skip
+                 "docker save", "image.id", "SHA256SUMS",
+                 'chmod -R u=rwX,go=rX "$STAGE/deploy"'):  # fmt: skip
         assert need in text, need

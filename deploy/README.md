@@ -20,9 +20,9 @@
 ## Контейнеры
 | Имя | Пользователь | Слушает | Секреты (ro) | Прочие монтирования |
 |---|---|---|---|---|
-| `llmhub-api` | 64100 + группы 998 (ключ llama), 64102 (секрет весов) | `10.8.0.1:8095` | `label`, `instance`, `weights`, `providers` | config ro, `/etc/llama/api-key` ro, `weights-pub` ro, `/var/lib/llmhub` rw |
-| `llmhub-reaper` | 64100 | — | `label` | config ro, `/var/lib/llmhub` rw (heartbeat `reaper.hb`) |
-| `llmhub-weights-auth` | 64102 + группа 64100 | `127.0.0.1:8096` | `weights` | config ro, `/var/lib/llmhub` ro, `/var/lib/llmhub-weights-auth` rw, `/var/log/llmhub` ro, `weights-pub` ro |
+| `llmhub-api` | 64100 + группы 998 (ключ llama), 64102 (секрет весов) | `10.8.0.1:8095` | `label`, `instance`, `weights`, `providers` | `/etc/llmhub/conf` ro, `/etc/llama/api-key` ro, `weights-pub` ro, `/var/lib/llmhub` rw |
+| `llmhub-reaper` | 64100 | — | `label` | `/etc/llmhub/conf` ro, `/var/lib/llmhub` rw (heartbeat `reaper.hb`) |
+| `llmhub-weights-auth` | 64102 + группа 64100 | `127.0.0.1:8096` | `weights` | `/etc/llmhub/conf` ro, `/var/lib/llmhub` ro, `/var/lib/llmhub-weights-auth` rw, `/var/log/llmhub` ro, `weights-pub` ro |
 | `llmhub-weights-nginx` | 64101 + группа 64100 | `65.109.95.35:9443` | — | `nginx-weights.conf` ro, `/etc/llmhub/weights` ro (cert + key 0600), `/opt/models` ro, `/var/log/llmhub` rw |
 
 Общие флаги: `--network host` (`-p` обходит ufw — запрещено тестом), `--read-only`, `--tmpfs /tmp`, `--cap-drop ALL`, `no-new-privileges`, `--pids-limit 256`, `--memory`, `--restart unless-stopped`, `--log-driver journald`, healthcheck. Docker не перезапускает unhealthy-контейнер, поэтому у reaper есть самосторож: если проход завишет, процесс завершается с кодом 70.
@@ -30,7 +30,8 @@
 ## Владельцы и права на хосте
 | Путь | Владелец / права |
 |---|---|
-| `/etc/llmhub` | `root:root 0755`; `config.yaml` 0640 `root:llmhub` |
+| `/etc/llmhub` | `root:root 0755`; `config.yaml.bak-<ts>` (прежние версии, вне монтирования) |
+| `/etc/llmhub/conf` | `root:llmhub 0750`; `config.yaml` 0640 `root:llmhub`. Монтируется **каталогом** (SEC-D2): `mv` внутри каталога работающий контейнер видит, а у монтирования одного файла остался бы старый inode |
 | `/etc/llmhub/secrets` | `root:root 0700`; `label`, `instance` 0640 `root:llmhub`; `weights` 0640 `root:llmhub-wauth`; `providers` 0600 (пустой) |
 | `/etc/llmhub/admin.key`, `/etc/llmhub/keys/*.key` | 0600 root (ключи создаёт `keys new --out`, на экран выводится только sha256) |
 | `/etc/llmhub/weights` | `root:llmhub-wnginx 0750`; `weights-key.pem` 0600 `llmhub-wnginx` |
@@ -38,14 +39,18 @@
 | `/var/lib/llmhub` | `llmhub:llmhub 0750`; `state.db*` 0640 (umask 0027 в `serve`/reaper) |
 | `/var/lib/llmhub-weights-auth` | `llmhub-wauth 0700` |
 | `/var/log/llmhub` | `root:llmhub 0750`; `weights-*.log` 0640 `llmhub-wnginx:llmhub` |
-| `/var/lib/llmhub-deploy` | 0700 root: маркеры шагов, `hashes.txt`, снимок `preflight/baseline` |
+| `/var/lib/llmhub-deploy` | 0700 root: маркеры шагов, `hashes.txt`, снимок `preflight/baseline`, `s2.created` (созданные пользователи), `ufw-*.added` (добавленные правила), временный `stage/` (0700 `llmhub`, только на время render) |
 
 Пользователи (`useradd --system`, `nologin`): `llmhub` 64100, `llmhub-wnginx` 64101, `llmhub-wauth` 64102. id фиксированы, поэтому переустановка после S14 и восстановление из архива сохраняют владельцев (F13).
 
 ## Порядок (план T-371 §6)
 - **Окно 1**: `s0` (снимок, только чтение) → `s1` (SHA256SUMS) → `s2` → `s3` → `s4` → `s5` → `s6` → `s7` → e2e (`scripts/e2e_mock.py pre`, `docker restart llmhub-api`, `post-restart`, `kill`) → `s11`.
-- **Окно 2**: `s8a` → `s8b` (`LLMHUB_WEIGHTS_MODEL=<rel> [LLMHUB_WEIGHTS_DRAFT=<rel>]`) → `s8c` → `s9` → проба `docker exec llmhub-weights-auth python -m llmhub.tools.weights_probe --config /etc/llmhub/config.yaml --op auto --negatives [--expect-sha256 …]` (сразу после `scripts/e2e_mock.py prewarm` — Mock-инстанс в BOOTING около 60 с; admin `hold` GPU не запускает, он только держит уже живую; затем `close-lease --lease <id>`) → `s10x` (в конце T-371: клиент `e2e` удаляется, ключ — `shred`; до этого он нужен пробе) → `s11`.
+- **Окно 2**: `s8a` → `s8b` (`LLMHUB_WEIGHTS_MODEL=<rel> [LLMHUB_WEIGHTS_DRAFT=<rel>]`) → `s8c` → `s9` → проба `docker exec llmhub-weights-auth python -m llmhub.tools.weights_probe --config /etc/llmhub/conf/config.yaml --op auto --negatives [--expect-sha256 …]` (сразу после `scripts/e2e_mock.py prewarm` — Mock-инстанс в BOOTING около 60 с; admin `hold` GPU не запускает, он только держит уже живую; затем `close-lease --lease <id>`) → `s10x` (в конце T-371: клиент `e2e` удаляется, ключ — `shred`; до этого он нужен пробе) → `s11`.
 - Каждый шаг: `apply` → `check` = 0. Неожиданный вывод — остановиться и разобрать. Откат: `rollback` того же шага; полный откат — `s14`.
+- Изменение конфига (`s5`, `s8b`, `s10x` и их откаты) перезапускает `llmhub-api`, `llmhub-reaper` и `llmhub-weights-auth`, если они есть. Изменение `nginx-weights.conf` в `s8c` перезапускает `llmhub-weights-nginx`. render и `keys new` работают от uid 64100 во временном каталоге `stage/`, а не от root поверх `/etc/llmhub` (L6).
+- `s9 check` проходит через `lo`. Правило ufw на публичном интерфейсе проверяется только **с внешнего хоста** — команды в `docs/runbook.md` §6 (L7).
+- ufw: скрипт удаляет только правила, которые сам добавил (`ufw-*.added`). Если на 8095/9443 уже есть чужое правило, `s0`/`s7`/`s9` останавливаются (L1).
+- **Шаблон `config.example.yaml` вне сервера — только в контейнере с `--network none`** (SEC-D4). В шаблоне настоящие `10.8.0.1:809x`, и через VPN рабочей станции фоновые пробы дошли бы до llama-server. Тест F5 так и запускает «сервер» и проверяет, что в отрендеренных конфигах нет `10.8.0.1`/`65.109.95.35`. `tests/conftest.py` запрещает тестам `connect` к 10.8.0.0/24 и 65.109.95.35.
 - Локальная проверка скрипта (F5): `uv run pytest -m docker tests/test_t371_deploy_script.py`. Тест запускает одноразовый ubuntu-«сервер» со своим dockerd и прогоняет `apply`/повторный `apply`/`rollback` для `s2`…`s9`, затем пробу весов, `s10x`, `s11` и `s14`.
 
 ## Таймауты nginx весов

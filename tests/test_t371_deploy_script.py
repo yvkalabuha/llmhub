@@ -1,6 +1,7 @@
 """T-371 E4 (critic F5): `deploy/server/llmhub-deploy.sh` on a disposable "server".
 
-The server is a privileged `ubuntu:22.04` container (same OS as 65.109.95.35) running its own
+The server is a privileged `ubuntu:22.04` container (same OS as 65.109.95.35) with
+`--network none` (SEC-D4: no route to the real 10.8.0.1 through the workstation VPN) running its own
 dockerd (static binaries from the pinned docker:dind image, `--iptables=false`, no bridge:
 every llmhub container uses `--network host`). Inside it: a fake `/etc/llama/api-key`
 (root:998 0640), `/opt/models` with two small GGUF files and a sha256 file, a ufw stub that
@@ -48,6 +49,8 @@ MODEL = os.urandom(2 * 1024 * 1024)
 DRAFT = os.urandom(64 * 1024)
 DBIN = "/opt/dbin"
 BACKENDS = ("qwen-35b-a3b", "qwen-27b", "qwen-9b")
+NGINX_FOREIGN_TAG = "searxng-proxy:upstream"
+REAL_ADDRS = ("10.8.0.1", "65.109.95.35")
 
 UFW_STUB = r"""#!/bin/bash
 # test stub of ufw: rules live in a file as "<spec> # <comment>"
@@ -159,8 +162,10 @@ def server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Server]:
     (assets / "qwen" / "model.gguf").write_bytes(MODEL)
     (assets / "qwen" / "draft.gguf").write_bytes(DRAFT)
     name = f"llmhub-test-srv-{tag}"
-    _run("docker", "run", "-d", "--name", name, "--label", "llmhub-test=1", "--privileged",
-         "-v", "/var/lib/docker", "-v", f"{dbin}:{DBIN}:ro", "-v", f"{dist}:/root/llmhub-dist/{ver}:ro",
+    # SEC-D4: no network at all (the workstation VPN routes to 10.8.0.1): images come in by
+    # `docker save | docker exec -i`, every backend of the template is 127.0.0.1
+    _run("docker", "run", "-d", "--name", name, "--network", "none", "--label", "llmhub-test=1",
+         "--privileged", "-v", "/var/lib/docker", "-v", f"{dbin}:{DBIN}:ro", "-v", f"{dist}:/root/llmhub-dist/{ver}:ro",
          "-v", f"{stub}:/usr/local/sbin/ufw:ro", "-v", f"{assets}:/assets:ro",
          IMAGES["TEST_SERVER_IMAGE"], "sleep", "infinity")  # fmt: skip
     render_set = ";".join(
@@ -187,6 +192,13 @@ def server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[Server]:
         )
         _run("bash", "-c", f"docker save {IMAGES['TEST_SERVER_IMAGE']} | docker exec -i {name} "
                            f"{DBIN}/docker load -q")  # fmt: skip
+        # SEC-D5: the upstream nginx image (same Id as ours) is already there under a FOREIGN
+        # tag; s3 must load our tag and rollback/s14 must leave the foreign tag alone
+        foreign_tag = NGINX_FOREIGN_TAG
+        _run("bash", "-c", f"docker save {IMAGES['NGINX_IMAGE']} | docker exec -i {name} "
+                           f"{DBIN}/docker load -q")  # fmt: skip
+        nginx_id = _run("docker", "image", "inspect", "-f", "{{.Id}}", IMAGES["NGINX_IMAGE"]).strip()
+        srv.sh(f"docker tag {nginx_id} {foreign_tag}")
         img = _run("docker", "image", "inspect", "-f", "{{.Id}}", IMAGES["TEST_SERVER_IMAGE"]).strip()
         srv.sh(f"docker run -d --name searxng-fake --network none {img} sleep infinity >/dev/null")
         yield srv
@@ -218,6 +230,13 @@ def test_steps_full_cycle(server: Server) -> None:
         assert srv.state(with_start=False) == before, f"{step}: rollback left traces"
         srv.ok(step, "apply")
 
+    # SEC-D4: nothing rendered for this server points at the real host (a 4th backend in the
+    # template or a missed LLMHUB_RENDER_SET would show up here)
+    rendered = srv.sh("cat /etc/llmhub/conf/config.yaml /etc/llmhub/nginx-weights.conf").stdout
+    for addr in REAL_ADDRS:
+        assert addr not in rendered, addr
+    assert srv.sh(f"docker image inspect -f '{{{{.Id}}}}' {NGINX_FOREIGN_TAG}").stdout.strip()
+
     # weights through nginx + validator: a loading Mock instance, pinned TLS, Range, DB read
     # a prewarm lease (client e2e) launches a Mock instance: BOOTING for ~60 s
     r = srv.sh("docker exec -i llmhub-api python -c \"import sys, httpx; k = sys.stdin.readline()"
@@ -227,7 +246,7 @@ def test_steps_full_cycle(server: Server) -> None:
     assert r.stdout.strip() == "201", r.stdout + r.stderr
     want = hashlib.sha256(MODEL[: 1024 * 1024]).hexdigest()
     r = srv.sh("for i in $(seq 30); do docker exec llmhub-weights-auth python -m"
-               " llmhub.tools.weights_probe --config /etc/llmhub/config.yaml --op auto"
+               " llmhub.tools.weights_probe --config /etc/llmhub/conf/config.yaml --op auto"
                f" --rel qwen/model.gguf --expect-sha256 {want} --negatives && exit 0; sleep 1;"
                " done; exit 1", check=False)  # fmt: skip
     assert r.returncode == 0, r.stdout + r.stderr
@@ -242,9 +261,18 @@ def test_steps_full_cycle(server: Server) -> None:
         assert s not in envs
     assert "LLMHUB_LABEL_SECRET_FILE=/run/llmhub-secrets/label" in envs
 
-    # F7: the e2e client goes away at the end of S10
+    # F7: the e2e client goes away at the end of S10. SEC-D2: the RUNNING API must refuse the
+    # key (the config dir mount shows the new file; api/reaper are restarted on a change)
+    srv.sh("install -m 0600 /etc/llmhub/keys/e2e.key /root/e2e.key.test")
     srv.ok("s10x", "apply")
     srv.ok("s10x", "check")
+    probe = ("docker exec -i llmhub-api python -c \"import sys, httpx; k = sys.stdin.readline()"
+             ".strip(); print(httpx.get('http://127.0.0.1:8095/v1/models', headers={"
+             "'Authorization': 'Bearer ' + k}).status_code)\" </root/e2e.key.test")  # fmt: skip
+    assert srv.sh(probe).stdout.strip() == "401"
+    seen = srv.sh("docker exec llmhub-api cat /etc/llmhub/conf/config.yaml").stdout
+    assert not [ln for ln in seen.splitlines() if ln.startswith("  e2e:")], seen
+    srv.sh("shred -u /root/e2e.key.test")
     # nothing foreign changed (llama files, foreign container, foreign ufw rule)
     srv.ok("s11", "check")
     assert _foreign(srv) == foreign
@@ -259,3 +287,6 @@ def test_steps_full_cycle(server: Server) -> None:
     assert "No such file" in left and left.strip().endswith("600")
     assert _foreign(srv) == foreign
     assert srv.sh("cat /var/lib/ufw-stub/rules").stdout.strip() == "22/tcp # ssh (foreign)"
+    # SEC-D5: the foreign tag of the shared nginx Id survived s3 rollback and s14
+    tags = srv.sh("docker images --format '{{.Repository}}:{{.Tag}}'").stdout.split()
+    assert NGINX_FOREIGN_TAG in tags and not [t for t in tags if t.startswith("llmhub")]

@@ -11,7 +11,11 @@
 #   (llmhub-*) and the `nginx -t` dry run (--rm);
 # - dockerd, daemon.json, llama-server, foreign containers and foreign ufw rules untouched;
 # - secrets are created in files and never printed; only sha256 of keys leave the host;
-# - apply is idempotent (a second apply changes nothing), rollback removes what apply made.
+# - apply is idempotent (a second apply changes nothing), rollback removes what apply made;
+# - the config lives in the DIRECTORY $ETC/conf (mounted as a dir: a rename inside it is seen by
+#   running containers, SEC-D2); a changed config restarts api/reaper/validator;
+# - renders run as $UID_API into a private staging dir, never as root over $ETC (L6);
+# - ufw rules and accounts are removed only when this script recorded creating them (L1, L2).
 # Environment (defaults = the server; the F5 test overrides them):
 #   LLMHUB_DIST (dir of this script)  LLMHUB_UFW (ufw)  LLMHUB_SYSTEMCTL (systemctl)
 #   LLMHUB_LOGROTATE (logrotate)  LLMHUB_API_HOST (10.8.0.1)  LLMHUB_PUBLIC_IP (65.109.95.35)
@@ -42,6 +46,7 @@ BACKUP_DIR=${LLMHUB_BACKUP_DIR:-/root}
 HEALTH_WAIT_S=${LLMHUB_HEALTH_WAIT_S:-120}
 
 ETC=/etc/llmhub
+CONF=$ETC/conf
 DATA=/var/lib/llmhub
 WAUTH=/var/lib/llmhub-weights-auth
 LOGS=/var/log/llmhub
@@ -53,6 +58,8 @@ UID_API=64100
 UID_NGINX=64101
 UID_WAUTH=64102
 CONTAINERS=(llmhub-api llmhub-reaper llmhub-weights-auth llmhub-weights-nginx)
+CONFIG_READERS=(llmhub-api llmhub-reaper llmhub-weights-auth)
+STAGE=$MARK/stage
 CLIENTS=(voicebot gamedev agents e2e)
 RULE_API=(in on "$VPN_IF" from "$VPN_NET" to "$API_HOST" port "$API_PORT" proto tcp)
 RULE_WEIGHTS=(in on "$PUBLIC_IF" to "$PUBLIC_IP" port "$WEIGHTS_PORT" proto tcp)
@@ -94,6 +101,10 @@ drun_once() {  # throw-away container from our image: no name, --rm
 image_id() { tr -d '[:space:]' <"$DIST/image.id"; }
 nginx_id() { tr -d '[:space:]' <"$DIST/nginx.id"; }
 release() { tr -d '[:space:]' <"$DIST/VERSION"; }
+# SEC-D5: our images are addressed by OUR tags (the nginx Id equals upstream nginx:1.27-alpine)
+image_tag() { printf 'llmhub:%s' "$(release)"; }
+nginx_tag() { printf 'llmhub-nginx:%s' "$(release)"; }
+tag_id() { docker image inspect -f '{{.Id}}' "$1" 2>/dev/null || true; }
 
 exists() { docker inspect -f '{{.Id}}' "$1" >/dev/null 2>&1; }
 running() { [ "$(docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null)" = "true" ]; }
@@ -172,12 +183,40 @@ no_wildcard() {  # no 0.0.0.0 / [::] listener on PORT
     ! ss -Hltn "( sport = :$1 )" | awk '{print $4}' | grep -Eq "^(0\.0\.0\.0|\*|\[::\]):$1$"
 }
 
+is_wildcard() { grep -Eq '^(0\.0\.0\.0|\*|\[::\]|\[::ffff:0\.0\.0\.0\]):[0-9]+$' <<<"$1"; }
+
+stage_dir() {  # fresh private staging dir for a render (owned by $UID_API, 0700)
+    rm -rf "$STAGE"
+    install -d -m 0700 "$MARK"
+    install -d -m 0700 -o "$UID_API" -g "$UID_API" "$STAGE"
+}
+
+restart_config_readers() {  # SEC-D2: settings other than clients are read at start only
+    local c restarted=()
+    for c in "${CONFIG_READERS[@]}"; do
+        if exists "$c"; then dctl restart "$c"; restarted+=("$c"); fi
+    done
+    if [ "${#restarted[@]}" -gt 0 ]; then
+        log "config changed: restarted ${restarted[*]}"
+        wait_healthy "${restarted[@]}"
+    fi
+}
+
+daemon_reload() {  # I1: never activate pending edits of llama units as a side effect
+    local out
+    out=$("$SYSTEMCTL" show llama-server llama-server-27b llama-server-small -p NeedDaemonReload \
+        2>/dev/null || true)
+    if grep -q '=yes' <<<"$out"; then die "a llama unit has NeedDaemonReload=yes; reload by hand first"; fi
+    "$SYSTEMCTL" daemon-reload
+}
+
 env_has_no_secret() {  # docker inspect Env must not contain the content of any secret file
     local name=$1 env f
     env=$(docker inspect -f '{{json .Config.Env}}' "$name")
     for f in "$ETC/secrets/label" "$ETC/secrets/instance" "$ETC/secrets/weights"; do
         [ -s "$f" ] || continue
-        if grep -qF -- "$(head -n1 "$f")" <<<"$env"; then fail "$name: Env contains a secret"; return 1; fi
+        # SEC-D1: the secret is the pattern FILE, never an argument (ps, /proc/*/cmdline)
+        if grep -qF -f "$f" <<<"$env"; then fail "$name: Env contains a secret"; return 1; fi
     done
     if grep -Eq 'LLMHUB_[A-Z_]*(SECRET|KEY|TOKEN)=' <<<"$env"; then fail "$name: secret-like Env value"; return 1; fi
 }
@@ -221,7 +260,11 @@ apply_s0() {
     listening "$API_HOST" "$API_PORT" && die "port $API_PORT is busy"
     listening 127.0.0.1 "$AUTH_PORT" && die "port $AUTH_PORT is busy"
     listening "$PUBLIC_IP" "$WEIGHTS_PORT" && die "port $WEIGHTS_PORT is busy"
-    local id
+    local id p
+    for p in "$API_PORT" "$AUTH_PORT" "$WEIGHTS_PORT"; do  # L4
+        no_wildcard "$p" || die "a wildcard listener holds port $p"
+        ufw_foreign "$p" && die "ufw already has a foreign rule for port $p"
+    done
     for id in $UID_API $UID_NGINX $UID_WAUTH; do
         if getent passwd "$id" >/dev/null && ! getent passwd "$id" | grep -q '^llmhub'; then
             die "uid $id is taken"
@@ -245,8 +288,28 @@ check_s11() {
             ok=1
         fi
     done
-    diff "$MARK/preflight/baseline/listen.txt" "$now/listen.txt" >&2 || true  # informational
+    new_listeners "$MARK/preflight/baseline/listen.txt" "$now/listen.txt" || ok=1
     return "$ok"
+}
+
+new_listeners() {  # L3: new wildcard listeners or a wrong address on our ports -> fail
+    local base=$1 now=$2 a port bad=0
+    while IFS= read -r a; do
+        [ -n "$a" ] || continue
+        port=${a##*:}
+        if is_wildcard "$a"; then
+            fail "new wildcard listener $a" || true
+            bad=1
+            continue
+        fi
+        case "$port" in
+            "$API_PORT") [ "$a" = "$API_HOST:$API_PORT" ] || { fail "unexpected listener $a" || true; bad=1; } ;;
+            "$AUTH_PORT") [ "$a" = "127.0.0.1:$AUTH_PORT" ] || { fail "unexpected listener $a" || true; bad=1; } ;;
+            "$WEIGHTS_PORT") [ "$a" = "$PUBLIC_IP:$WEIGHTS_PORT" ] || { fail "unexpected listener $a" || true; bad=1; } ;;
+            *) log "new listener (not ours, informational): $a" ;;
+        esac
+    done < <(comm -13 <(sort -u "$base") <(sort -u "$now"))
+    return "$bad"
 }
 apply_s11() { check_s11; }
 rollback_s11() { log "s11 is read-only"; }
@@ -275,6 +338,7 @@ ensure_account() {  # ensure_account ID NAME
 
 DIRS=(
     "$ETC 0755 0 0"
+    "$CONF 0750 0 $UID_API"
     "$ETC/secrets 0700 0 0"
     "$ETC/keys 0700 0 0"
     "$ETC/weights 0750 0 $UID_NGINX"
@@ -317,43 +381,55 @@ rollback_s2() {
         read -r path _ <<<"${DIRS[$i]}"
         if [ -d "$path" ]; then rmdir "$path" 2>/dev/null || log "kept non-empty $path"; fi
     done
-    if [ -f "$MARK/s2.created" ]; then
-        while read -r kind name; do
-            if [ "$kind" = user ] && getent passwd "$name" >/dev/null; then userdel "$name"; fi
-        done <"$MARK/s2.created"
-        while read -r kind name; do
-            if [ "$kind" = group ] && getent group "$name" >/dev/null; then groupdel "$name"; fi
-        done <"$MARK/s2.created"
-        rm -f "$MARK/s2.created"
-    fi
+    remove_recorded_accounts
     rm -f "$MARK/s2.done"
+}
+remove_recorded_accounts() {  # users/groups listed in s2.created (and only llmhub* names)
+    local kind name
+    [ -f "$MARK/s2.created" ] || { log "no s2.created: accounts kept"; return 0; }
+    while read -r kind name; do
+        case "$name" in llmhub|llmhub-wnginx|llmhub-wauth) ;; *) continue ;; esac
+        if [ "$kind" = user ] && getent passwd "$name" >/dev/null; then userdel "$name"; fi
+    done <"$MARK/s2.created"
+    while read -r kind name; do
+        case "$name" in llmhub|llmhub-wnginx|llmhub-wauth) ;; *) continue ;; esac
+        if [ "$kind" = group ] && getent group "$name" >/dev/null; then groupdel "$name"; fi
+    done <"$MARK/s2.created"
+    rm -f "$MARK/s2.created"
 }
 
 # ------------------------------------------------------------------ S3 images
 check_s3() {
-    [ "$(docker image inspect -f '{{.Id}}' "$(image_id)" 2>/dev/null)" = "$(image_id)" ] \
-        || { fail "llmhub image"; return 1; }
-    [ "$(docker image inspect -f '{{.Id}}' "$(nginx_id)" 2>/dev/null)" = "$(nginx_id)" ] \
-        || { fail "nginx image"; return 1; }
+    [ "$(tag_id "$(image_tag)")" = "$(image_id)" ] || { fail "$(image_tag) != image.id"; return 1; }
+    [ "$(tag_id "$(nginx_tag)")" = "$(nginx_id)" ] || { fail "$(nginx_tag) != nginx.id"; return 1; }
     local v
     v=$(drun_once --network none --user $UID_API "$(image_id)" \
         python -c 'import llmhub; print(llmhub.__version__)')
     [ "$v" = "$(release)" ] || fail "image version $v != $(release)"
 }
+load_tagged() {  # load_tagged TAG WANT_ID TARBALL: load unless TAG already is WANT_ID
+    local tag=$1 want=$2 tar=$3 got
+    got=$(tag_id "$tag")
+    if [ -z "$got" ]; then
+        gzip -dc "$tar" | docker load >/dev/null
+        got=$(tag_id "$tag")
+    fi
+    [ "$got" = "$want" ] || die "$tag is $got, want $want (foreign image under our tag?)"
+}
 apply_s3() {
-    if ! docker image inspect "$(image_id)" >/dev/null 2>&1; then
-        gzip -dc "$DIST/llmhub-$(release).tar.gz" | docker load >/dev/null
-    fi
-    if ! docker image inspect "$(nginx_id)" >/dev/null 2>&1; then
-        gzip -dc "$DIST/nginx-weights-$(release).tar.gz" | docker load >/dev/null
-    fi
+    load_tagged "$(image_tag)" "$(image_id)" "$DIST/llmhub-$(release).tar.gz"
+    load_tagged "$(nginx_tag)" "$(nginx_id)" "$DIST/nginx-weights-$(release).tar.gz"
     check_s3
 }
 rollback_s3() {
-    local img
-    for img in "$(image_id)" "$(nginx_id)"; do
-        if [ -n "$(docker ps -aq --filter "ancestor=$img")" ]; then die "image $img is in use"; fi
-        docker image rm "$img" >/dev/null 2>&1 || true
+    # only our tags: an image that also carries a foreign tag (or backs a foreign container)
+    # stays; docker refuses to remove the last tag of an image a container uses (no -f)
+    local c tag
+    for c in "${CONTAINERS[@]}"; do exists "$c" && die "container $c exists; roll back s6/s8c first"; done
+    for tag in "llmhub:$(release)" "llmhub-nginx:$(release)"; do
+        if [ -n "$(tag_id "$tag")" ]; then
+            docker image rm "$tag" >/dev/null 2>&1 || log "kept $tag (in use by a foreign container)"
+        fi
     done
 }
 
@@ -374,10 +450,11 @@ new_key() {  # new_key NAME DEST (the key goes into a file; stdout has only its 
     local name=$1 dest=$2
     [ -s "$dest" ] && return 0
     rm -f "$ETC/keys/$name.key.new"
-    drun_once --network none --user 0 -v "$ETC/keys:/out" "$(image_id)" \
-        python -m llmhub keys new --name "$name" --out "/out/$name.key.new" >/dev/null
-    chown 0:0 "$ETC/keys/$name.key.new"
-    chmod 0600 "$ETC/keys/$name.key.new"
+    stage_dir  # L6: the generator sees only an empty private dir, never the other keys
+    drun_once --network none --user "$UID_API:$UID_API" -v "$STAGE:/out" "$(image_id)" \
+        python -m llmhub keys new --name "$name" --out "/out/$name.key" >/dev/null
+    install -m 0600 -o 0 -g 0 "$STAGE/$name.key" "$ETC/keys/$name.key.new"
+    rm -rf "$STAGE"
     mv "$ETC/keys/$name.key.new" "$dest"
     record s4 "$dest"
 }
@@ -436,7 +513,7 @@ rollback_s4() {
 }
 
 # ------------------------------------------------------------------ S5 / S8b config
-render_config() {  # -> $ETC/config.yaml.new
+render_config() {  # -> $CONF/config.yaml.new (rendered by $UID_API in $STAGE, L6)
     local sets=() item extra=() weights=()
     IFS=';' read -r -a sets <<<"${LLMHUB_RENDER_SET:-}"
     for item in "${sets[@]}"; do if [ -n "$item" ]; then extra+=(--set "$item"); fi; done
@@ -447,16 +524,23 @@ render_config() {  # -> $ETC/config.yaml.new
             --model "$(cat "$MARK/weights.model")")
         if [ -s "$MARK/weights.draft" ]; then weights+=(--draft "$(cat "$MARK/weights.draft")"); fi
     fi
-    drun_once --network none --user 0 -v "$ETC:/out" -v "$MARK/hashes.txt:/in/hashes.txt:ro" \
-        -v "$MODELS:$MODELS:ro" "$(image_id)" python /opt/llmhub/deploy/render.py config \
-        --template /opt/llmhub/deploy/config.example.yaml --out /out/config.yaml.new \
+    stage_dir
+    local pub=()
+    if [ -d "$ETC/weights-pub" ]; then pub=(-v "$ETC/weights-pub:$ETC/weights-pub:ro"); fi
+    drun_once --network none --user "$UID_API:$UID_API" -v "$STAGE:/out" \
+        -v "$MARK/hashes.txt:/in/hashes.txt:ro" -v "$MODELS:$MODELS:ro" "${pub[@]}" "$(image_id)" \
+        python /opt/llmhub/deploy/render.py config \
+        --template /opt/llmhub/deploy/config.example.yaml --out /out/config.yaml \
         --hashes /in/hashes.txt "${extra[@]}" "${weights[@]}"
+    cp "$STAGE/config.yaml" "$CONF/config.yaml.new"
+    rm -rf "$STAGE"
 }
 
 install_config() {  # returns 0 when config.yaml changed, 1 when it is the same
-    local new="$ETC/config.yaml.new" cur="$ETC/config.yaml"
+    # rename INSIDE the mounted directory: running containers see the new file (SEC-D2)
+    local new="$ETC/conf/config.yaml.new" cur="$ETC/conf/config.yaml"
     if [ -f "$cur" ] && cmp -s "$new" "$cur"; then rm -f "$new"; return 1; fi
-    if [ -f "$cur" ]; then cp -p "$cur" "$cur.bak-$(date -u +%Y%m%dT%H%M%S)"; fi
+    if [ -f "$cur" ]; then cp -p "$cur" "$ETC/config.yaml.bak-$(date -u +%Y%m%dT%H%M%S)"; fi
     chown "0:$UID_API" "$new"
     chmod 0640 "$new"
     mv "$new" "$cur"
@@ -465,25 +549,32 @@ install_config() {  # returns 0 when config.yaml changed, 1 when it is the same
 config_check() {
     local out
     out=$(drun_once --network none --user "$UID_API:$UID_API" \
-        -v "$ETC/config.yaml:$ETC/config.yaml:ro" \
+        -v "$CONF:$CONF:ro" \
         -v "$ETC/secrets/label:/run/s/label:ro" -v "$ETC/secrets/instance:/run/s/instance:ro" \
         -e LLMHUB_LABEL_SECRET_FILE=/run/s/label -e LLMHUB_INSTANCE_SECRET_FILE=/run/s/instance \
-        "$(image_id)" python -m llmhub config-check --config "$ETC/config.yaml") \
+        "$(image_id)" python -m llmhub config-check --config "$CONF/config.yaml") \
         || { fail "config-check"; return 1; }
     [ "$out" = ok ] || fail "config-check: $out"
 }
 
-check_s5() { stat_is "$ETC/config.yaml" "0:$UID_API 640" && config_check; }
+check_s5() { stat_is "$CONF/config.yaml" "0:$UID_API 640" && config_check; }
 apply_s5() {
     render_config
-    install_config || log "config unchanged"
+    if install_config; then restart_config_readers; else log "config unchanged"; fi
     marker s5
     check_s5
 }
 rollback_s5() {
     local last
     last=$(find "$ETC" -maxdepth 1 -name 'config.yaml.bak-*' | sort | tail -n1)
-    if [ -n "$last" ]; then mv "$last" "$ETC/config.yaml"; else rm -f "$ETC/config.yaml"; fi
+    if [ -n "$last" ]; then
+        cp -p "$last" "$CONF/config.yaml.new"
+        mv "$CONF/config.yaml.new" "$CONF/config.yaml"  # rename inside the mounted dir
+        rm -f "$last"
+        restart_config_readers
+    else
+        rm -f "$CONF/config.yaml"
+    fi
     rm -f "$MARK/s5.done"
 }
 
@@ -513,7 +604,7 @@ apply_s6() {
         install -m 0644 -o 0 -g 0 "$DIST/systemd/$u" "$UNIT_DIR/$u"
         changed=1
     done
-    if [ "$changed" = 1 ]; then "$SYSTEMCTL" daemon-reload; fi
+    if [ "$changed" = 1 ]; then daemon_reload; fi
     "$SYSTEMCTL" enable --now llmhub-backup.timer >/dev/null 2>&1
     marker s6
     check_s6
@@ -524,19 +615,41 @@ rollback_s6() {
     if [ -f "$UNIT_DIR/llmhub-backup.timer" ]; then
         "$SYSTEMCTL" disable --now llmhub-backup.timer >/dev/null 2>&1 || true
         rm -f "$UNIT_DIR/llmhub-backup.timer" "$UNIT_DIR/llmhub-backup.service"
-        "$SYSTEMCTL" daemon-reload
+        daemon_reload
     fi
     rm -f "$MARK/s6.done"
 }
 
 # ------------------------------------------------------------------ S7 / S9 ufw
 ufw_has() { "$UFW" status 2>/dev/null | grep -qF "# $1"; }
+ufw_foreign() {  # a rule for PORT without our comment (allow would merge into it, L1)
+    "$UFW" status 2>/dev/null | grep -v '# llmhub' | grep -Eq "(^|[^0-9])$1([^0-9]|$)"
+}
+ufw_add() {  # ufw_add TAG COMMENT PORT SPEC...: add once, record that WE added it
+    local tag=$1 comment=$2 port=$3
+    shift 3
+    ufw_has "$comment" && return 0
+    ufw_foreign "$port" && die "ufw has a foreign rule for port $port; resolve it by hand"
+    "$UFW" allow "$@" comment "$comment" >/dev/null
+    install -d -m 0700 "$MARK"
+    : >"$MARK/ufw-$tag.added"
+}
+ufw_remove() {  # ufw_remove TAG COMMENT SPEC...: delete only a rule this script added
+    local tag=$1 comment=$2
+    shift 2
+    if [ -f "$MARK/ufw-$tag.added" ] && ufw_has "$comment"; then
+        "$UFW" delete allow "$@" >/dev/null
+    elif ufw_has "$comment"; then
+        log "ufw rule '$comment' was not added by this script: kept"
+    fi
+    rm -f "$MARK/ufw-$tag.added"
+}
 check_s7() { ufw_has "llmhub api" || fail "ufw rule llmhub api"; }
 apply_s7() {
-    ufw_has "llmhub api" || "$UFW" allow "${RULE_API[@]}" comment 'llmhub api' >/dev/null
+    ufw_add api 'llmhub api' "$API_PORT" "${RULE_API[@]}"
     check_s7
 }
-rollback_s7() { if ufw_has "llmhub api"; then "$UFW" delete allow "${RULE_API[@]}" >/dev/null; fi; }
+rollback_s7() { ufw_remove api 'llmhub api' "${RULE_API[@]}"; }
 
 weights_get() {  # weights_get PATH [tls12] -> HTTP status or "tls_error" (pinned cert, no token)
     drun_once -i --network host --user "$UID_API:$UID_API" \
@@ -572,12 +685,13 @@ check_s9() {
     fi
 }
 apply_s9() {
-    ufw_has "llmhub weights" || "$UFW" allow "${RULE_WEIGHTS[@]}" comment 'llmhub weights' >/dev/null
+    ufw_add weights 'llmhub weights' "$WEIGHTS_PORT" "${RULE_WEIGHTS[@]}"
     check_s9
+    # L7: this check runs on the host itself (lo); the ufw rule on the public interface is
+    # proven only from OUTSIDE - docs/runbook.md section 6 ("S9 from an external host")
+    log "S9: now repeat the probe from an external host (docs/runbook.md section 6)"
 }
-rollback_s9() {
-    if ufw_has "llmhub weights"; then "$UFW" delete allow "${RULE_WEIGHTS[@]}" >/dev/null; fi
-}
+rollback_s9() { ufw_remove weights 'llmhub weights' "${RULE_WEIGHTS[@]}"; }
 
 # ------------------------------------------------------------------ S8 weights
 check_s8a() {
@@ -608,7 +722,7 @@ rollback_s8a() {
 }
 
 check_s8b() {
-    grep -q 'kind: self_hosted' "$ETC/config.yaml" || { fail "no weights source in config"; return 1; }
+    grep -q 'kind: self_hosted' "$CONF/config.yaml" || { fail "no weights source in config"; return 1; }
     config_check || return 1
     wait_healthy llmhub-api
 }
@@ -618,30 +732,32 @@ apply_s8b() {
     [ -s "$MARK/weights.model" ] || die "LLMHUB_WEIGHTS_MODEL is required (path under $MODELS)"
     marker s8b
     render_config
-    if install_config; then dctl restart llmhub-api; fi
+    if install_config; then restart_config_readers; fi
     check_s8b
 }
 rollback_s8b() {
     rm -f "$MARK/s8b.done" "$MARK/weights.model" "$MARK/weights.draft"
     render_config
-    if install_config && exists llmhub-api; then dctl restart llmhub-api; fi
+    if install_config; then restart_config_readers; fi
 }
 
-render_nginx_conf() {
-    drun_once --network none --user 0 -v "$ETC:/out" "$(image_id)" \
+render_nginx_conf() {  # returns 0 when nginx-weights.conf changed, 1 when it is the same
+    stage_dir
+    drun_once --network none --user "$UID_API:$UID_API" -v "$STAGE:/out" "$(image_id)" \
         python /opt/llmhub/deploy/render.py nginx \
-        --template /opt/llmhub/deploy/nginx-weights.conf --out /out/nginx-weights.conf.new \
+        --template /opt/llmhub/deploy/nginx-weights.conf --out /out/nginx-weights.conf \
         --var "PUBLIC_IP=$PUBLIC_IP" --var "PORT=$WEIGHTS_PORT" --var "RATE=$RATE" \
         --var SEGMENTS=1 --var "MAX_DL=$MAX_DL" --var "MODELS=$MODELS" \
         --var "AUTH=127.0.0.1:$AUTH_PORT" --var "LOGDIR=$LOGS" \
         --var "CERT=$ETC/weights/weights-cert.pem" --var "KEY=$ETC/weights/weights-key.pem" \
         --var PID=/tmp/nginx.pid --var TMP=/tmp
-    chmod 0644 "$ETC/nginx-weights.conf.new"
+    install -m 0644 -o 0 -g 0 "$STAGE/nginx-weights.conf" "$ETC/nginx-weights.conf.new"
+    rm -rf "$STAGE"
     if cmp -s "$ETC/nginx-weights.conf.new" "$ETC/nginx-weights.conf"; then
         rm -f "$ETC/nginx-weights.conf.new"
-    else
-        mv "$ETC/nginx-weights.conf.new" "$ETC/nginx-weights.conf"
+        return 1
     fi
+    mv "$ETC/nginx-weights.conf.new" "$ETC/nginx-weights.conf"
 }
 
 check_s8c() {
@@ -657,16 +773,22 @@ check_s8c() {
     "$LOGROTATE" -d "$LOGROTATE_FILE" >/dev/null 2>&1 || fail "logrotate -d"
 }
 apply_s8c() {
-    render_nginx_conf
+    local changed=0
+    if render_nginx_conf; then changed=1; fi
     local f
     for f in weights-acct.log weights-access.log weights-error.log; do
         [ -e "$LOGS/$f" ] || install -m 0640 -o $UID_NGINX -g $UID_API /dev/null "$LOGS/$f"
     done
-    docker run --rm --read-only --cap-drop ALL --network none --user "$UID_NGINX:$UID_NGINX" \
-        --group-add $UID_API --tmpfs /tmp --entrypoint nginx \
+    # L5: dry run hardened like the service; logs go to a throw-away tmpfs, never $LOGS
+    docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+        --pids-limit 64 --network none --user "$UID_NGINX:$UID_NGINX" \
+        --group-add $UID_API --tmpfs /tmp --tmpfs "$LOGS:rw,noexec,nosuid,size=1m,mode=1777" \
+        --entrypoint nginx \
         -v "$ETC/nginx-weights.conf:/etc/nginx-weights/nginx.conf:ro" \
-        -v "$ETC/weights:$ETC/weights:ro" -v "$MODELS:$MODELS:ro" -v "$LOGS:$LOGS" \
+        -v "$ETC/weights:$ETC/weights:ro" -v "$MODELS:$MODELS:ro" \
         "$(nginx_id)" -t -q -e stderr -c /etc/nginx-weights/nginx.conf || die "nginx -t failed"
+    # a single-file mount keeps the old inode: a changed conf needs a restart (SEC-D2)
+    if [ "$changed" = 1 ] && exists llmhub-weights-nginx; then dctl restart llmhub-weights-nginx; fi
     drun_named llmhub-weights-auth
     drun_named llmhub-weights-nginx
     if ! cmp -s "$DIST/logrotate-llmhub-acct" "$LOGROTATE_FILE"; then
@@ -682,16 +804,32 @@ rollback_s8c() {
 }
 
 # ------------------------------------------------------------------ S10x: drop the e2e client
+key_status() {  # key_status KEYFILE -> HTTP status of GET /v1/models with that key (stdin)
+    dexec -i llmhub-api python -c "import sys, httpx; k = sys.stdin.readline().strip(); print(
+httpx.get('http://$API_HOST:$API_PORT/v1/models', headers={'Authorization': 'Bearer ' + k},
+          timeout=10).status_code)" <"$1"
+}
+
 check_s10x() {
-    if grep -q '^  e2e:' "$ETC/config.yaml"; then fail "e2e still in config"; return 1; fi
-    [ ! -e "$ETC/keys/e2e.key" ] || fail "e2e key still on disk"
+    if grep -q '^  e2e:' "$CONF/config.yaml"; then fail "e2e still in config"; return 1; fi
+    [ ! -e "$ETC/keys/e2e.key" ] || { fail "e2e key still on disk"; return 1; }
+    if grep -q '^e2e ' "$MARK/hashes.txt"; then fail "e2e still in hashes.txt"; return 1; fi
+    # SEC-D2: the RUNNING API must not know the client any more (not only the file on disk)
+    local list
+    list=$(admin_call client list) || { fail "admin client list"; return 1; }
+    if grep -q '"name": *"e2e"' <<<"$list"; then fail "running API still has client e2e"; return 1; fi
 }
 apply_s10x() {
     marker s10x
     render_config
-    install_config || true
+    if install_config; then restart_config_readers; fi
     admin_call reload-clients >/dev/null
-    if [ -e "$ETC/keys/e2e.key" ]; then shred -u "$ETC/keys/e2e.key"; fi
+    if [ -e "$ETC/keys/e2e.key" ]; then
+        local st
+        st=$(key_status "$ETC/keys/e2e.key")
+        [ "$st" = 401 ] || die "the running API still accepts the e2e key (HTTP $st)"
+        shred -u "$ETC/keys/e2e.key"
+    fi
     write_hashes
     check_s10x
 }
@@ -711,7 +849,7 @@ check_s14() {
 apply_s14() {
     # F13: archive, then remove dirs and users. A reinstall recreates the fixed ids
     # 64100-64102, so files restored from the archive keep valid owners.
-    local c ts d dirs=() name
+    local c ts d dirs=()
     for c in llmhub-weights-nginx llmhub-weights-auth llmhub-reaper llmhub-api; do
         if exists "$c"; then dctl rm "$c"; fi
     done
@@ -720,7 +858,7 @@ apply_s14() {
     if [ -f "$UNIT_DIR/llmhub-backup.timer" ]; then
         "$SYSTEMCTL" disable --now llmhub-backup.timer >/dev/null 2>&1 || true
         rm -f "$UNIT_DIR/llmhub-backup.timer" "$UNIT_DIR/llmhub-backup.service"
-        "$SYSTEMCTL" daemon-reload
+        daemon_reload
     fi
     rm -f "$LOGROTATE_FILE"
     ts=$(date -u +%Y%m%dT%H%M%S)
@@ -732,10 +870,7 @@ apply_s14() {
         rm -rf "${dirs[@]}"
     fi
     rollback_s3
-    for name in llmhub-wauth llmhub-wnginx llmhub; do
-        if getent passwd "$name" >/dev/null; then userdel "$name"; fi
-        if getent group "$name" >/dev/null; then groupdel "$name"; fi
-    done
+    remove_recorded_accounts  # L2: only accounts s2 recorded as created
     find "$MARK" -maxdepth 1 -type f -delete
     check_s14
 }

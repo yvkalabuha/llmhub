@@ -42,4 +42,6 @@ async def test_controller_heartbeat_and_backup(tmp_path: Path) -> None:
     h = Harness(tmp_path)
     await h.step()
     assert h.conn.execute("SELECT value FROM controller_state WHERE key='heartbeat'").fetchone()
-    assert list((tmp_path / "backups").glob("state-*.db"))
+    # REV2-7: one backup dir shared with `llmhub backup`, own prefix (separate rotation)
+    assert list((tmp_path / "backup").glob("controller-*.db"))
+    assert not (tmp_path / "backups").exists()

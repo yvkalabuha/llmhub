@@ -15,7 +15,7 @@ python -m llmhub healthcheck --url http://127.0.0.1:8096/metrics
 -e
 LLMHUB_WEIGHTS_SECRET_FILE=/run/llmhub-secrets/weights
 -v
-/etc/llmhub/config.yaml:/etc/llmhub/config.yaml:ro
+/etc/llmhub/conf:/etc/llmhub/conf:ro
 -v
 /etc/llmhub/secrets/weights:/run/llmhub-secrets/weights:ro
 -v
@@ -31,4 +31,4 @@ python
 -m
 llmhub.weights.auth_app
 --config
-/etc/llmhub/config.yaml
+/etc/llmhub/conf/config.yaml

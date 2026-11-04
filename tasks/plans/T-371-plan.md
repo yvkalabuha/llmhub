@@ -399,3 +399,13 @@ CLI: `status · budget · client list · reload-clients · hold --pool|--model -
 - [x] G1 runbook; G2 integration.md; G3 deploy/README.md
 - [x] I1–I3 проверки, сборка `dist/0.2.0`
 - [ ] Шаги сервера S0–S14 — координатор
+
+## 15. Исправления после ревью, раунд 1 (implementer, 2026-11-04)
+- [x] SEC-D2 конфиг каталогом `/etc/llmhub/conf` (rename виден контейнерам), перезапуск api/reaper/валидатора при изменении конфига, `s10x` требует 401 от работающего API и проверяет `client list`
+- [x] SEC-D3 `limit_conn_zone $server_port` (тест на закреплённом nginx: вторая загрузка → 503)
+- [x] SEC-D1 `grep -qF -f` (секрет не в argv)
+- [x] SEC-D4 F5 с `--network none`, проверка отрендеренных конфигов на 10.8.0.1/65.109.95.35, socket-guard в `tests/conftest.py`
+- [x] SEC-D5 образы по своим тегам `llmhub:<ver>`/`llmhub-nginx:<ver>`; откат снимает только теги
+- [x] L1–L7, I1, I3
+- [x] REV2-1…REV2-7
+- [x] xfail в `tests/test_review_t371_*.py` сняты; сборка `dist/0.2.1`

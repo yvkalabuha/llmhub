@@ -61,7 +61,7 @@ from llmhub.lifecycle_manager.safety import (
 )
 from llmhub.lifecycle_manager.states import LIVE_IN_INDEX, State
 from llmhub.persistence import state as cstate
-from llmhub.persistence.backup import maybe_daily_backup
+from llmhub.persistence.backup import BACKUP_DIR, CONTROLLER_PREFIX, maybe_daily_backup
 from llmhub.persistence.db import Busy, tx
 from llmhub.provider_adapters.base import ProviderAdapter, UnavailableReason
 from llmhub.provider_adapters.guarded import CircuitBreaker, GuardedAdapter
@@ -282,7 +282,9 @@ class Controller:
             self._budget(now, self._no_launch)
             self._budget_at = now
         await self._reconcile(now)
-        maybe_daily_backup(self.conn, self.cfg.data_dir / "backups", self.clock)
+        maybe_daily_backup(
+            self.conn, self.cfg.data_dir / BACKUP_DIR, self.clock, prefix=CONTROLLER_PREFIX
+        )
         if check_kill_file(self.cfg.data_dir):
             wake = min(wake, await self._kill_file_pass(now))
         if self.busy_ops():

@@ -82,6 +82,16 @@ async def status(request: Request) -> JSONResponse:
             "safe_mode": cstate.get(rt.conn, "safe_mode") == "1",
             "kill_file": check_kill_file(rt.cfg.data_dir),
             "pools": pools,
+            # rows whose provider resource may still exist (hidden from `pools[].instance`):
+            # the e2e kill check needs them (REV2-3)
+            "teardown": {
+                r["state"]: r["n"]
+                for r in _rows(
+                    request,
+                    "SELECT state, count(*) AS n FROM instances WHERE state IN"
+                    " ('STOPPING','PENDING_DELETE','LEAKED') GROUP BY state",
+                )
+            },
             "local": {"backends": local, "queue": {r["status"]: r["n"] for r in local_queue}},
             "budget": _budget(request),
             "providers": _rows(

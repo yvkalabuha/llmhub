@@ -21,7 +21,7 @@ LLMHUB_INSTANCE_SECRET_FILE=/run/llmhub-secrets/instance
 -e
 LLMHUB_WEIGHTS_SECRET_FILE=/run/llmhub-secrets/weights
 -v
-/etc/llmhub/config.yaml:/etc/llmhub/config.yaml:ro
+/etc/llmhub/conf:/etc/llmhub/conf:ro
 -v
 /etc/llmhub/secrets/label:/run/llmhub-secrets/label:ro
 -v
@@ -42,5 +42,5 @@ python
 llmhub
 serve
 --config
-/etc/llmhub/config.yaml
+/etc/llmhub/conf/config.yaml
 --no-docs

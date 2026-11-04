@@ -7,4 +7,4 @@ After=docker.service
 [Service]
 Type=oneshot
 Nice=10
-ExecStart=/usr/bin/docker exec llmhub-api python -m llmhub backup --config /etc/llmhub/config.yaml --to /var/lib/llmhub/backup --keep 14
+ExecStart=/usr/bin/docker exec llmhub-api python -m llmhub backup --config /etc/llmhub/conf/config.yaml --to /var/lib/llmhub/backup --keep 14

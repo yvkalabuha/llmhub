@@ -33,6 +33,8 @@ docker run --rm --name "llmhub-build-dl-$$" --label llmhub-build=1 \
 
 cp "$ROOT/deploy/render.py" "$ROOT/deploy/gen_weights_cert.py" \
    "$ROOT/deploy/config.example.yaml" "$ROOT/deploy/nginx-weights.conf" "$STAGE/deploy/"
+# render.py / templates run as uid 64100 (L6): world-readable regardless of the builder umask
+chmod -R u=rwX,go=rX "$STAGE/deploy"
 cp "$ROOT/deploy/docker/Dockerfile" "$ROOT/deploy/docker/.dockerignore" "$STAGE/"
 docker build --quiet --pull=false --label "org.llmhub.release=$VER" -t "$TAG" "$STAGE" >/dev/null
 

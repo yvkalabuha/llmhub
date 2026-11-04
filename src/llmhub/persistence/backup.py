@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import tempfile
 import time
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,29 +16,56 @@ _PREFIX = "state-"
 _DAY_S = 86400.0
 
 
-def backup(conn: sqlite3.Connection, dst_dir: Path, clock: Clock, keep: int = 7) -> Path:
+# The controller's own daily copy shares `<data_dir>/backup` with `llmhub backup` (the systemd
+# timer, `state-*.db`) under its own prefix, so neither rotation deletes the other's copies.
+CONTROLLER_PREFIX = "controller-"
+BACKUP_DIR = "backup"
+
+
+def _to_rollback_journal(out: sqlite3.Connection) -> None:
+    """REV2-5: the online backup copies the WAL flag of the source; a copy opened later for
+    inspection would grow `-wal`/`-shm` files that no rotation removes."""
+    out.execute("PRAGMA journal_mode=DELETE").fetchone()
+
+
+def backup(
+    conn: sqlite3.Connection, dst_dir: Path, clock: Clock, keep: int = 7, prefix: str = _PREFIX
+) -> Path:
     dst_dir = Path(dst_dir)
     dst_dir.mkdir(parents=True, exist_ok=True)
     now = clock.now()
     stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime(now)) + f"{int(now * 1000) % 1000:03d}"
-    dst = dst_dir / f"{_PREFIX}{stamp}.db"
-    out = sqlite3.connect(str(dst))
+    dst = dst_dir / f"{prefix}{stamp}.db"
+    # a private temp file: concurrent controllers (same clock) never share one copy file
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{prefix}", suffix=".tmp", dir=dst_dir)
+    os.close(fd)
+    tmp = Path(tmp_name)
     try:
-        conn.backup(out)
-    finally:
-        out.close()
-    copies = sorted(dst_dir.glob(f"{_PREFIX}*.db"))
+        out = sqlite3.connect(str(tmp))
+        try:
+            conn.backup(out)
+            _to_rollback_journal(out)
+        finally:
+            out.close()
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    copies = sorted(dst_dir.glob(f"{prefix}*.db"))
     for old in copies[: max(0, len(copies) - keep)]:
         old.unlink()
     return dst
 
 
-def maybe_daily_backup(conn: sqlite3.Connection, dst_dir: Path, clock: Clock) -> Path | None:
+def maybe_daily_backup(
+    conn: sqlite3.Connection, dst_dir: Path, clock: Clock, prefix: str = _PREFIX
+) -> Path | None:
     now = clock.now()
     last = state.get(conn, "last_backup_at")
     if last is not None and now - float(last) < _DAY_S:
         return None
-    path = backup(conn, dst_dir, clock)
+    path = backup(conn, dst_dir, clock, prefix=prefix)
     state.set(conn, "last_backup_at", repr(now), now)
     return path
 
@@ -75,6 +103,7 @@ def backup_state_db(src: Path, dst_dir: Path, keep: int, now: datetime) -> Path:
         out = sqlite3.connect(str(tmp))
         try:
             source.backup(out)
+            _to_rollback_journal(out)
             row = out.execute("PRAGMA integrity_check").fetchone()
             if row is None or row[0] != "ok":
                 raise sqlite3.DatabaseError("backup copy failed integrity_check")

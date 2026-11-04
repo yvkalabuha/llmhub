@@ -26,7 +26,7 @@ import httpx
 from llmhub.configuration.loader import ConfigError, load_config
 from llmhub.configuration.models import Config
 
-DEFAULT_CONFIG = "/etc/llmhub/config.yaml"
+DEFAULT_CONFIG = "/etc/llmhub/conf/config.yaml"
 DEFAULT_ADMIN_KEY = "/etc/llmhub/admin.key"
 STDIN = "/dev/stdin"
 KILL_FILE = "KILL"  # same name as llmhub.killswitch.KILL_FILE (no controller import here)

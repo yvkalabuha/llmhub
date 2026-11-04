@@ -1,7 +1,7 @@
 """Weights-server probe (T-371 S10w): one pinned-TLS Range GET of 1 MiB with a fresh token.
 
     docker exec -i llmhub-weights-auth python -m llmhub.tools.weights_probe \
-        --config /etc/llmhub/config.yaml --op <op_id> [--expect-sha256 HEX] [--negatives]
+        --config /etc/llmhub/conf/config.yaml --op <op_id> [--expect-sha256 HEX] [--negatives]
 
 Runs where the weights secret is already mounted (`LLMHUB_WEIGHTS_SECRET_FILE`). The op must
 be a live instance (e.g. a Mock pool held in BOOTING). Before the request the host
