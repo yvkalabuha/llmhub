@@ -14,5 +14,8 @@
    ```
 3. Обычные запросы `/v1/chat/completions` (в т.ч. `stream`) работают как у OpenAI. Синхронное ожидание ≤ 8 мин, затем `503` + `Retry-After` + `task_id`; таймаут клиента должен быть больше (openai-python — 600 с). Долгие задачи и явные GPU-сеансы — `/v1/tasks`, `/v1/leases` (`docs/integration.md`, черновик).
 
+## Облачный под
+Образ `llmhub-infer` (`infer-image/`, см. его README): llama.cpp + фронт с ключом API на инстанс и загрузчиком весов (наш сервер весов → HF). Сервер весов и заметки установки — `deploy/README.md`. Весов и секретов в образе нет; push — только с разрешения заказчика.
+
 ## Разработка
 `uv sync`, `uv run pytest`, `uv run ruff check`, `uv run pyright`. Процесс и правила безопасности — `CLAUDE.md`; решения — `DECISIONS.md`; задачи — `BOARD.md`.

@@ -1,4 +1,4 @@
-"""Provider-independent adapter contract C1..C10 (plan section 7.2).
+"""Provider-independent adapter contract C1..C11 (plan section 7.2; C11 from T-370).
 
 Every real adapter (T-372) must pass `run_contract` against its own harness (sandbox or
 recorded fixtures); MockProvider passes it in `tests/test_b_contract.py`.
@@ -14,6 +14,7 @@ only after the grace from the first and the last create call (`teardown.no_ref_w
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import subprocess
 import sys
 from collections.abc import Awaitable
@@ -202,6 +203,23 @@ async def _c10(h: AdapterHarness) -> None:
     _check(proc.returncode == 0, "C10", f"import of {module} touched the network: {proc.stderr}")
 
 
+SECRET_SENTINEL = "llmhub-contract-secret-0f1e2d3c4b5a"
+
+
+async def _c11(h: AdapterHarness, secret: bytes) -> None:
+    """`InstanceSpec.secret_env` is accepted and never echoed back (T-370, ADR-0138 p. 12)."""
+    spec = dataclasses.replace(h.make_spec(), secret_env={"LLMHUB_API_KEY": SECRET_SENTINEL})
+    _check(SECRET_SENTINEL not in repr(spec), "C11", "repr(InstanceSpec) shows secret_env")
+    res = await h.adapter.create(spec, make_label(new_op_id(), secret))
+    try:
+        await h.settle()
+        seen = [repr(res), repr(await h.adapter.get(res.ref))]
+        seen += [repr(r) for r in await h.adapter.list_owned("llmhub-")]
+        _check(all(SECRET_SENTINEL not in x for x in seen), "C11", "a secret came back")
+    finally:
+        await h.adapter.destroy(res.ref)
+
+
 async def _item[T](item: str, coro: Awaitable[T]) -> T:
     try:
         return await coro
@@ -212,7 +230,7 @@ async def _item[T](item: str, coro: Awaitable[T]) -> T:
 
 
 async def run_contract(h: AdapterHarness, secret: bytes) -> None:
-    """Run C1..C10; raises AssertionError whose message starts with the failed item id."""
+    """Run C1..C11; raises AssertionError whose message starts with the failed item id."""
     await _item("C1", _c1(h))
     ref = await _item("C2", _c2(h, secret))
     try:
@@ -228,3 +246,4 @@ async def run_contract(h: AdapterHarness, secret: bytes) -> None:
     await _item("C8", _c8(h))
     await _item("C9", _c9(h, secret))
     await _item("C10", _c10(h))
+    await _item("C11", _c11(h, secret))

@@ -29,6 +29,7 @@ from llmhub.cloud_manager.inference import (
     JobRunSpec,
     NetworkLost,
 )
+from llmhub.cloud_manager.instance_env import MaterialFn
 from llmhub.cloud_manager.pools import PoolRuntime
 from llmhub.cloud_manager.provisioner import provision_step
 from llmhub.configuration.models import Config
@@ -112,6 +113,7 @@ class Controller:
         poll_s: float = POLL_INTERVAL_S,
         alive_check_s: float = ALIVE_CHECK_S,
         dup_sweep_s: float = DUP_SWEEP_S,
+        materials: Mapping[str, MaterialFn] | None = None,
     ) -> None:
         self.conn = conn
         self.cfg = cfg
@@ -121,6 +123,7 @@ class Controller:
             name: self._guard(a) if guard else a for name, a in adapters.items()
         }
         self.inference = inference
+        self.materials = dict(materials or {})  # pool -> pod env/secrets (T-370)
         self.bodies = bodies
         self.secret = secret
         self.boot_id = boot_id
@@ -481,7 +484,10 @@ class Controller:
 
     def _pool_rt(self, name: str) -> PoolRuntime:
         pool = self.cfg.pools[name]
-        return PoolRuntime(pool, self.adapters[pool.provider], self.inference[pool.provider])
+        return PoolRuntime(
+            pool, self.adapters[pool.provider], self.inference[pool.provider],
+            self.materials.get(name),
+        )  # fmt: skip
 
     def _spawn_op(self, key: str, coro: Coroutine[Any, Any, Any]) -> None:
         task = asyncio.get_running_loop().create_task(coro)

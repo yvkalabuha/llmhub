@@ -6,6 +6,7 @@ from dataclasses import dataclass
 
 from llmhub.clock import Clock
 from llmhub.cloud_manager.inference import InstanceLost, JobRunResult, JobRunSpec, NetworkLost
+from llmhub.cloud_manager.load_status import LoadStatus
 from llmhub.provider_adapters.base import RemoteStatus
 from llmhub.provider_adapters.mock import MockProvider
 
@@ -18,6 +19,10 @@ class MockInferenceKnobs:
     health_never: bool = False
     test_fail: int = 0  # number of test_request calls that fail first
     hang_load: bool = False
+    # load_status (LoadStatusSource, T-370): failure reason, fixed ETA, fallback sources left
+    load_fail: str | None = None
+    load_eta_s: float | None = None  # None -> remaining load_s (unknown while hang_load)
+    load_sources_left: int = 1
 
 
 class MockInference:
@@ -57,6 +62,25 @@ class MockInference:
             return False
         since = await self._running_since(endpoint)
         return since is not None and self.clock.now() >= since + self.knobs.load_s
+
+    async def load_status(self, endpoint: str) -> LoadStatus | None:
+        """Simulated `/health` body of `llmhub-infer`: loading -> ok, or failed by knob."""
+        if not self._reachable(endpoint):
+            return None
+        since = await self._running_since(endpoint)
+        if since is None:
+            return None
+        k = self.knobs
+        if k.load_fail is not None:
+            return LoadStatus(status="failed", reason=k.load_fail)
+        left = since + k.load_s - self.clock.now()
+        if not k.hang_load and left <= 0:
+            return LoadStatus(status="ok")
+        eta = k.load_eta_s if k.load_eta_s is not None else (None if k.hang_load else left)
+        return LoadStatus(
+            status="loading", phase="downloading", source="mock", eta_s=eta,
+            sources_left=k.load_sources_left,
+        )  # fmt: skip
 
     async def test_request(self, endpoint: str) -> bool:
         ref = self._ref(endpoint)

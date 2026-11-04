@@ -533,11 +533,11 @@ class HttpInferenceBackend:
   Выполнять после B; иначе — вместе с F.
 
 ### Поток E — интеграция в контроллер (sonnet; зависит от A и D1; файлы: `provider_adapters/base.py`, `cloud_manager/{instance_env,load_status,pools,provisioner}.py`, `provider_adapters/mock_inference.py`, `tests/test_w_instance_env.py`, `tests/test_w_provisioner_loading.py`, `tests/test_w_contract.py`)
-- E1 `InstanceSpec.secret_env` (последнее поле, default, `repr=False`):
+- [x] E1 `InstanceSpec.secret_env` (последнее поле, default, `repr=False`):
   - `test_b_types` не ломается;
   - новый тест: `repr(spec)` не содержит секрета;
   - `dataclasses.asdict` используется где-либо? — grep; если да, исключить поле.
-- E2 `test_w_instance_env.py` → `instance_env.py`:
+- [x] E2 `test_w_instance_env.py` → `instance_env.py`:
   - `derive_api_key` детерминирован и различается по op;
   - `derive_tls` детерминирован (два вызова → тот же PEM и отпечаток), Ed25519, срок ≥ `max_lifetime`; TLS-сервер с этим сертификатом принимается клиентом с `cadata`, чужой — нет;
   - `build_material`:
@@ -547,8 +547,8 @@ class HttpInferenceBackend:
     - без `self_hosted` в цепочке → без токена;
     - `HF_TOKEN` только если задан;
   - ни одно секретное значение не попадает в `env`.
-- E3 `test_w_contract.py`: `build_material` → `env|secret_env` → `llmhub_infer.supervisor.read_env` разбирает без ошибок, план совпадает поле в поле. Это единственное место, где тест импортирует оба пакета.
-- E4 Провижининг:
+- [x] E3 `test_w_contract.py`: `build_material` → `env|secret_env` → `llmhub_infer.supervisor.read_env` разбирает без ошибок, план совпадает поле в поле. Это единственное место, где тест импортирует оба пакета.
+- [x] E4 Провижининг:
   - `PoolRuntime.material`;
   - `_start_create` в той же tx намерения пишет `tls_fingerprint`; spec получает env/secret_env;
   - `direct` → `OfferQuery.need_public_ip=True`.
@@ -557,7 +557,7 @@ class HttpInferenceBackend:
   - шпион-адаптер видит env и secret_env;
   - повторный create (unknown outcome) с тем же label → тот же токен и отпечаток;
   - в `transitions`, `incidents`, `last_error` и логах нет секретов (grep по БД-дампу и caplog).
-- E5 `cloud_manager/load_status.py` (`LoadStatus`, `LoadStatusSource`) + `MockInference.load_status` (knob `load_fail`). В LOADING_MODEL при `isinstance(inference, LoadStatusSource)`:
+- [x] E5 `cloud_manager/load_status.py` (`LoadStatus`, `LoadStatusSource`) + `MockInference.load_status` (knob `load_fail`). В LOADING_MODEL при `isinstance(inference, LoadStatusSource)`:
   - `failed` → E7 сразу с reason `weights_failed:<reason>`;
   - прогресс — в `load_progress:<iid>`;
   - `on_pin_mismatch` → инцидент `tls_pin_mismatch` (high).
@@ -571,19 +571,19 @@ class HttpInferenceBackend:
   Регрессия: `tests/test_s0_skeleton.py tests/test_f_transitions.py tests/test_f_provisioner.py tests/test_c_timeouts.py`.
 
 ### Поток G — облачный `HttpInferenceBackend` (sonnet; зависит от E2 (`derive_api_key`, `derive_tls`) и A (`InferClientConfig`); файлы: `cloud_manager/http_inference.py`, `tests/i_infer_fake.py`, `tests/test_g_timings.py`, `tests/test_g_http_inference.py`, `tests/test_g_http_inference_live.py`)
-- G1 Чтение кода ядра: как `controller`/`scheduler` вызывают `run` и обрабатывают исключения и `finish_reason`; результат — в журнал (одна строка); таблица ошибок 5.3 подстраивается под ядро.
-- G2 `test_g_timings.py` → `parse_timings`:
+- [x] G1 Чтение кода ядра: как `controller`/`scheduler` вызывают `run` и обрабатывают исключения и `finish_reason`; результат — в журнал (одна строка); таблица ошибок 5.3 подстраивается под ядро.
+- [x] G2 `test_g_timings.py` → `parse_timings`:
   - полный ответ llama-server с MTP (`draft_n`, `draft_n_accepted`) → `pp_tps`, `tg_tps`, `accept_rate`;
   - без MTP → `None` в draft-полях;
   - нет `timings`, нули, строки вместо чисел, отрицательные → `None` или корректные значения без исключений.
-- G3 `tests/i_infer_fake.py` — фейковый `llmhub-infer` (Starlette-приложение, тот же контракт, что `llmhub_infer.front`). Knobs:
+- [x] G3 `tests/i_infer_fake.py` — фейковый `llmhub-infer` (Starlette-приложение, тот же контракт, что `llmhub_infer.front`). Knobs:
   - ключ, фаза (`loading`/`ok`/`failed`);
   - ответ чата с `usage` и `timings`;
   - задержка до первого байта, обрыв посреди тела, 4xx/5xx с телом и без;
   - «прокси без пода» (502 HTML).
 
   Подключается к backend через `transport_factory` (`httpx.ASGITransport`) — без сети и портов.
-- G4 `test_g_http_inference.py` (ASGI-транспорт), отдельные тесты:
+- [x] G4 `test_g_http_inference.py` (ASGI-транспорт), отдельные тесты:
   - `ping` 204 → True; исключение → False;
   - `health`: ok → True; loading/failed → False; без ключа (неверный op) → False;
   - `test_request`: 200 + choices → True; пустые choices или 500 → False; задержка > `test_s` → False;
@@ -597,18 +597,18 @@ class HttpInferenceBackend:
   - `load_status`: разбор JSON фронта во всех фазах; мусор → `None`;
   - endpoint не в БД → False / `NetworkLost`;
   - в логах нет ключа.
-- G5 `test_g_http_inference_live.py` — настоящий `llmhub_infer.front` (поток C) в uvicorn на `127.0.0.1:0` за фейковым upstream llama:
+- [x] G5 `test_g_http_inference_live.py` — настоящий `llmhub_infer.front` (поток C) в uvicorn на `127.0.0.1:0` за фейковым upstream llama:
   - `direct` с TLS из `derive_tls` → ping/health/test/run проходят;
   - сервер с другим сертификатом → False / `NetworkLost` и `on_pin_mismatch` вызван;
   - `proxy`-режим: локальный TLS-сервер с отдельным тестовым CA (в тесте подменяется контекст «системных CA»); `http://` отвергается.
 
   Зависит от C1; до готовности C — пропуск с пометкой (skip), не заглушка.
-- G6 Подключение в composition root: где строится `PoolRuntime` для облачных провайдеров — `HttpInferenceBackend`; Mock — `MockInference`. Если composition root — в T-369/T-371, оставить фабрику `make_inference(cfg, conn, secrets, provider_name)` и строку во «Входящие» T-371.
+- [x] G6 Подключение в composition root: где строится `PoolRuntime` для облачных провайдеров — `HttpInferenceBackend`; Mock — `MockInference`. Если composition root — в T-369/T-371, оставить фабрику `make_inference(cfg, conn, secrets, provider_name)` и строку во «Входящие» T-371.
 
 ### Поток F — интеграция и документы (haiku/sonnet, после всех)
-- F1 Полный набор тестов задачи: `uv run pytest tests/test_w_*.py tests/test_i_*.py tests/test_g_*.py -q` + регрессия E5; `-m docker` отдельно; `uv run ruff check`, `uv run pyright` по всему дереву.
-- F2 Короткий `infer-image/README.md` (TL;DR, env-контракт из раздела 3, health-семантика, ручные команды C5, «не публиковать без разрешения»).
-- F3 Задача: журнал, отметки критериев; BOARD — только строка T-370 (статус `review`); во «Входящие» T-371 занести, что развернуть:
+- [x] F1 Полный набор тестов задачи: `uv run pytest tests/test_w_*.py tests/test_i_*.py tests/test_g_*.py -q` + регрессия E5; `-m docker` отдельно; `uv run ruff check`, `uv run pyright` по всему дереву.
+- [x] F2 Короткий `infer-image/README.md` (TL;DR, env-контракт из раздела 3, health-семантика, ручные команды C5, «не публиковать без разрешения»).
+- [x] F3 Задача: журнал, отметки критериев; BOARD — только строка T-370 (статус `review`); во «Входящие» T-371 занести, что развернуть:
   - nginx-юнит;
   - `auth_app`-юнит;
   - сертификат;

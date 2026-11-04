@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import enum
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Protocol
 
 
@@ -83,6 +83,8 @@ class InstanceSpec:
     max_price_usd_h: float
     max_lifetime_s: int
     env: Mapping[str, str]  # non-secret only
+    # secrets for the pod (API key, weights token, TLS key): never in repr, logs or the DB
+    secret_env: Mapping[str, str] = field(default_factory=dict[str, str], repr=False)
 
 
 @dataclass(frozen=True)

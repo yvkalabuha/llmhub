@@ -25,13 +25,21 @@ from collections.abc import Callable, Coroutine
 from typing import Any
 
 from llmhub.budget_manager.accounts import handle_provider_error
+from llmhub.cloud_manager.instance_env import InstanceMaterial
+from llmhub.cloud_manager.load_status import LoadStatus, LoadStatusSource
 from llmhub.cloud_manager.offers import select_offer
 from llmhub.cloud_manager.pools import PoolRuntime
 from llmhub.configuration.models import Config
 from llmhub.lifecycle_manager import machine, timeouts
 from llmhub.lifecycle_manager.machine import transition
 from llmhub.lifecycle_manager.recovery import destroy_duplicates, split_duplicates
-from llmhub.lifecycle_manager.safety import delete_key, get_key, record_incident, set_key
+from llmhub.lifecycle_manager.safety import (
+    blacklist_host,
+    delete_key,
+    get_key,
+    record_incident,
+    set_key,
+)
 from llmhub.lifecycle_manager.states import State
 from llmhub.lifecycle_manager.teardown import adopt_ref_or_destroy
 from llmhub.persistence.db import assert_not_in_tx, tx
@@ -189,14 +197,25 @@ async def _start_create(
     query = OfferQuery(
         gpu=pool.gpu, min_vram_gb=pool.vram_gb, max_price_usd_h=pool.max_price_usd_h,
         exclude_hosts=_excluded(conn, inst["id"]),
+        need_public_ip=pool.infer.transport == "direct",  # direct TLS needs a reachable IP
     )  # fmt: skip
     try:
         offers = await adapter.list_offers(query)
     except Exception:  # noqa: BLE001 - adapters may raise anything; retried next step
         offers = []
-    offer: Offer | None = select_offer(
-        offers, query, blacklisted_hosts(conn, pool.provider, now)
-    )
+    material: InstanceMaterial | None = None
+    if rt.material is not None:
+        try:  # derived from the row: a repeated create with the same label gets the same
+            material = rt.material(inst)
+        except Exception as exc:  # noqa: BLE001 - a config problem must not stop the loop
+            record_incident(
+                conn, now, "instance_material_failed", "high", ref=inst["id"],
+                dedup_key=f"instance_material:{inst['id']}",
+                details={"error": type(exc).__name__},
+            )  # fmt: skip
+            _fail_provisioning(conn, inst["id"], now, "instance_material")
+            return CreateOutcome.FAILED
+    offer: Offer | None = select_offer(offers, query, blacklisted_hosts(conn, pool.provider, now))
     if offer is None:
         if now >= float(inst["state_since"]) + cfg.timeouts.offer_wait_s:
             _fail_provisioning(conn, inst["id"], now, str(UnavailableReason.GPU_UNAVAILABLE))
@@ -211,15 +230,18 @@ async def _start_create(
         cur = conn.execute(
             "UPDATE instances SET offer_json=?, create_called_at=?, attempts=attempts+1,"
             " first_create_called_at=COALESCE(first_create_called_at, ?),"
-            " last_create_called_at=?, gpu=?"
+            " last_create_called_at=?, gpu=?, tls_fingerprint=?"
             " WHERE id=? AND state='PROVISIONING' AND create_called_at IS NULL",
-            (offer_json, now, now, now, offer.gpu, inst["id"]),
-        )
+            (offer_json, now, now, now, offer.gpu,
+             material.tls_fingerprint if material is not None else None, inst["id"]),
+        )  # fmt: skip
         if cur.rowcount != 1:
             return CreateOutcome.RETRY_LATER
     spec = InstanceSpec(
         pool=pool.name, offer_id=offer.offer_id, image=pool.image, disk_gb=pool.disk_gb,
-        max_price_usd_h=pool.max_price_usd_h, max_lifetime_s=cfg.timeouts.max_lifetime_s, env={},
+        max_price_usd_h=pool.max_price_usd_h, max_lifetime_s=cfg.timeouts.max_lifetime_s,
+        env=dict(material.env) if material is not None else {},
+        secret_env=dict(material.secret_env) if material is not None else {},
     )  # fmt: skip
     coro = _do_create(conn, adapter, inst, spec, offer.host_id, cfg, now_fn)
     if spawn is None:
@@ -324,6 +346,85 @@ async def _provisioning(
     await _start_create(conn, rt, inst, now, cfg, spawn, now_fn)
 
 
+LLAMA_LOAD_S = 60.0  # model load after the download (ETA margin, plan 2a item 6)
+SLOW_MIN_S = 60.0  # no early E7 during the first minute of LOADING_MODEL
+# "two consecutive polls": the first slow poll is remembered; E7 when the pod is still too slow
+# at least one poll interval later (extra steps at the same time do not count twice)
+SLOW_CONFIRM_S = 5.0  # = controller POLL_INTERVAL_S
+_DOWNLOAD_PHASES = frozenset({"downloading", "verifying", "loading"})
+
+
+def _progress_key(iid: str) -> str:
+    return f"load_progress:{iid}"
+
+
+def _slow_key(iid: str) -> str:
+    return f"load_slow_since:{iid}"
+
+
+def _clear_load_keys(conn: sqlite3.Connection, iid: str) -> None:
+    delete_key(conn, _progress_key(iid))
+    delete_key(conn, _slow_key(iid))
+
+
+def _weights_error(conn: sqlite3.Connection, inst: sqlite3.Row, now: float, cfg: Config,
+                   cause: str) -> None:  # fmt: skip
+    """Early E7 (LOADING_MODEL -> ERROR) without waiting for `loading_model_s`."""
+    with tx(conn):
+        if transition(conn, inst["id"], State.LOADING_MODEL, State.ERROR, "E7", now,
+                      "controller", last_error=cause, reason=cause):  # fmt: skip
+            blacklist_host(conn, inst["provider"], inst["host_id"], now,
+                           cfg.retry.host_blacklist_s, cause)  # fmt: skip
+            _clear_load_keys(conn, inst["id"])
+
+
+def _too_slow(st: LoadStatus, inst: sqlite3.Row, now: float, cfg: Config) -> bool:
+    """No fallback source left and the projected finish misses the LOADING_MODEL budget."""
+    since = float(inst["state_since"])
+    if now - since < SLOW_MIN_S or st.status != "loading" or st.phase not in _DOWNLOAD_PHASES:
+        return False
+    if st.sources_left != 0 or st.eta_s is None:  # a fallback exists, or ETA unknown
+        return False
+    return now + st.eta_s + LLAMA_LOAD_S > since + cfg.timeouts.loading_model_s
+
+
+async def _load_progress(
+    conn: sqlite3.Connection, rt: PoolRuntime, inst: sqlite3.Row, now: float, cfg: Config
+) -> bool:
+    """Read the pod's load status (optional `LoadStatusSource`). True = this step is done.
+
+    `failed` -> E7 `weights_failed:<reason>` at once; still downloading and too slow on two
+    polls `SLOW_CONFIRM_S` apart -> E7 `weights_too_slow`; `None` (unknown/not ours) or a
+    backend without `load_status` -> the old health/test path.
+    """
+    backend = rt.inference
+    if not isinstance(backend, LoadStatusSource):
+        return False
+    iid = inst["id"]
+    try:
+        st = await backend.load_status(inst["endpoint"])
+    except Exception:  # noqa: BLE001 - backends may raise anything; poll again later
+        st = None
+    if st is None:
+        return False
+    if st.status == "failed":
+        _weights_error(conn, inst, now, cfg, f"weights_failed:{st.reason or 'unknown'}"[:80])
+        return True
+    slow = _too_slow(st, inst, now, cfg)
+    raw = get_key(conn, _slow_key(iid))
+    slow_since = (float(raw) if raw is not None else now) if slow else None
+    with tx(conn):
+        set_key(conn, _progress_key(iid), json.dumps(st.to_json_dict(), sort_keys=True), now)
+        if slow_since is None:
+            delete_key(conn, _slow_key(iid))
+        elif raw is None:
+            set_key(conn, _slow_key(iid), repr(now), now)
+    if slow_since is not None and now - slow_since >= SLOW_CONFIRM_S:
+        _weights_error(conn, inst, now, cfg, "weights_too_slow")
+        return True
+    return st.status == "loading" and st.phase in _DOWNLOAD_PHASES
+
+
 async def provision_step(
     conn: sqlite3.Connection,
     pool_rt: PoolRuntime,
@@ -356,12 +457,15 @@ async def provision_step(
         elif state == State.LOADING_MODEL:
             assert inst["endpoint"] is not None
             ep = inst["endpoint"]
+            if await _load_progress(conn, pool_rt, inst, now, cfg):
+                return  # E7 done, or the pod still downloads (health would be 503 anyway)
             if not await pool_rt.inference.health(ep):
                 return  # still loading; the 20 min timeout is E7 in apply_timeouts
             if await pool_rt.inference.test_request(ep):
                 with tx(conn):
-                    transition(conn, inst["id"], State.LOADING_MODEL, State.READY, "E6", now,
-                               "controller", ready_at=now)  # fmt: skip
+                    if transition(conn, inst["id"], State.LOADING_MODEL, State.READY, "E6", now,
+                                  "controller", ready_at=now):  # fmt: skip
+                        _clear_load_keys(conn, inst["id"])
             else:
                 timeouts.note_model_test_failure(conn, inst["id"], now, cfg)
     except ProviderError:
