@@ -253,6 +253,7 @@ def test_s8c_passed_dry_run_installs_the_checked_conf(tmp_path: Path) -> None:
     (tmp_path / "logrotate-llmhub-acct").write_text("same\n")
     prog = (
         f"STAGE={tmp_path}/mark/stage\nLOGS={tmp_path}/logs\nmkdir -p $LOGS\nAUTH_PORT=8096\n"
+        f"MARK={tmp_path}/mark\nmkdir -p $MARK\n"
         f"PUBLIC_IP=1.2.3.4\nWEIGHTS_PORT=9443\nRATE=80m\nMAX_DL=1\nDIST={tmp_path}\n"
         f"LOGROTATE_FILE={tmp_path}/logrotate-llmhub-acct\n"
         "install() {\n"
@@ -261,8 +262,10 @@ def test_s8c_passed_dry_run_installs_the_checked_conf(tmp_path: Path) -> None:
         ' *) a+=("$1"); shift ;; esac; done\n'
         '    if [ $d = 1 ]; then mkdir -p "${a[@]}"; else cp "${a[0]}" "${a[1]}"; fi\n}\n'
         "image_id() { echo img; }\nnginx_id() { echo ngx; }\nexists() { return 1; }\n"
-        "drun_once() { printf 'new\\n' >\"$STAGE/nginx-weights.conf\"; }\n"
-        'docker() { echo "docker $*" >>$CALLS; }\n'
+        "drun_once() { printf 'new\\n    listen 1.2.3.4:9443 ssl;\\n' >\"$STAGE/nginx-weights.conf\"; }\n"
+        # the stub copies the mounted dry-run conf so the test can inspect it
+        'docker() { echo "docker $*" >>$CALLS; local a; for a in "$@"; do\n'
+        '  case $a in *:/etc/nginx-weights/nginx.conf:ro) cp "${a%%:*}" "$MARK/dry.seen";; esac; done; }\n'
         'drun_named() { echo "run $1" >>$CALLS; }\n'
         "marker() { :; }\ncheck_s8c() { :; }\n"
         + _fns("stage_dir", "render_nginx_conf", "apply_s8c")
@@ -270,10 +273,14 @@ def test_s8c_passed_dry_run_installs_the_checked_conf(tmp_path: Path) -> None:
     )
     r = _bash(prog, tmp_path)
     assert r.returncode == 0, r.stderr
-    assert (tmp_path / "etc" / "nginx-weights.conf").read_text() == "new\n"
+    assert (tmp_path / "etc" / "nginx-weights.conf").read_text() == "new\n    listen 1.2.3.4:9443 ssl;\n"
     assert not (tmp_path / "etc" / "nginx-weights.conf.new").exists()
     dry = next(c for c in _calls(tmp_path) if c.startswith("docker run"))
-    assert f"{tmp_path}/etc/nginx-weights.conf.new:/etc/nginx-weights/nginx.conf:ro" in dry
+    assert f"{tmp_path}/mark/nginx-dry." in dry and ":/etc/nginx-weights/nginx.conf:ro" in dry
+    # the dry run binds loopback (the public IP is absent under --network none); the copy is removed
+    seen = (tmp_path / "mark" / "dry.seen").read_text()
+    assert "listen 127.0.0.1:9443 ssl;" in seen and "1.2.3.4" not in seen
+    assert not list((tmp_path / "mark").glob("nginx-dry.*"))
 
 
 # ------------------------------------------------------------------ /opt/models readability

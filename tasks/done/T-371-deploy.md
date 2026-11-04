@@ -5,7 +5,7 @@
 - Проект: llmhub
 - Тип: chore
 - Агент: analyst → implementer → reviewer
-- Статус: review (код; шаги сервера S0–S14 не выполнены — их выполняет координатор)
+- Статус: done
 - План: tasks/plans/T-371-plan.md
 - Приоритет: P1
 - Зависит от: T-369, T-370
@@ -250,3 +250,6 @@ Implementer, 2026-11-04. ssh не использовался, сервер не 
 - 2026-11-04: implementer — исправления раунда 1 (все находки циклов 1 и 2), релиз `dist/0.2.1` (image `sha256:6f1dd818…`), полный прогон зелёный; статус остаётся review.
 - 2026-11-04: reviewer — цикл 3 (повторное ревью раунда 1): исправления верны, регрессий нет; новая R3-5 (high, образ по digest индекса на classic-сторе) + R3-1..R3-4 (low); changes required, статус не менял.
 - 2026-11-04: implementer — исправления раунда 2 (R3-1..R3-5), релиз `dist/0.2.2`, xfail сняты; статус review.
+- 2026-11-04 (координатор): установка на 65.109.95.35 выполнена, dist 0.2.2. Окно 1: s0–s7, e2e pre/post-restart/kill — все проверки ok, s11 ok. Окно 2: s8a–s8c, s9, проба весов (Range 1 MiB, pinned TLS, негативы ok, MemAvailable ≈ 30 ГиБ), внешние проверки с рабочей станции (401 / 404 / TLS 1.2 отказ / 8095 снаружи закрыт), s10x (клиент e2e удалён, ключ стёрт), s11 ok: llama-server ExecMainPID/NRestarts и чужие контейнеры без изменений. Модель весов — qwen3.8-27b UD-Q4_K_M + MTP.
+- 2026-11-04 (координатор): найдено на сервере — `nginx -t` в s8c с `--network none` не может bind на публичный IP (99: Address not available); исправлено: сухой прогон идёт на копии конфига с `listen 127.0.0.1:9443`. Тест `test_s8c_passed_dry_run_installs_the_checked_conf` обновлён, F5 зелёный, скрипт в dist/0.2.2 и SHA256SUMS обновлены (образы не менялись).
+- 2026-11-04 (координатор): S12 — `llmhub` зарегистрирован в `/var/www/projectVoiceBot/.mcp.json` (копия `.mcp.json.bak-*`) и в новом `/var/www/gameDev/.mcp.json`; ключ клиента `agents` (cloud_allowed=false) — `~/.config/llmhub/agents.key` 0600. Smoke: `llmhub_models` ok, `llmhub_ask kind=classify` → verdict ok (local qwen-35b-a3b). S13 (GHCR) не выполнялся.

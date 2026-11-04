@@ -4,7 +4,6 @@
 
 | ID | Задача | Тип | Статус | Зависит |
 |---|---|---|---|---|
-| T-371 | 3d: деплой в Docker на 65.109.95.35, e2e на Mock, integration.md | impl | review (fix round 2, dist 0.2.2; шаги сервера S0–S14 — координатор) | T-369, T-370 |
 | T-372 | Этап 4: spike dstack + тест RunPod ≤ $5 | test | blocked | T-371 |
 
 ## Входящие

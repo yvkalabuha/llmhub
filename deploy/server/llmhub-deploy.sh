@@ -829,15 +829,23 @@ apply_s8c() {
     for f in weights-acct.log weights-access.log weights-error.log; do
         [ -e "$LOGS/$f" ] || install -m 0640 -o $UID_NGINX -g $UID_API /dev/null "$LOGS/$f"
     done
-    # L5: dry run hardened like the service; logs go to a throw-away tmpfs, never $LOGS
+    # L5: dry run hardened like the service; logs go to a throw-away tmpfs, never $LOGS.
+    # `nginx -t` binds its listen sockets: with --network none the public IP does not exist
+    # (and with host network the live nginx already holds the port), so the dry-run copy
+    # listens on the container's own loopback instead. Only the listen address differs.
+    local dry rc=0
+    dry=$(mktemp "$MARK/nginx-dry.XXXXXX")
+    sed "s/listen $PUBLIC_IP:$WEIGHTS_PORT /listen 127.0.0.1:$WEIGHTS_PORT /" "$conf" >"$dry"
+    chmod 0644 "$dry"
     docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges:true \
         --pids-limit 64 --network none --user "$UID_NGINX:$UID_NGINX" \
         --group-add $UID_API --tmpfs /tmp --tmpfs "$LOGS:rw,noexec,nosuid,size=1m,mode=1777" \
         --entrypoint nginx \
-        -v "$conf:/etc/nginx-weights/nginx.conf:ro" \
+        -v "$dry:/etc/nginx-weights/nginx.conf:ro" \
         -v "$ETC/weights:$ETC/weights:ro" -v "$MODELS:$MODELS:ro" \
-        "$(nginx_id)" -t -q -e stderr -c /etc/nginx-weights/nginx.conf \
-        || { rm -f "$ETC/nginx-weights.conf.new"; die "nginx -t failed (live conf kept)"; }
+        "$(nginx_id)" -t -q -e stderr -c /etc/nginx-weights/nginx.conf || rc=1
+    rm -f "$dry"
+    [ $rc = 0 ] || { rm -f "$ETC/nginx-weights.conf.new"; die "nginx -t failed (live conf kept)"; }
     if [ "$changed" = 1 ]; then mv "$ETC/nginx-weights.conf.new" "$ETC/nginx-weights.conf"; fi
     # a single-file mount keeps the old inode: a changed conf needs a restart (SEC-D2)
     if [ "$changed" = 1 ] && exists llmhub-weights-nginx; then dctl restart llmhub-weights-nginx; fi
