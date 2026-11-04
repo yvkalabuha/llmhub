@@ -7,7 +7,7 @@
 |---|---|
 | `docker/Dockerfile`, `docker/.dockerignore` | образ `llmhub` (база закреплена по digest, wheelhouse с хешами, `USER 64100`, без секретов и конфигов) |
 | `docker/images.env` | закреплённые образы: python, nginx (сервер), ubuntu и dind (только тест F5) |
-| `docker/build.sh` | сборка: wheel → `uv export` → `pip download --require-hashes` → `docker build --pull=false` → `docker save` (llmhub и nginx) → `image.id`, `nginx.id`, `SHA256SUMS` в `dist/<ver>/` |
+| `docker/build.sh` | сборка: wheel → `uv export` → `pip download --require-hashes` → `docker build --pull=false` → `docker save` (llmhub и nginx) → `image.id`, `nginx.id` (digest индекса) и `image.config-id`, `nginx.config-id` (digest конфига из `manifest.json` tar, для классического хранилища образов, R3-5), `SHA256SUMS` в `dist/<ver>/` |
 | `docker/run-args/*.args` | аргументы `docker run` каждого контейнера (по одному на строку, `@IMAGE@` = Id образа); источник истины для скрипта и тестов |
 | `server/llmhub-deploy.sh` | шаги S0–S14 (план T-371 §6): `s0 s1 s2 s3 s4 s5 s6 s7 s8a s8b s8c s9 s10x s11 s14` |
 | `config.example.yaml` | шаблон серверного конфига (Mock, `api.host 10.8.0.1`, `docs: false`, клиенты `voicebot`, `gamedev`, `agents`, `e2e`) |
@@ -39,13 +39,14 @@
 | `/var/lib/llmhub` | `llmhub:llmhub 0750`; `state.db*` 0640 (umask 0027 в `serve`/reaper) |
 | `/var/lib/llmhub-weights-auth` | `llmhub-wauth 0700` |
 | `/var/log/llmhub` | `root:llmhub 0750`; `weights-*.log` 0640 `llmhub-wnginx:llmhub` |
-| `/var/lib/llmhub-deploy` | 0700 root: маркеры шагов, `hashes.txt`, снимок `preflight/baseline`, `s2.created` (созданные пользователи), `ufw-*.added` (добавленные правила), временный `stage/` (0700 `llmhub`, только на время render) |
+| `/var/lib/llmhub-deploy` | 0700 root: маркеры шагов, `hashes.txt`, снимок `preflight/baseline` (с `docker-store.txt`), `image-<ver>.local-id`, `nginx-<ver>.local-id` (Id образов после `s3`), `s2.created` (созданные пользователи), `ufw-*.added` (добавленные правила), временный `stage/` (0700 `llmhub`, только на время render) |
 
 Пользователи (`useradd --system`, `nologin`): `llmhub` 64100, `llmhub-wnginx` 64101, `llmhub-wauth` 64102. id фиксированы, поэтому переустановка после S14 и восстановление из архива сохраняют владельцев (F13).
 
 ## Порядок (план T-371 §6)
 - **Окно 1**: `s0` (снимок, только чтение) → `s1` (SHA256SUMS) → `s2` → `s3` → `s4` → `s5` → `s6` → `s7` → e2e (`scripts/e2e_mock.py pre`, `docker restart llmhub-api`, `post-restart`, `kill`) → `s11`.
-- **Окно 2**: `s8a` → `s8b` (`LLMHUB_WEIGHTS_MODEL=<rel> [LLMHUB_WEIGHTS_DRAFT=<rel>]`) → `s8c` → `s9` → проба `docker exec llmhub-weights-auth python -m llmhub.tools.weights_probe --config /etc/llmhub/conf/config.yaml --op auto --negatives [--expect-sha256 …]` (сразу после `scripts/e2e_mock.py prewarm` — Mock-инстанс в BOOTING около 60 с; admin `hold` GPU не запускает, он только держит уже живую; затем `close-lease --lease <id>`) → `s10x` (в конце T-371: клиент `e2e` удаляется, ключ — `shred`; до этого он нужен пробе) → `s11`.
+- **Окно 2**: `s8a` → `s8b` (`LLMHUB_WEIGHTS_MODEL=<rel> [LLMHUB_WEIGHTS_DRAFT=<rel>]`; render идёт от uid 64100: нужны o+r на `/opt/models/sha256-T365.txt` и GGUF, o+x на `/opt/models` и каталоги моделей — `s0` предупреждает `WARN`, R3-4) → `s8c` → `s9` → проба `docker exec llmhub-weights-auth python -m llmhub.tools.weights_probe --config /etc/llmhub/conf/config.yaml --op auto --negatives [--expect-sha256 …]` (сразу после `scripts/e2e_mock.py prewarm` — Mock-инстанс в BOOTING около 60 с; admin `hold` GPU не запускает, он только держит уже живую; затем `close-lease --lease <id>`) → `s10x` (в конце T-371: клиент `e2e` удаляется, ключ — `shred`; до этого он нужен пробе) → `s11`.
+- Новый конфиг (`s5`, `s8b`, `s10x`) сначала проходит `config-check` как `config.yaml.new` и только потом заменяет живой; новый `nginx-weights.conf` — `nginx -t` как `.new` (R3-1, R3-3). При отказе живой файл не меняется.
 - Каждый шаг: `apply` → `check` = 0. Неожиданный вывод — остановиться и разобрать. Откат: `rollback` того же шага; полный откат — `s14`.
 - Изменение конфига (`s5`, `s8b`, `s10x` и их откаты) перезапускает `llmhub-api`, `llmhub-reaper` и `llmhub-weights-auth`, если они есть. Изменение `nginx-weights.conf` в `s8c` перезапускает `llmhub-weights-nginx`. render и `keys new` работают от uid 64100 во временном каталоге `stage/`, а не от root поверх `/etc/llmhub` (L6).
 - `s9 check` проходит через `lo`. Правило ufw на публичном интерфейсе проверяется только **с внешнего хоста** — команды в `docs/runbook.md` §6 (L7).

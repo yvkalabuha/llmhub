@@ -23,7 +23,7 @@ EXPORTING = [
 
 
 def test_version() -> None:
-    assert llmhub.__version__ == "0.2.1"
+    assert llmhub.__version__ == "0.2.2"
 
 
 @pytest.mark.parametrize("name", MODULES)

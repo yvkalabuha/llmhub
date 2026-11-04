@@ -1,6 +1,6 @@
 # Runbook llmhub (сервер 65.109.95.35)
 
-> TL;DR: Как эксплуатировать llmhub в Docker на 65.109.95.35 (релиз 0.2.1, конфиг в каталоге `/etc/llmhub/conf/`). Работают четыре контейнера `llmhub-*` (все `--network host`); журналы лежат в journald, CLI вызывается через `docker exec -i … --admin-key-file /dev/stdin`. Здесь собраны инциденты (`weights_config`, `db_corrupt`, код 75, KILL, `tls_pin_mismatch`, `low_memory`), бэкап и восстановление, ротация ключей и сертификата, обновление и откат (S14). Шаги установки — `deploy/README.md` и план T-371 §6.
+> TL;DR: Как эксплуатировать llmhub в Docker на 65.109.95.35 (релиз 0.2.2, конфиг в каталоге `/etc/llmhub/conf/`). Работают четыре контейнера `llmhub-*` (все `--network host`); журналы лежат в journald, CLI вызывается через `docker exec -i … --admin-key-file /dev/stdin`. Здесь собраны инциденты (`weights_config`, `db_corrupt`, код 75, KILL, `tls_pin_mismatch`, `low_memory`), бэкап и восстановление, ротация ключей и сертификата, обновление и откат (S14). Шаги установки — `deploy/README.md` и план T-371 §6.
 
 ## 1. Что где
 | Что | Где |
@@ -76,7 +76,7 @@
 
 ## 7. Обновление релиза и откат
 1. На рабочей станции: `nice -n 10 deploy/docker/build.sh` → `dist/<ver>/`. Скопировать каталог в `/root/llmhub-dist/<ver>/` и выполнить `llmhub-deploy.sh s1 check` (SHA256SUMS).
-2. `s3 apply` нового релиза (`docker load`, сверка Id тегов `llmhub:<ver>` и `llmhub-nginx:<ver>` с `image.id`/`nginx.id`). `s3 rollback` снимает только эти теги (SEC-D5): Id нашего nginx совпадает с upstream `nginx:1.27-alpine`, и образ под чужим тегом остаётся.
+2. `s3 apply` нового релиза (`docker load`, сверка Id тегов `llmhub:<ver>` и `llmhub-nginx:<ver>` с `image.id`/`nginx.id` или `image.config-id`/`nginx.config-id`). Хранилище containerd показывает digest индекса, классическое (overlay2/vfs) — digest конфига (R3-5); фактический Id записывается в `/var/lib/llmhub-deploy/<image|nginx>-<ver>.local-id`, по нему запускаются контейнеры. Тип хранилища — `preflight/baseline/docker-store.txt` (s0). `s3 rollback` снимает только эти теги и только если их Id наш (SEC-D5, R3-2): Id нашего nginx совпадает с upstream `nginx:1.27-alpine`, и образ под чужим тегом остаётся.
 3. Контейнеры по новому Id: `s6 rollback` → `s6 apply` из нового каталога (данные остаются), для окна 2 так же `s8c`.
 4. Откат: те же `s6`/`s8c`, но скриптом из `/root/llmhub-dist/<prev>/` (в его `image.id` старый Id).
 - **Полный откат (S14)**: `llmhub-deploy.sh s14 apply`. Удаляются только `llmhub-*` контейнеры, правила ufw, которые добавил сам скрипт (`/var/lib/llmhub-deploy/ufw-*.added`, L1), таймер бэкапа и logrotate. `/etc/llmhub`, `/var/lib/llmhub*` и `/var/log/llmhub` архивируются в `/root/llmhub-rollback-<ts>.tgz` (0600) и **удаляются**. Затем снимаются наши теги образов и удаляются пользователи и группы, записанные в `s2.created` (L2). В конце выполняется `s11`: новые слушатели на 0.0.0.0/`[::]` и чужие адреса на 8095/8096/9443 считаются ошибкой (L3).

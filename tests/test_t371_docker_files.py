@@ -272,6 +272,6 @@ def test_build_script() -> None:
     text = (DOCKER / "build.sh").read_text()
     subprocess.run(["bash", "-n", str(DOCKER / "build.sh")], check=True)
     for need in ("--pull=false", "--require-hashes", "--only-binary :all:", "uv export --frozen",
-                 "docker save", "image.id", "SHA256SUMS",
+                 "docker save", "image.id", "image.config-id", "nginx.config-id", "SHA256SUMS",
                  'chmod -R u=rwX,go=rX "$STAGE/deploy"'):  # fmt: skip
         assert need in text, need

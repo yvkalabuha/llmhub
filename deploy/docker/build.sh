@@ -3,7 +3,7 @@
 #   nice -n 10 deploy/docker/build.sh            -> dist/<ver>/
 # Steps: wheel + `uv export` (hashes from uv.lock) -> wheelhouse via `pip download
 # --only-binary :all: --require-hashes` inside the pinned python image -> `docker build
-# --pull=false` -> `docker save | gzip` (llmhub + pinned nginx) -> image.id, nginx.id,
+# --pull=false` -> `docker save | gzip` (llmhub + pinned nginx) -> image.id, nginx.id (+ .config-id),
 # deploy files, SHA256SUMS. The server loads the tarballs and never pulls (S3).
 set -euo pipefail
 
@@ -43,6 +43,16 @@ docker image inspect -f '{{.Id}}' "$TAG" >"$OUT/image.id"
 docker image inspect -f '{{.Id}}' "$NGINX_TAG" >"$OUT/nginx.id"
 docker save "$TAG" | gzip -n >"$OUT/llmhub-$VER.tar.gz"
 docker save "$NGINX_TAG" | gzip -n >"$OUT/nginx-weights-$VER.tar.gz"
+# R3-5: a graphdriver image store (overlay2/vfs) reports the CONFIG digest as .Id after
+# `docker load`, the containerd store the index digest: ship both (from the tar's manifest.json)
+config_id() {  # config_id TARBALL -> sha256:<config digest> of its single manifest
+    local m
+    m=$(gzip -dc "$1" | tar -xO manifest.json | grep -o '"Config":"blobs/sha256/[0-9a-f]\{64\}"')
+    [ "$(wc -l <<<"$m")" = 1 ] || { echo "build: $1: want exactly 1 manifest" >&2; exit 2; }
+    printf 'sha256:%s\n' "$(grep -o '[0-9a-f]\{64\}' <<<"$m")"
+}
+config_id "$OUT/llmhub-$VER.tar.gz" >"$OUT/image.config-id"
+config_id "$OUT/nginx-weights-$VER.tar.gz" >"$OUT/nginx.config-id"
 echo "$VER" >"$OUT/VERSION"
 rm -rf "$OUT/run-args" "$OUT/systemd"
 cp -r "$ROOT/deploy/docker/run-args" "$ROOT/deploy/systemd" "$OUT/"

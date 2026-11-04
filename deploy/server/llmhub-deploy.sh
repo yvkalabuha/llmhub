@@ -98,9 +98,29 @@ drun_once() {  # throw-away container from our image: no name, --rm
         --label org.llmhub.tool=1 "$@"
 }
 
-image_id() { tr -d '[:space:]' <"$DIST/image.id"; }
-nginx_id() { tr -d '[:space:]' <"$DIST/nginx.id"; }
+# R3-5: dist has the index digest (<kind>.id: containerd image store) and the config digest
+# (<kind>.config-id: classic graphdriver store); s3 records the Id the local dockerd reports
 release() { tr -d '[:space:]' <"$DIST/VERSION"; }
+local_id_file() { printf '%s/%s-%s.local-id' "$MARK" "$1" "$(release)"; }  # KIND = image|nginx
+dist_ids() {  # dist_ids KIND -> the accepted Ids, one per line
+    tr -d '[:space:]' <"$DIST/$1.id"
+    printf '\n'
+    if [ -f "$DIST/$1.config-id" ]; then tr -d '[:space:]' <"$DIST/$1.config-id"; printf '\n'; fi
+}
+is_dist_id() { [ -n "$2" ] && grep -qxF -- "$2" < <(dist_ids "$1"); }  # is_dist_id KIND ID
+our_id() {  # our_id KIND: the Id recorded by s3 (verified against dist), else dist <kind>.id
+    local f got
+    f=$(local_id_file "$1")
+    if [ -s "$f" ]; then
+        got=$(tr -d '[:space:]' <"$f")
+        is_dist_id "$1" "$got" || die "$f: $got is not an Id of dist $1"
+        printf '%s' "$got"
+        return 0
+    fi
+    tr -d '[:space:]' <"$DIST/$1.id"
+}
+image_id() { our_id image; }
+nginx_id() { our_id nginx; }
 # SEC-D5: our images are addressed by OUR tags (the nginx Id equals upstream nginx:1.27-alpine)
 image_tag() { printf 'llmhub:%s' "$(release)"; }
 nginx_tag() { printf 'llmhub-nginx:%s' "$(release)"; }
@@ -270,8 +290,18 @@ apply_s0() {
             die "uid $id is taken"
         fi
     done
+    # R3-4: renders run as $UID_API and read $SUMS + stat the GGUF (s8b); window 1 does not
+    # need it, so only warn (o+x on the dirs, o+r on the file)
+    for p in /opt "$MODELS" "$SUMS"; do
+        local mode need=1 what=o+x
+        [ "$p" = "$SUMS" ] && { need=4; what=o+r; }
+        if ! mode=$(stat -c %a "$p" 2>/dev/null); then log "WARN: $p is missing (needed by s8b)"; continue; fi
+        [ $((8#$mode & need)) -ne 0 ] || log "WARN: $p lacks $what (render as uid $UID_API fails in s8b)"
+    done
     install -d -m 0700 "$MARK" "$MARK/preflight"
     snapshot "$MARK/preflight/baseline"
+    # R3-5: record the image store (graphdriver vs containerd snapshotter) next to the baseline
+    docker info -f '{{.Driver}} {{json .DriverStatus}}' >"$MARK/preflight/baseline/docker-store.txt" 2>&1 || true
     log "baseline snapshot: $MARK/preflight/baseline"
 }
 rollback_s0() { log "s0 is read-only"; }
@@ -407,29 +437,39 @@ check_s3() {
         python -c 'import llmhub; print(llmhub.__version__)')
     [ "$v" = "$(release)" ] || fail "image version $v != $(release)"
 }
-load_tagged() {  # load_tagged TAG WANT_ID TARBALL: load unless TAG already is WANT_ID
-    local tag=$1 want=$2 tar=$3 got
+load_tagged() {  # load_tagged KIND TAG TARBALL: load unless TAG exists; record its local Id
+    local kind=$1 tag=$2 tar=$3 got
     got=$(tag_id "$tag")
     if [ -z "$got" ]; then
         gzip -dc "$tar" | docker load >/dev/null
         got=$(tag_id "$tag")
     fi
-    [ "$got" = "$want" ] || die "$tag is $got, want $want (foreign image under our tag?)"
+    # R3-5: index digest (containerd store) or config digest (graphdriver store) of dist
+    is_dist_id "$kind" "$got" || die "$tag is $got, want one of: $(dist_ids "$kind" | tr '\n' ' ')(foreign image under our tag?)"
+    install -d -m 0700 "$MARK"
+    printf '%s\n' "$got" >"$(local_id_file "$kind")"
 }
 apply_s3() {
-    load_tagged "$(image_tag)" "$(image_id)" "$DIST/llmhub-$(release).tar.gz"
-    load_tagged "$(nginx_tag)" "$(nginx_id)" "$DIST/nginx-weights-$(release).tar.gz"
+    load_tagged image "$(image_tag)" "$DIST/llmhub-$(release).tar.gz"
+    load_tagged nginx "$(nginx_tag)" "$DIST/nginx-weights-$(release).tar.gz"
     check_s3
 }
 rollback_s3() {
     # only our tags: an image that also carries a foreign tag (or backs a foreign container)
     # stays; docker refuses to remove the last tag of an image a container uses (no -f)
-    local c tag
+    local c kind tag got
     for c in "${CONTAINERS[@]}"; do exists "$c" && die "container $c exists; roll back s6/s8c first"; done
-    for tag in "llmhub:$(release)" "llmhub-nginx:$(release)"; do
-        if [ -n "$(tag_id "$tag")" ]; then
+    for kind in image nginx; do
+        tag="llmhub:$(release)"
+        [ "$kind" = nginx ] && tag="llmhub-nginx:$(release)"
+        got=$(tag_id "$tag")
+        if [ -z "$got" ]; then :
+        elif ! is_dist_id "$kind" "$got"; then
+            log "kept $tag ($got is not our image)"  # R3-2: never untag a foreign image
+        else
             docker image rm "$tag" >/dev/null 2>&1 || log "kept $tag (in use by a foreign container)"
         fi
+        rm -f "$(local_id_file "$kind")"
     done
 }
 
@@ -546,13 +586,23 @@ install_config() {  # returns 0 when config.yaml changed, 1 when it is the same
     mv "$new" "$cur"
 }
 
-config_check() {
-    local out
+install_checked_config() {  # R3-1: config-check the rendered .new BEFORE it becomes live
+    local new="$CONF/config.yaml.new"
+    if ! cmp -s "$new" "$CONF/config.yaml"; then
+        chown "0:$UID_API" "$new"  # readable by the checker ($UID_API), like the live file
+        chmod 0640 "$new"
+        config_check "$new" || { rm -f "$new"; die "rendered config fails config-check; live config kept"; }
+    fi
+    install_config
+}
+
+config_check() {  # config_check [PATH under $CONF] (default: the live config.yaml)
+    local out path=${1:-$CONF/config.yaml}
     out=$(drun_once --network none --user "$UID_API:$UID_API" \
         -v "$CONF:$CONF:ro" \
         -v "$ETC/secrets/label:/run/s/label:ro" -v "$ETC/secrets/instance:/run/s/instance:ro" \
         -e LLMHUB_LABEL_SECRET_FILE=/run/s/label -e LLMHUB_INSTANCE_SECRET_FILE=/run/s/instance \
-        "$(image_id)" python -m llmhub config-check --config "$CONF/config.yaml") \
+        "$(image_id)" python -m llmhub config-check --config "$path") \
         || { fail "config-check"; return 1; }
     [ "$out" = ok ] || fail "config-check: $out"
 }
@@ -560,7 +610,7 @@ config_check() {
 check_s5() { stat_is "$CONF/config.yaml" "0:$UID_API 640" && config_check; }
 apply_s5() {
     render_config
-    if install_config; then restart_config_readers; else log "config unchanged"; fi
+    if install_checked_config; then restart_config_readers; else log "config unchanged"; fi
     marker s5
     check_s5
 }
@@ -732,16 +782,16 @@ apply_s8b() {
     [ -s "$MARK/weights.model" ] || die "LLMHUB_WEIGHTS_MODEL is required (path under $MODELS)"
     marker s8b
     render_config
-    if install_config; then restart_config_readers; fi
+    if install_checked_config; then restart_config_readers; fi
     check_s8b
 }
 rollback_s8b() {
     rm -f "$MARK/s8b.done" "$MARK/weights.model" "$MARK/weights.draft"
     render_config
-    if install_config; then restart_config_readers; fi
+    if install_checked_config; then restart_config_readers; fi
 }
 
-render_nginx_conf() {  # returns 0 when nginx-weights.conf changed, 1 when it is the same
+render_nginx_conf() {  # -> $ETC/nginx-weights.conf.new; 0 when it differs from the live conf
     stage_dir
     drun_once --network none --user "$UID_API:$UID_API" -v "$STAGE:/out" "$(image_id)" \
         python /opt/llmhub/deploy/render.py nginx \
@@ -757,7 +807,6 @@ render_nginx_conf() {  # returns 0 when nginx-weights.conf changed, 1 when it is
         rm -f "$ETC/nginx-weights.conf.new"
         return 1
     fi
-    mv "$ETC/nginx-weights.conf.new" "$ETC/nginx-weights.conf"
 }
 
 check_s8c() {
@@ -773,8 +822,9 @@ check_s8c() {
     "$LOGROTATE" -d "$LOGROTATE_FILE" >/dev/null 2>&1 || fail "logrotate -d"
 }
 apply_s8c() {
-    local changed=0
-    if render_nginx_conf; then changed=1; fi
+    local changed=0 conf="$ETC/nginx-weights.conf"
+    # R3-3: a changed conf is dry-run as .new and replaces the live file only after `nginx -t`
+    if render_nginx_conf; then changed=1; conf="$ETC/nginx-weights.conf.new"; fi
     local f
     for f in weights-acct.log weights-access.log weights-error.log; do
         [ -e "$LOGS/$f" ] || install -m 0640 -o $UID_NGINX -g $UID_API /dev/null "$LOGS/$f"
@@ -784,9 +834,11 @@ apply_s8c() {
         --pids-limit 64 --network none --user "$UID_NGINX:$UID_NGINX" \
         --group-add $UID_API --tmpfs /tmp --tmpfs "$LOGS:rw,noexec,nosuid,size=1m,mode=1777" \
         --entrypoint nginx \
-        -v "$ETC/nginx-weights.conf:/etc/nginx-weights/nginx.conf:ro" \
+        -v "$conf:/etc/nginx-weights/nginx.conf:ro" \
         -v "$ETC/weights:$ETC/weights:ro" -v "$MODELS:$MODELS:ro" \
-        "$(nginx_id)" -t -q -e stderr -c /etc/nginx-weights/nginx.conf || die "nginx -t failed"
+        "$(nginx_id)" -t -q -e stderr -c /etc/nginx-weights/nginx.conf \
+        || { rm -f "$ETC/nginx-weights.conf.new"; die "nginx -t failed (live conf kept)"; }
+    if [ "$changed" = 1 ]; then mv "$ETC/nginx-weights.conf.new" "$ETC/nginx-weights.conf"; fi
     # a single-file mount keeps the old inode: a changed conf needs a restart (SEC-D2)
     if [ "$changed" = 1 ] && exists llmhub-weights-nginx; then dctl restart llmhub-weights-nginx; fi
     drun_named llmhub-weights-auth
@@ -822,7 +874,7 @@ check_s10x() {
 apply_s10x() {
     marker s10x
     render_config
-    if install_config; then restart_config_readers; fi
+    if install_checked_config; then restart_config_readers; fi
     admin_call reload-clients >/dev/null
     if [ -e "$ETC/keys/e2e.key" ]; then
         local st
