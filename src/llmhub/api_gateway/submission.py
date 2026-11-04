@@ -178,14 +178,20 @@ class Submitter:
                 ErrorCode.FORBIDDEN, "route to cloud refused", reason="private_requires_local"
             )
 
+        # X-LLMHub-Fallback (T-369 I): a cloud-eligible request (cloud_allowed, no secrets,
+        # alias with a pool) served locally while the cloud is unavailable carries the reason,
+        # whichever rule picked the local route. Private/secret requests never had the cloud
+        # as an option, so they get no fallback mark.
         fallback = decision.fallback
         if (
             fallback is None
             and decision.route == "local"
+            and opts.data_class == "cloud_allowed"
+            and not hits
             and cloud.pool is not None
             and cloud.unavailable is not None
         ):
-            fallback = str(cloud.unavailable)  # the cloud was not an option: say why
+            fallback = str(cloud.unavailable)
         local_fallback = decision.route == "local" and fallback is not None
         spec = JobSpec(
             client_id=principal.client_id, body=body, priority=opts.priority, model_alias=alias,
