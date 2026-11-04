@@ -20,7 +20,6 @@ from collections.abc import Coroutine, Mapping
 from typing import Any
 
 from llmhub.budget_manager import limits, reservations
-from llmhub.budget_manager.allocation import allocate_session
 from llmhub.budget_manager.estimate import JobLoad, estimate_launch, get_speeds, t_cold_p90
 from llmhub.budget_manager.limits import Gate, HoldExceedsSessionBudget, Stage
 from llmhub.clock import Clock
@@ -50,7 +49,6 @@ from llmhub.lifecycle_manager.recovery import (
     reconcile_on_start,
 )
 from llmhub.lifecycle_manager.safety import (
-    delete_key,
     get_key,
     record_incident,
     resume_provider,
@@ -72,6 +70,7 @@ POLL_INTERVAL_S = 5.0  # polling cadence for PROVISIONING..LOADING_MODEL and tea
 ALIVE_CHECK_S = 30.0  # provider/endpoint liveness of READY/BUSY/IDLE instances
 DUP_SWEEP_S = 60.0  # duplicate-resource sweep (section 3.9)
 PURGE_S = 3600.0
+ORPHAN_SWEEP_S = 60.0  # HMAC resources of STOPPED/ERROR rows (F-R2-1)
 ACCRUE_S = 60.0  # ledger accrual granularity (keeps the ledger small; reservations cover it)
 BUDGET_CHECK_S = 30.0  # stage / warnings / 100 % actions
 MAX_FAILED_CYCLES = 3  # consecutive failed launch cycles of a pool before local fallback
@@ -133,10 +132,13 @@ class Controller:
         self._started = False
         self._alive_at: dict[str, float] = {}
         self._dup_at: dict[str, float] = {}
+        self._orphan_at = -INF
+        self._pending_done: dict[str, tuple[str, Any, float, float, str]] = {}
         self._purge_at = -INF
         self._accrue_at = -INF
         self._budget_at = -INF
         self._no_launch = False
+        self._stage = Stage.NORMAL
         self._op_last: dict[str, tuple[float, str]] = {}  # teardown op key -> (when, state)
 
     def _guard(self, adapter: ProviderAdapter) -> ProviderAdapter:
@@ -155,6 +157,8 @@ class Controller:
         from llmhub.reaper.core import orphan_sweep  # reaper imports controller-free modules
 
         await orphan_sweep(self.conn, self.adapters, self.secret, now, self.cfg, "controller")
+        self._orphan_at = now
+        self._stop_removed_pools(now)
         with tx(self.conn):
             report.requeued_jobs += queue.requeue_orphaned_running(
                 self.conn, self.boot_id, now, self.cfg.timeouts.worker_stale_s
@@ -216,6 +220,8 @@ class Controller:
         if check_kill_file(self.cfg.data_dir):
             wake = min(wake, await self._kill_file_pass(now))
         self._heartbeats(now)
+        self._flush_pending_done()
+        self._stop_removed_pools(now)
         with tx(self.conn):
             leases.expire_due(self.conn, now)
             self._release_closed_hold_reservations(now)
@@ -231,9 +237,14 @@ class Controller:
         machine.error_to_stopping(self.conn, now)
         teardown.mark_leaks(self.conn, now, self.cfg, "controller")
         await self._duplicate_sweep(now)
+        await self._orphan_sweep(now)
         if now - self._budget_at >= BUDGET_CHECK_S:
-            self._no_launch = limits.stage(self.conn, now, self.cfg) == Stage.NO_LAUNCH
+            self._stage = limits.stage(self.conn, now, self.cfg)
+            self._no_launch = self._stage == Stage.NO_LAUNCH
+        wake = min(wake, self._teardown(now))
         for name in self.cfg.pools:
+            if self._adapter_for(self.cfg.pools[name].provider, now) is None:
+                continue
             wake = min(wake, await self._step_pool(name, now, self._no_launch))
         if now - self._accrue_at >= ACCRUE_S:  # E20/E22 finalize to the exact second
             ledger.accrue(self.conn, now)
@@ -262,8 +273,67 @@ class Controller:
     def _heartbeats(self, now: float) -> None:
         with tx(self.conn):
             set_key(self.conn, "heartbeat", repr(now), now)
-            if self._jobs:
-                queue.heartbeat(self.conn, list(self._jobs), self.boot_id, now)
+            if self._jobs or self._pending_done:
+                queue.heartbeat(
+                    self.conn, [*self._jobs, *self._pending_done], self.boot_id, now
+                )
+
+    def _adapter_for(self, provider: str, now: float) -> ProviderAdapter | None:
+        """Adapter of a provider; a missing one (provider disabled while rows live) is a
+        critical incident, never a KeyError that stops the whole controller (F-R2-3b)."""
+        adapter = self.adapters.get(provider)
+        if adapter is None or provider not in self.inference:
+            try:
+                record_incident(
+                    self.conn, now, "adapter_missing", "critical", ref=provider,
+                    dedup_key=f"adapter_missing:{provider}:{int(now // 86400)}",
+                    details={"provider": provider},
+                )  # fmt: skip
+            except Busy:
+                pass
+            return None
+        return adapter
+
+    def _stop_removed_pools(self, now: float) -> None:
+        """F-R2-3: live rows of a pool removed from the config -> STOPPING (E15/E18, reason
+        `pool_removed`); their queued jobs go to local fallback."""
+        pools = tuple(self.cfg.pools)
+        marks = ",".join("?" for _ in pools) or "''"
+        live = ",".join("?" for _ in LIVE_IN_INDEX)
+        rows = self.conn.execute(
+            f"SELECT * FROM instances WHERE pool NOT IN ({marks}) AND state IN ({live})"
+            " AND state != 'STOPPING' ORDER BY id",
+            (*pools, *sorted(LIVE_IN_INDEX)),
+        ).fetchall()
+        jobs = self.conn.execute(
+            f"SELECT id FROM jobs WHERE pool IS NOT NULL AND pool NOT IN ({marks})"
+            " AND status='queued'",
+            pools,
+        ).fetchall()
+        if not rows and not jobs:
+            return
+        with tx(self.conn):
+            for r in rows:
+                src = State(r["state"])
+                edge = "E18" if src == State.ERROR else "E15"
+                if transition(self.conn, r["id"], src, State.STOPPING, edge, now, "controller",
+                              stop_reason="pool_removed", reason="pool_removed"):  # fmt: skip
+                    machine.requeue_running_jobs(self.conn, now, instance_id=r["id"],
+                                                 count_attempt=False, reason="pool_removed")  # fmt: skip
+            for j in jobs:
+                queue.fallback_local(self.conn, j["id"], "pool_removed", now)
+
+    def _flush_pending_done(self) -> None:
+        """R1-10: a completion lost to `Busy` is written by a later step (result on disk)."""
+        for job_id, (iid, result, cost, done_at, path) in list(self._pending_done.items()):
+            try:
+                with tx(self.conn):
+                    if self._still_mine(job_id, iid):
+                        queue.complete(self.conn, job_id, result, cost, done_at, path)
+                    reservations.release_ref(self.conn, "job", job_id, done_at, "job_done")
+            except Busy:
+                return
+            del self._pending_done[job_id]
 
     def _release_closed_hold_reservations(self, now: float) -> None:
         self.conn.execute(
@@ -281,11 +351,13 @@ class Controller:
         for row in rows:
             if now - self._alive_at.get(row["id"], -INF) < self.alive_check_s:
                 continue
+            adapter = self._adapter_for(row["provider"], now)
+            if adapter is None:
+                continue
             self._alive_at[row["id"]] = now
             await timeouts.check_alive(
-                self.conn, self.adapters[row["provider"]], self.inference[row["provider"]],
-                row, now, self.cfg,
-            )  # fmt: skip
+                self.conn, adapter, self.inference[row["provider"]], row, now, self.cfg
+            )
 
     def _before_error_to_stopping(self, now: float) -> None:
         """E3 sends the pool queue to local fallback (section 6.8); count failed cycles."""
@@ -299,11 +371,15 @@ class Controller:
             if src not in ("PROVISIONING", "BOOTING", "LOADING_MODEL"):
                 continue
             key = f"failed_cycles:{row['pool']}"
-            with tx(self.conn):
+            with tx(self.conn):  # R1-9: the count and E18 by row in one transaction
+                if not transition(self.conn, row["id"], State.ERROR, State.STOPPING, "E18", now,
+                                  "controller", stop_reason="error"):  # fmt: skip
+                    continue  # already moved on (another actor): counted by whoever moved it
                 n = int(get_key(self.conn, key) or 0) + 1
                 set_key(self.conn, key, str(n), now)
                 if src == "PROVISIONING":
-                    reason = _reason_of(row["last_error"], row["create_called_at"] is not None)
+                    called = (row["create_called_at"] or row["last_create_called_at"]) is not None
+                    reason = _reason_of(row["last_error"], called)
                     self._fallback_pool(row["pool"], reason, now)
 
     def _fallback_pool(self, pool: str, reason: UnavailableReason | str, now: float) -> int:
@@ -342,6 +418,49 @@ class Controller:
                 if extras:
                     await destroy_duplicates(self.conn, adapter, row, extras, now)
 
+    async def _orphan_sweep(self, now: float) -> None:
+        """F-R2-1: every ORPHAN_SWEEP_S destroy HMAC-verified resources whose row is STOPPED
+        or ERROR (e.g. a late-visible resource of an earlier unknown-outcome create). Rows
+        without a row are left to Q1 (start-up report, reaper timers)."""
+        if now - self._orphan_at < ORPHAN_SWEEP_S:
+            return
+        self._orphan_at = now
+        from llmhub.reaper.core import orphan_sweep  # reaper imports controller-free modules
+
+        await orphan_sweep(
+            self.conn, self.adapters, self.secret, now, self.cfg, "controller", unknown=False
+        )
+
+    def _teardown(self, now: float) -> float:
+        """STOPPING / PENDING_DELETE / LEAKED of EVERY row (also of a removed pool, F-R2-3a);
+        the adapter is taken by `row.provider`."""
+        wake = INF
+        for row in self.conn.execute(
+            "SELECT * FROM instances WHERE state IN ('STOPPING','PENDING_DELETE','LEAKED')"
+            " ORDER BY created_at"
+        ).fetchall():
+            adapter = self._adapter_for(row["provider"], now)
+            if adapter is None:
+                continue
+            key = f"teardown:{row['id']}"
+            last = self._op_last.get(key)
+            due = last is None or last[1] != row["state"] or now - last[0] >= self.poll_s or (
+                row["next_destroy_at"] is not None and now >= float(row["next_destroy_at"])
+                and last[0] < float(row["next_destroy_at"])
+            )
+            if due and not self._op_running(key):
+                self._op_last[key] = (now, row["state"])
+                if row["state"] == State.STOPPING:
+                    self._spawn_op(key, teardown.request_destroy(
+                        self.conn, adapter, row, now, self.cfg, "controller"))  # fmt: skip
+                else:
+                    self._spawn_op(key, teardown.confirm_zero(
+                        self.conn, adapter, row, now, self.cfg, "controller",
+                        on_stopped=self._on_stopped))  # fmt: skip
+            nxt = row["next_destroy_at"]
+            wake = min(wake, now + self.poll_s if nxt is None else max(float(nxt), now + 1.0))
+        return wake
+
     def _aligned_poll(self, since: float, now: float) -> float:
         """Next poll at since + k * poll_s: the cadence does not drift with unrelated steps."""
         k = int((now - since) // self.poll_s) + 1
@@ -379,37 +498,12 @@ class Controller:
         return frozenset(json.loads(raw)) if raw else frozenset()
 
     def _on_stopped(self, conn: sqlite3.Connection, row: sqlite3.Row, now: float) -> None:
-        """E20/E22 hook (inside the final transaction): finalize ledger, release, allocate."""
-        delete_key(conn, f"launch_jobs:{row['id']}")
-        ledger.finalize(conn, row["id"], float(row["zero_confirmed_at"] or now))
-        reservations.release_instance(conn, row["id"], now, "instance_stopped")
-        allocate_session(conn, row["id"])
+        """E20/E22 hook: the shared `teardown.on_stopped` (R1-4)."""
+        teardown.on_stopped(conn, row, now)
 
     async def _step_pool(self, name: str, now: float, no_launch: bool) -> float:
         rt = self._pool_rt(name)
         wake = INF
-        for row in self.conn.execute(
-            "SELECT * FROM instances WHERE pool=? AND state IN ('STOPPING','PENDING_DELETE',"
-            "'LEAKED') ORDER BY created_at",
-            (name,),
-        ).fetchall():
-            key = f"teardown:{row['id']}"
-            last = self._op_last.get(key)
-            due = last is None or last[1] != row["state"] or now - last[0] >= self.poll_s or (
-                row["next_destroy_at"] is not None and now >= float(row["next_destroy_at"])
-                and last[0] < float(row["next_destroy_at"])
-            )
-            if due and not self._op_running(key):
-                self._op_last[key] = (now, row["state"])
-                if row["state"] == State.STOPPING:
-                    self._spawn_op(key, teardown.request_destroy(
-                        self.conn, rt.adapter, row, now, self.cfg, "controller"))  # fmt: skip
-                else:
-                    self._spawn_op(key, teardown.confirm_zero(
-                        self.conn, rt.adapter, row, now, self.cfg, "controller",
-                        on_stopped=self._on_stopped))  # fmt: skip
-            nxt = row["next_destroy_at"]
-            wake = min(wake, now + self.poll_s if nxt is None else max(float(nxt), now + 1.0))
         inst = live_instance(self.conn, name)
         if inst is None:
             return min(wake, self._maybe_launch(rt, now))
@@ -480,8 +574,16 @@ class Controller:
                 if job is None:
                     break
                 load = JobLoad(job["id"], int(job["est_tokens_in"]), int(job["est_tokens_out"]))
-                if job["id"] in self._launch_jobs(iid):
+                launch_set = self._launch_jobs(iid)
+                if job["id"] in launch_set:
                     gate = Gate(ok=True)  # already inside the session reservation
+                    # R1-6: only the FIRST run is paid by the session; a re-run after a
+                    # requeue goes through reserve_job_on_running like any other job
+                    set_key(self.conn, f"launch_jobs:{iid}",
+                            json.dumps(sorted(launch_set - {job["id"]})), now)  # fmt: skip
+                elif self._urgent_only_refuses(job):
+                    gate = Gate(ok=False, reason=UnavailableReason.BUDGET_LIMIT_REACHED,
+                                detail="stage:urgent_only")  # fmt: skip
                 else:
                     gate = limits.reserve_job_on_running(self.conn, iid, load, now, self.cfg)
                 if not gate.ok:
@@ -503,17 +605,25 @@ class Controller:
             self._spawn_job(self._pool_rt(rt.cfg.name), inst, spawned)
         return progressed
 
+    def _urgent_only_refuses(self, job: sqlite3.Row) -> bool:
+        """Stage URGENT_ONLY (95 %): a non-urgent job is not run on the cloud GPU, even on a
+        live one (coordinator 2026-11-04); it goes to local fallback."""
+        return job["priority"] != Priority.URGENT and self._stage >= Stage.URGENT_ONLY
+
     # --- launching ----------------------------------------------------------------
     def _pool_price(self, name: str) -> tuple[float, float]:
+        """(price, disk) for estimates: never below the pool's `max_price_usd_h`, since the
+        next offer may cost up to it (R1-7); the ledger still accrues the real price."""
+        cap = self.cfg.pools[name].max_price_usd_h
         row = self.conn.execute(
             "SELECT price_usd_h, offer_json FROM instances WHERE pool=? AND price_usd_h IS NOT"
             " NULL ORDER BY created_at DESC LIMIT 1",
             (name,),
         ).fetchone()
         if row is None:
-            return self.cfg.pools[name].max_price_usd_h, 0.0
+            return cap, 0.0
         disk = json.loads(row["offer_json"]).get("disk_usd_h", 0.0) if row["offer_json"] else 0.0
-        return float(row["price_usd_h"]), float(disk)
+        return max(float(row["price_usd_h"]), cap), float(disk)
 
     def _maybe_launch(self, rt: PoolRuntime, now: float) -> float:
         pool = rt.cfg
@@ -534,7 +644,12 @@ class Controller:
             return now
         price, disk = self._pool_price(pool.name)
         pp, tg = get_speeds(self.conn, pool.name, pool.pp_tps, pool.tg_tps)
-        loads = [JobLoad(j.job_id, j.est_tokens_in, j.est_tokens_out) for j in jobs]
+        launch_jobs = jobs
+        if any(j.priority == Priority.URGENT for j in jobs) and (
+            limits.stage(self.conn, now, self.cfg) == Stage.URGENT_ONLY
+        ):  # 95 %: non-urgent jobs do not ride along in an urgent launch (they stay queued)
+            launch_jobs = [j for j in jobs if j.priority == Priority.URGENT]
+        loads = [JobLoad(j.job_id, j.est_tokens_in, j.est_tokens_out) for j in launch_jobs]
         est = estimate_launch(
             price, loads, t_cold, pool.idle_timeout_s, pp, tg, disk_usd_h=disk
         )
@@ -580,9 +695,10 @@ class Controller:
     # --- budget / reconcile -------------------------------------------------------
     def _budget(self, now: float, no_launch: bool) -> None:
         with tx(self.conn):
-            if no_launch:
+            if no_launch:  # R1-6: READY/IDLE stop too (no launch job runs unchecked at 100 %)
                 for r in self.conn.execute(
-                    "SELECT id FROM instances WHERE state='BUSY' AND stop_after_current=0"
+                    "SELECT id FROM instances WHERE state IN ('READY','BUSY','IDLE')"
+                    " AND stop_after_current=0"
                 ).fetchall():
                     machine.request_stop_after_current(self.conn, r["id"], "budget_100")
                 self.conn.execute(
@@ -660,11 +776,14 @@ class Controller:
         now = self.clock.now()
         path = self.bodies.write_result(job["id"], result.body)
         price = float(inst["price_usd_h"] or 0.0)
-        with tx(self.conn):
-            if self._still_mine(job["id"], iid):
-                queue.complete(self.conn, job["id"], result, price / 3600 * (now - started),
-                               now, str(path))  # fmt: skip
-            reservations.release_ref(self.conn, "job", job["id"], now, "job_done")
+        cost = price / 3600 * (now - started)
+        try:
+            with tx(self.conn):
+                if self._still_mine(job["id"], iid):
+                    queue.complete(self.conn, job["id"], result, cost, now, str(path))
+                reservations.release_ref(self.conn, "job", job["id"], now, "job_done")
+        except Busy:  # R1-10: the result is on disk; the next step writes the completion
+            self._pending_done[job["id"]] = (iid, result, cost, now, str(path))
 
     def _requeue_mine(
         self, job_id: str, iid: str, now: float, *, count_attempt: bool, reason: str
@@ -725,11 +844,14 @@ class Controller:
         """Admin hold (<= 8 h). Cost to TTL above budget_session raises
         HoldExceedsSessionBudget unless `leases.hold_may_exceed_session`."""
         now = self.clock.now()
+        live = live_instance(self.conn, pool)
         price, disk = self._pool_price(pool)
+        if live is not None and live["price_usd_h"] is not None:  # the hold binds to it
+            price = float(live["price_usd_h"])
+            disk = limits.instance_disk_usd_h(live)
         gate = limits.check_hold(self.conn, price, ttl_s, now, self.cfg, disk_usd_h=disk)
         if not gate.ok:
             raise HoldRejected(gate)
-        live = live_instance(self.conn, pool)
         with tx(self.conn):
             lease_id = leases.create_hold(
                 self.conn, holder=holder, pool=pool, ttl_s=ttl_s, now=now, cfg=self.cfg.leases

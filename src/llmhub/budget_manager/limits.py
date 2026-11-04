@@ -211,11 +211,14 @@ def launch_gate(
 # --- jobs on a running GPU -------------------------------------------------------------
 
 
+def instance_disk_usd_h(inst: sqlite3.Row) -> float:
+    if not inst["offer_json"]:
+        return 0.0
+    return float(json.loads(inst["offer_json"]).get("disk_usd_h", 0.0))
+
+
 def _instance_rate(inst: sqlite3.Row) -> float:
-    disk = 0.0
-    if inst["offer_json"]:
-        disk = float(json.loads(inst["offer_json"]).get("disk_usd_h", 0.0))
-    return (float(inst["price_usd_h"] or 0.0) + disk) / 3600.0
+    return (float(inst["price_usd_h"] or 0.0) + instance_disk_usd_h(inst)) / 3600.0
 
 
 def idle_reserved(conn: sqlite3.Connection, inst: sqlite3.Row, cfg: Config) -> float:

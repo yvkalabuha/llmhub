@@ -333,7 +333,7 @@ def warnings(conn, now, cfg) -> list[str]                              # writes 
 def reserve(conn, scope, ref_id, amount, now, instance_id=None) -> str
 def release(conn, reservation_id | ref, now, reason) -> None
 def remainder(conn, reservation_row) -> float                          # max(0, amount - consumed)
-def consume_fifo(conn, instance_id, amount) -> None                    # accrual of an instance consumes its open reservations FIFO (session first)
+def consume_fifo(conn, instance_id, amount) -> None                    # accrual of an instance consumes its open reservations FIFO (job first, then session; R1-1)
 # accounts.py
 def block_provider(conn, provider, reason, now) -> None                # incidents + no retries
 def resume_provider(conn, provider, now) -> None                       # manual only
@@ -565,7 +565,7 @@ CREATE TABLE cost_allocations (
 - **E_launch** = `r · (T_cold_p90 + Σ_j T_work_j + T_idle) + traffic + storage`; в Mock `traffic` и `storage` равны 0, кроме тестов с `TRAFFIC_BILLED`.
 - **Доля задания**: `share_j = r · T_work_j + r · (T_cold_p90 + T_idle) / n`, где n — число задач в пачке запуска. Должно быть `share_j ≤ budget_job`; иначе задача не идёт в облако (`budget_limit_reached`, fallback).
 - **Задача на живой GPU**: резерв `job` = `r · T_work_j + r · max(0, T_idle − idle_reserved_remaining)` — простой не умножается на число задач (не n·T_idle): новая задача только продлевает уже зарезервированный простой до полного `T_idle`. Проверка: `session_cost + Σ резервов сеанса + резерв ≤ budget_session`, иначе `stop_after_current`.
-- **Committed(окно)** = `spent(окно) + Σ_{открытые резервы} (amount − consumed)`. Каждое начисление инстанса (`accrue`) в той же транзакции списывает `consumed_usd` с его открытых резервов в порядке FIFO (session, затем job по `created_at`); остаток сверх резервов просто ложится в ledger. Здесь `spent` суммирует по провайдерам `max(Σ ledger source=estimate, Σ source=provider)` в окне. Начисления по ресурсам в PENDING_DELETE и LEAKED идут до `zero_confirmed_at`, поэтому они уже входят в `spent`.
+- **Committed(окно)** = `spent(окно) + Σ_{открытые резервы} (amount − consumed)`. Каждое начисление инстанса (`accrue`) в той же транзакции списывает `consumed_usd` с его открытых резервов в порядке FIFO (сначала job по `created_at`, затем session, hold, prewarm; решение координатора 2026-11-04 по ревью R1-1: работа задачи на живой GPU оплачивается её собственным резервом, а покрытие сеанса — задачи запуска и `T_idle` — сохраняется); остаток сверх резервов просто ложится в ledger. Здесь `spent` суммирует по провайдерам `max(Σ ledger source=estimate, Σ source=provider)` в окне. Начисления по ресурсам в PENDING_DELETE и LEAKED идут до `zero_confirmed_at`, поэтому они уже входят в `spent`.
 - **check_launch** (все проверки обязательны, первая проваленная даёт причину):
   0. Проверка выполняется **внутри транзакции `insert_provisioning`** (через `gate`), чтобы HALTED, блокировка или чужой резерв, появившиеся между решением и вставкой, не пропускали запуск.
   1. HALTED → `controller_halted`.

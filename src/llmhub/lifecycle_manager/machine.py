@@ -27,6 +27,7 @@ _FIELDS = frozenset(
         "stop_reason", "destroy_requested_at", "destroy_accepted_at", "destroy_attempts",
         "next_destroy_at", "zero_confirmed_at", "attempts", "model_test_failures_json",
         "net_fail_since", "accrued_to", "last_error", "max_lifetime_at",
+        "first_create_called_at", "last_create_called_at", "create_unknown",
     }
 )  # fmt: skip
 
@@ -44,13 +45,18 @@ def insert_provisioning(
 ) -> str | None:
     """ONE tx: gate re-check, INSERT (E1) and transitions row. None on gate fail or UNIQUE.
 
-    The `session` reservation is added by stream E when budget_manager lands.
+    The `session` reservation is written by the gate (`limits.launch_gate`). A live hold of the
+    pool extends `max_lifetime_at` to its `expires_at` (capped at `hold_max_ttl_s` from now,
+    R1-8), and its reservation (made with no instance) is bound to the new instance (R1-2).
     """
+    from llmhub.budget_manager.reservations import bind_pool_holds  # local: budget -> lifecycle
+
     instance_id = f"inst-{op_id}"
     try:
         with tx(conn):
             if not gate(conn).ok:
                 return None
+            max_lifetime_at = max(max_lifetime_at, leases.hold_lifetime_until(conn, pool, now))
             conn.execute(
                 "INSERT INTO instances(id, op_id, pool, provider, label, state, state_since,"
                 " created_at, max_lifetime_at, accrued_to) VALUES (?,?,?,?,?,?,?,?,?,?)",
@@ -62,6 +68,7 @@ def insert_provisioning(
                 " VALUES (?,?,?,?,?,?)",
                 (instance_id, now, State.STOPPED, State.PROVISIONING, "E1", "controller"),
             )
+            bind_pool_holds(conn, pool, instance_id)
     except sqlite3.IntegrityError:
         return None
     return instance_id
@@ -239,21 +246,39 @@ def idle_stop_reason(
     since = float(inst["idle_since"] if inst["idle_since"] is not None else inst["state_since"])
     if now >= float(inst["max_lifetime_at"]):
         return "max_lifetime"
+    pool_cfg = cfg.pools.get(pool)
+    if pool_cfg is None:  # F-R2-3: the pool was removed from the config
+        return "pool_removed"
     if no_launch:
         return "stage_no_launch"
-    if leases.drain_requested(conn, pool, since):
+    if leases.drain_requested(conn, pool, activity_since(conn, inst)):
         return "drain"
     if leases.hold_ended_since(conn, pool, since):
         return "hold_expired"
-    if now >= since + cfg.pools[pool].idle_timeout_s:
+    if now >= since + pool_cfg.idle_timeout_s:
         return "idle_timeout"
     return None
+
+
+def activity_since(conn: sqlite3.Connection, inst: sqlite3.Row) -> float:
+    """Start of the instance's last busy period (its latest E8/E13), else `ready_at`, else
+    `created_at`. A final lease close at or after it is a drain, even when the close came
+    while the last job still ran (R1-3)."""
+    row = conn.execute(
+        "SELECT MAX(ts) FROM transitions WHERE instance_id=? AND to_state='BUSY'", (inst["id"],)
+    ).fetchone()
+    if row is not None and row[0] is not None:
+        return float(row[0])
+    base = inst["ready_at"] if inst["ready_at"] is not None else inst["created_at"]
+    return float(base)
 
 
 def idle_due_at(inst: sqlite3.Row, cfg: Config) -> float:
     """Wake-up time of the idle timer (idle_since + idle_timeout, or max_lifetime if sooner)."""
     since = float(inst["idle_since"] if inst["idle_since"] is not None else inst["state_since"])
-    return min(since + cfg.pools[inst["pool"]].idle_timeout_s, float(inst["max_lifetime_at"]))
+    pool_cfg = cfg.pools.get(inst["pool"])
+    timeout = pool_cfg.idle_timeout_s if pool_cfg is not None else 0.0
+    return min(since + timeout, float(inst["max_lifetime_at"]))
 
 
 def settle_idle(

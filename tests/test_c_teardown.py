@@ -55,10 +55,12 @@ async def test_destroy_accepted_goes_pending_delete() -> None:
 
 
 async def test_already_gone_is_accepted_too() -> None:
+    """A ref the provider does not know (get -> None) needs no destroy (R1-11: an unlisted
+    ref is destroyed only after `get` shows our label); E19 still fires."""
     conn, cloud = make_conn(), FakeCloud()
     add_instance(conn, "a", "STOPPING", provider_ref="r-missing")
     assert (await _destroy(conn, cloud, T0))["state"] == "PENDING_DELETE"
-    assert cloud.destroy_calls == ["r-missing"]
+    assert cloud.destroy_calls == []
 
 
 async def test_destroy_failures_back_off_then_stop_confirm_timeout() -> None:

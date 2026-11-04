@@ -118,6 +118,7 @@ class BillingRecord:
 class NormalizedError:
     reason: UnavailableReason
     retryable: bool
+    # True when the call may have taken effect (create: 5xx / timeout -> maybe created, L7)
     outcome_unknown: bool
     retry_after_s: float | None
     http_status: int | None

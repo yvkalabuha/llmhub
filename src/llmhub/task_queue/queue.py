@@ -10,9 +10,11 @@ import uuid
 from pathlib import Path
 from typing import Literal
 
+from llmhub.budget_manager import reservations
 from llmhub.cloud_manager.inference import JobRunResult
 from llmhub.configuration.models import Config
 from llmhub.lifecycle_manager import leases
+from llmhub.lifecycle_manager.safety import record_incident
 from llmhub.persistence.db import tx
 from llmhub.provider_adapters.base import UnavailableReason
 from llmhub.task_queue.bodies import BodyStore
@@ -182,6 +184,7 @@ def _close_lease(conn: sqlite3.Connection, job_id: str, now: float, reason: str)
 
 
 _CLEAR_RUN = "instance_id=NULL, worker_id=NULL, worker_heartbeat_at=NULL"
+MAX_RESTARTS = 5  # L5: a job restarted more often than this goes to local fallback
 
 
 def requeue(
@@ -202,14 +205,25 @@ def requeue(
     """
     with _join_or_open(conn):
         row = conn.execute(
-            "SELECT status, attempts, max_attempts, cancel_requested FROM jobs WHERE id=?",
+            "SELECT status, attempts, max_attempts, cancel_requested, restarts FROM jobs"
+            " WHERE id=?",
             (job_id,),
         ).fetchone()
         if row is None or row["status"] not in ("running", "queued"):
             return "failed"
+        # R1-10: the run is over; its job reservation must not stay open until E20
+        reservations.release_ref(conn, "job", job_id, now, f"requeue:{reason}")
         if row["cancel_requested"]:
             _finish_cancel(conn, job_id, now)
             return "failed"
+        if int(row["restarts"]) > MAX_RESTARTS:
+            record_incident(
+                conn, now, "job_max_restarts", "high", ref=job_id,
+                dedup_key=f"job_max_restarts:{job_id}",
+                details={"restarts": int(row["restarts"]), "reason": reason},
+            )  # fmt: skip
+            fallback_local(conn, job_id, "max_restarts", now)
+            return "fallback"
         attempts = row["attempts"] if count_attempt else max(row["attempts"] - 1, 0)
         if attempts >= row["max_attempts"]:
             fallback_local(conn, job_id, f"attempts_exhausted:{reason}", now)
@@ -226,8 +240,10 @@ def requeue(
 def fallback_local(
     conn: sqlite3.Connection, job_id: str, reason: UnavailableReason | str, now: float
 ) -> None:
-    """Send the job to the local queue (route 'local:fallback'); closes its implicit lease."""
+    """Send the job to the local queue (route 'local:fallback'); closes its implicit lease
+    and releases its job reservation."""
     with _join_or_open(conn):
+        reservations.release_ref(conn, "job", job_id, now, "fallback_local")
         conn.execute(
             f"UPDATE jobs SET route='local:fallback', pool=NULL, status='queued',"
             f" fallback_reason=?, {_CLEAR_RUN} WHERE id=? AND status IN ('queued','running')",

@@ -40,17 +40,18 @@ def test_overspend_goes_to_ledger_only(tmp_path: Path) -> None:
     assert _committed(conn, T0 + HOUR) == pytest.approx(0.36)
 
 
-def test_fifo_session_then_jobs_by_created(tmp_path: Path) -> None:
+def test_fifo_jobs_by_created_then_session(tmp_path: Path) -> None:
+    """R1-1 (coordinator 2026-11-04): job reservations are consumed before the session."""
     conn = make_conn(tmp_path)
     add_instance(conn)
-    s = rs.reserve(conn, "session", "op", 0.1, T0 + 5, "i1")
+    s = rs.reserve(conn, "session", "op", 0.1, T0, "i1")
     j1 = rs.reserve(conn, "job", "j1", 0.1, T0 + 1, "i1")
     j2 = rs.reserve(conn, "job", "j2", 0.1, T0 + 2, "i1")
     left = rs.consume_fifo(conn, "i1", 0.25)
     assert left == 0
     c = {r["id"]: r["consumed_usd"] for r in conn.execute("SELECT * FROM reservations")}
     assert (
-        c[s] == pytest.approx(0.1) and c[j1] == pytest.approx(0.1) and c[j2] == pytest.approx(0.05)
+        c[j1] == pytest.approx(0.1) and c[j2] == pytest.approx(0.1) and c[s] == pytest.approx(0.05)
     )
     assert rs.consume_fifo(conn, "i1", 1.0) == pytest.approx(0.95)
 

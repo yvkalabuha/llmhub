@@ -179,13 +179,15 @@ async def test_job_of_the_current_boot_is_left_alone() -> None:
     assert st == {"j1": "running", "j2": "queued"} and rep.requeued_jobs == ["j2"]
 
 
-async def test_busy_resource_missing_counts_the_attempt_and_stops() -> None:
+async def test_busy_resource_missing_at_restart_refunds_the_attempt_and_stops() -> None:
+    """L4 (coordinator 2026-11-04): a loss found by the restart reconcile is not an attempt."""
     conn, cloud = make_conn(), FakeCloud()
     add_instance(conn, "a", "BUSY", provider_ref="gone", endpoint="e")
     add_job(conn, "j1", "running", instance_id="a", worker_id="boot-1", attempts=1)
-    await _recon(conn, cloud)
+    rep = await _recon(conn, cloud)
     j = conn.execute("SELECT * FROM jobs").fetchone()
-    assert (j["status"], j["attempts"], j["restarts"]) == ("queued", 1, 0)  # E17: attempt counted
+    assert (j["status"], j["attempts"], j["restarts"]) == ("queued", 0, 1)  # restart, refunded
+    assert rep.requeued_jobs == ["j1"]
     assert inst(conn, "a")["state"] == "STOPPING"
     assert [t[:2] for t in trail(conn)] == [("BUSY", "ERROR"), ("ERROR", "STOPPING")]
 

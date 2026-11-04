@@ -101,11 +101,7 @@ def create_hold(
         raise LeaseError(f"hold ttl_s {ttl_s} outside (0, {lc.hold_max_ttl_s}]")
     with join_or_open(conn):
         lease_id = _insert_timed(conn, LeaseKind.HOLD, holder, None, pool, ttl_s, now)
-        conn.execute(
-            "UPDATE instances SET max_lifetime_at=max(max_lifetime_at, ?) WHERE pool=?"
-            " AND state IN ('PROVISIONING','BOOTING','LOADING_MODEL','READY','BUSY','IDLE')",
-            (now + ttl_s, pool),
-        )
+        _extend_live_lifetime(conn, pool, now + ttl_s)
     return lease_id
 
 
@@ -126,7 +122,33 @@ def renew(conn: sqlite3.Connection, lease_id: str, now: float) -> float:
             expires = min(expires, float(row["created_at"]) + LeaseConfig().hold_max_ttl_s)
         conn.execute("UPDATE leases SET expires_at=?, renewed_at=? WHERE id=?",
                      (expires, now, lease_id))  # fmt: skip
+        if row["kind"] == LeaseKind.HOLD:  # R1-8: the live GPU lives as long as the hold
+            _extend_live_lifetime(conn, row["pool"], expires)
     return float(expires)
+
+
+def _extend_live_lifetime(conn: sqlite3.Connection, pool: str, until: float) -> None:
+    conn.execute(
+        "UPDATE instances SET max_lifetime_at=max(max_lifetime_at, ?) WHERE pool=?"
+        " AND state IN ('PROVISIONING','BOOTING','LOADING_MODEL','READY','BUSY','IDLE')",
+        (until, pool),
+    )
+
+
+def hold_lifetime_until(
+    conn: sqlite3.Connection, pool: str, now: float, cfg: LeaseConfig | None = None
+) -> float:
+    """max_lifetime_at a new instance of the pool needs for the live holds (0 without any):
+    the latest `expires_at` of a live hold, capped at `hold_max_ttl_s` from now (R1-8)."""
+    lc = cfg or LeaseConfig()
+    row = conn.execute(
+        "SELECT MAX(expires_at) FROM leases WHERE pool=? AND kind='hold' AND closed_at IS NULL"
+        " AND expires_at > ?",
+        (pool, now),
+    ).fetchone()
+    if row is None or row[0] is None:
+        return 0.0
+    return min(float(row[0]), now + lc.hold_max_ttl_s)
 
 
 def close(

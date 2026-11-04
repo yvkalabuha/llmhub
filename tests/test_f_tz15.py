@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+import time
 from pathlib import Path
 
 import pytest
@@ -52,17 +53,21 @@ async def test_10_concurrent_requests_one_create(tmp_path: Path) -> None:
                              boot_id=f"thread-{n}")  # fmt: skip
 
             async def go() -> None:
-                for _ in range(50):  # Busy (300 ms) just postpones a step: keep stepping
+                # R1-12: no step limit (Busy only postpones a step) and never leave
+                # asyncio.run with a background create in flight (that would cancel it and
+                # let the harness controller create again); a wall deadline bounds the test
+                deadline = time.monotonic() + 120
+                while time.monotonic() < deadline:
                     await ctl.step()
-                    for _ in range(500):  # let a background create finish before exit
+                    while ctl.busy_ops():
                         await asyncio.sleep(0.01)
-                        if not ctl.busy_ops():
-                            break
                     ref = conn.execute(
                         "SELECT 1 FROM instances WHERE provider_ref IS NOT NULL"
                     ).fetchone()
                     if ref is not None:
                         return
+                    await asyncio.sleep(0.01)
+                raise AssertionError("no instance got a provider_ref")
 
             asyncio.run(go())
         except BaseException as exc:  # noqa: BLE001 - reported below
@@ -79,7 +84,7 @@ async def test_10_concurrent_requests_one_create(tmp_path: Path) -> None:
     h.restart()
     await h.run_for(3000)
     assert job_states(h) == [("completed", "cloud")] * 10
-    assert h.provider.create_calls == 0  # nothing new: the threads' instance served all
+    assert h.provider.create_calls == 0, h.transitions()  # the threads' instance served all
 
 
 async def test_several_agents_urgent_skips_batch(tmp_path: Path) -> None:

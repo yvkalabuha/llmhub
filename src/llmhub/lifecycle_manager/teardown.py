@@ -33,6 +33,73 @@ from llmhub.provider_adapters.base import (
 Actor = Literal["controller", "reaper", "admin"]
 StoppedHook = Callable[[sqlite3.Connection, sqlite3.Row, float], None]
 
+# F-R2-1: after an unknown-outcome create, zero is confirmed not before
+# first_create_called_at + UNKNOWN_GRACE_FACTOR * create_visibility_grace_s.
+UNKNOWN_GRACE_FACTOR = 3
+
+
+def on_stopped(conn: sqlite3.Connection, row: sqlite3.Row, now: float) -> None:
+    """Shared E20/E22 hook of controller and reaper (inside the final transaction, R1-4):
+    finalize the ledger to `zero_confirmed_at`, close the instance reservations (hold/prewarm
+    of a live lease are unbound, not closed), attribute the session cost to clients and drop
+    the `launch_jobs:<id>` key."""
+    from llmhub.budget_manager import reservations  # local: budget_manager -> lifecycle
+    from llmhub.budget_manager.allocation import allocate_session
+    from llmhub.cost_tracker import ledger
+
+    delete_key(conn, f"launch_jobs:{row['id']}")
+    ledger.finalize(conn, row["id"], float(row["zero_confirmed_at"] or now))
+    reservations.release_instance(conn, row["id"], now, "instance_stopped")
+    allocate_session(conn, row["id"])
+
+
+def no_ref_wait_until(inst: sqlite3.Row, cfg: Config) -> float:
+    """Earliest time zero may be confirmed for a row (0 when there is nothing to wait for).
+
+    A row without `provider_ref` that ever called create waits `create_visibility_grace_s`
+    after its LAST create call (the time is never cleared, R1-5); without a recorded time
+    (older rows) the grace runs from `destroy_requested_at`. After an unknown outcome it also
+    waits `first_create_called_at + UNKNOWN_GRACE_FACTOR * grace` (F-R2-1).
+    """
+    if inst["provider_ref"] is not None:
+        return 0.0
+    grace = cfg.timeouts.create_visibility_grace_s
+    times = [
+        float(t) for t in (inst["create_called_at"], inst["last_create_called_at"]) if t is not None
+    ]
+    wait = 0.0
+    if times:
+        wait = max(times) + grace
+    elif int(inst["attempts"]) > 0:  # an earlier create without a recorded time
+        base = inst["destroy_requested_at"]
+        wait = float(base if base is not None else inst["state_since"]) + grace
+    if inst["create_unknown"] and inst["first_create_called_at"] is not None:
+        wait = max(wait, float(inst["first_create_called_at"]) + UNKNOWN_GRACE_FACTOR * grace)
+    return wait
+
+
+async def _ref_is_ours(
+    conn: sqlite3.Connection, adapter: ProviderAdapter, inst: sqlite3.Row, now: float
+) -> bool:
+    """R1-11: `provider_ref` is not listed under the row's label; destroy it only when `get`
+    shows a resource with exactly this label. A ghost (None) needs no destroy; another label
+    -> `ownership_mismatch` incident and no destroy; a failed `get` -> retried later."""
+    ref = inst["provider_ref"]
+    try:
+        res = await adapter.get(ref)
+    except Exception:  # noqa: BLE001 - adapters may raise anything; retried next pass
+        return False
+    if res is None:
+        return False
+    if res.label == inst["label"]:
+        return True
+    record_incident(
+        conn, now, "ownership_mismatch", "critical", ref=inst["id"],
+        dedup_key=f"ownership_mismatch:{ref}",
+        details={"provider_ref": ref, "row_label": inst["label"], "resource_label": res.label},
+    )  # fmt: skip
+    return False
+
 
 def _staleness(adapter: ProviderAdapter) -> float:
     """Optional adapter attribute `list_staleness_s` (default 0: one empty list is enough)."""
@@ -120,12 +187,13 @@ async def request_destroy(
     accepted = False
     if inst["next_destroy_at"] is None or now >= float(inst["next_destroy_at"]):
         refs: list[str] = []
-        if inst["provider_ref"] is not None:
-            refs.append(inst["provider_ref"])
         try:
             refs += [r.ref for r in await _owned_by_label(adapter, inst["label"])]
         except Exception:  # noqa: BLE001, S110 - listing failed: still destroy the known ref
             pass
+        ref = inst["provider_ref"]
+        if ref is not None and ref not in refs and await _ref_is_ours(conn, adapter, inst, now):
+            refs.insert(0, ref)
         refs = list(dict.fromkeys(refs))
         accepted = await _destroy_refs(conn, adapter, inst, refs, now, cfg)
     if accepted or now - requested_at >= cfg.timeouts.stop_confirm_s:
@@ -143,9 +211,21 @@ async def adopt_ref_or_destroy(
     now: float,
 ) -> bool:
     """A create answer arrived: store the ref WITHOUT a state CAS; if the row has left
-    PROVISIONING (kill, timeout) destroy the ref at once. True when the ref is adopted."""
+    PROVISIONING (kill, timeout) destroy the ref at once. True when the ref is adopted.
+
+    Exception (R1-12 root cause): the row already carries THIS ref and has moved on to a
+    live state (another actor adopted the same resource and did E2): nothing to store and
+    nothing to destroy. A row that already has another ref keeps it (no overwrite)."""
     assert_not_in_tx()
-    state = set_provider_ref(conn, instance_id, res.ref, res.host_id, res.price_usd_h, now)
+    with tx(conn):
+        row = conn.execute(
+            "SELECT state, provider_ref FROM instances WHERE id=?", (instance_id,)
+        ).fetchone()
+        state = State(row["state"])
+        if state != State.PROVISIONING and row["provider_ref"] == res.ref:
+            return False  # already ours and live (or in teardown, which destroys it)
+        if state == State.PROVISIONING or row["provider_ref"] is None:
+            state = set_provider_ref(conn, instance_id, res.ref, res.host_id, res.price_usd_h, now)
     if state == State.PROVISIONING:
         return True
     try:
@@ -174,7 +254,8 @@ async def confirm_zero(
     Zero = no resource of any kind with the label (instance, volume, other) and no remaining
     spend on `provider_ref`, observed twice at least `list_staleness_s` apart. Leftovers are
     destroyed by their own ref (backoff via `next_destroy_at`). A row without `provider_ref`
-    also waits `create_visibility_grace_s` after `create_called_at`.
+    also waits `no_ref_wait_until` (grace after the last create; after an unknown outcome
+    also first create + 3 * grace); resources that show up meanwhile are destroyed at once.
     `on_stopped(conn, row, now)` runs inside the final transaction (ledger finalize, etc.).
     """
     assert_not_in_tx()
@@ -182,13 +263,6 @@ async def confirm_zero(
     if src not in (State.PENDING_DELETE, State.LEAKED):
         return False
     zero_key = f"zero_seen:{inst['id']}"
-    no_ref_wait = (
-        float(inst["create_called_at"]) + cfg.timeouts.create_visibility_grace_s
-        if inst["provider_ref"] is None and inst["create_called_at"] is not None
-        else 0.0
-    )
-    if now < no_ref_wait:
-        return False
     try:
         owned = await _owned_by_label(adapter, inst["label"])
         spending = False
@@ -197,6 +271,14 @@ async def confirm_zero(
             spending = res is not None and (
                 res.status != RemoteStatus.TERMINATED or (res.spend_rate_usd_h or 0.0) > 0
             )
+            if spending and res is not None and res.label != inst["label"]:  # R1-11
+                record_incident(
+                    conn, now, "ownership_mismatch", "critical", ref=inst["id"],
+                    dedup_key=f"ownership_mismatch:{inst['provider_ref']}",
+                    details={"provider_ref": inst["provider_ref"], "row_label": inst["label"],
+                             "resource_label": res.label},
+                )  # fmt: skip
+                return False  # not ours: never destroyed, never confirmed as zero
     except Exception:  # noqa: BLE001 - adapters may raise anything
         return False  # cannot see the provider: not zero
     if owned or spending:
@@ -207,6 +289,8 @@ async def confirm_zero(
             if spending and inst["provider_ref"] is not None:
                 refs.append(inst["provider_ref"])
             await _destroy_refs(conn, adapter, inst, list(dict.fromkeys(refs)), now, cfg)
+        return False
+    if now < no_ref_wait_until(inst, cfg):  # a create may still become visible: not zero yet
         return False
     stale = _staleness(adapter)
     seen = get_key(conn, zero_key)
@@ -226,11 +310,9 @@ async def confirm_zero(
             row = conn.execute("SELECT * FROM instances WHERE id=?", (inst["id"],)).fetchone()
             if on_stopped is not None:
                 on_stopped(conn, row, now)
-            conn.execute(
-                "UPDATE reservations SET released_at=?, release_reason='instance_stopped'"
-                " WHERE instance_id=? AND released_at IS NULL",
-                (now, inst["id"]),
-            )
+            from llmhub.budget_manager import reservations  # local: budget -> lifecycle
+
+            reservations.release_instance(conn, inst["id"], now, "instance_stopped")
     return ok
 
 

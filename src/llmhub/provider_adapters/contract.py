@@ -2,6 +2,13 @@
 
 Every real adapter (T-372) must pass `run_contract` against its own harness (sandbox or
 recorded fixtures); MockProvider passes it in `tests/test_b_contract.py`.
+
+Rule for real adapters (review L7): an error of `create` after which the provider MAY have
+created the resource (HTTP 5xx, timeout, connection reset after the request was sent) must be
+normalized with `outcome_unknown=True`. Only a definite refusal (4xx: no GPU, quota, balance,
+bad request) may be `outcome_unknown=False`. The core then looks the label up after
+`create_visibility_grace_s` instead of assuming that nothing was created; zero is confirmed
+only after the grace from the first and the last create call (`teardown.no_ref_wait_until`).
 """
 
 from __future__ import annotations

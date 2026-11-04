@@ -146,7 +146,9 @@ def _create_failed(
     msg = err.message[:200]
     if err.outcome_unknown:  # resolved by the label lookup after the grace period
         with tx(conn):
-            conn.execute("UPDATE instances SET last_error=? WHERE id=?", (msg, iid))
+            conn.execute(
+                "UPDATE instances SET last_error=?, create_unknown=1 WHERE id=?", (msg, iid)
+            )
         return CreateOutcome.RETRY_LATER
     if handle_provider_error(conn, inst["provider"], err, now):  # balance / quota: no retries
         _fail_provisioning(conn, iid, now, str(err.reason))
@@ -208,8 +210,10 @@ async def _start_create(
     with tx(conn):  # the intent is in the DB before the call
         cur = conn.execute(
             "UPDATE instances SET offer_json=?, create_called_at=?, attempts=attempts+1,"
-            " gpu=? WHERE id=? AND state='PROVISIONING' AND create_called_at IS NULL",
-            (offer_json, now, offer.gpu, inst["id"]),
+            " first_create_called_at=COALESCE(first_create_called_at, ?),"
+            " last_create_called_at=?, gpu=?"
+            " WHERE id=? AND state='PROVISIONING' AND create_called_at IS NULL",
+            (offer_json, now, now, now, offer.gpu, inst["id"]),
         )
         if cur.rowcount != 1:
             return CreateOutcome.RETRY_LATER
@@ -236,8 +240,10 @@ async def create_or_adopt(
     assert_not_in_tx()
     with tx(conn):
         conn.execute(
-            "UPDATE instances SET create_called_at=?, attempts=attempts+1 WHERE id=?",
-            (now, inst["id"]),
+            "UPDATE instances SET create_called_at=?, attempts=attempts+1,"
+            " first_create_called_at=COALESCE(first_create_called_at, ?),"
+            " last_create_called_at=? WHERE id=?",
+            (now, now, now, inst["id"]),
         )
     return await _do_create(conn, adapter, inst, spec, "", cfg, lambda: now)
 
@@ -305,9 +311,10 @@ async def _provisioning(
         if int(inst["attempts"]) >= cfg.retry.create_max_attempts:
             _fail_provisioning(conn, iid, now, "create_unknown_max_attempts")
             return
-        with tx(conn):  # retry with the same label
+        with tx(conn):  # retry with the same label (the outcome of the last call is unknown)
             conn.execute(
-                "UPDATE instances SET create_called_at=NULL WHERE id=? AND provider_ref IS NULL",
+                "UPDATE instances SET create_called_at=NULL, create_unknown=1"
+                " WHERE id=? AND provider_ref IS NULL",
                 (iid,),
             )
         fresh = conn.execute("SELECT * FROM instances WHERE id=?", (iid,)).fetchone()

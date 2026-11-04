@@ -132,12 +132,35 @@ async def kill_all(
             report.completed = True
             break
         if now >= deadline:
-            record_incident(
+            record_incident(  # L2: one incident per actor and day, not one per kill run
                 conn, now, "kill_incomplete", "critical",
-                dedup_key=f"kill_incomplete:{int(start)}",
+                dedup_key=f"kill_incomplete:{actor}:{int(start // 86400)}",
                 details={"remaining": report.remaining[:50], "actor": actor},
             )  # fmt: skip
             break
         await clock.sleep_until(min(now + poll_s, deadline))
     report.elapsed_s = clock.now() - start
     return report
+
+
+async def emergency_kill_pass(
+    adapters: Mapping[str, ProviderAdapter], secret: bytes
+) -> list[str]:
+    """F-R2-4: KILL without a usable state.db (corrupt / quarantined). Destroys every listed
+    resource whose HMAC label verifies; no DB access at all. Returns refs still listed (or
+    `<provider>:list_failed`)."""
+    assert_not_in_tx()
+    remaining: list[str] = []
+    for adapter in adapters.values():
+        ours = await _owned_ours(adapter, secret)
+        if ours is None:
+            remaining.append(f"{adapter.name}:list_failed")
+            continue
+        for res in ours:
+            try:
+                await adapter.destroy(res.ref)
+            except Exception:  # noqa: BLE001, S112 - retried on the next pass
+                continue
+        after = await _owned_ours(adapter, secret)
+        remaining += [f"{adapter.name}:list_failed"] if after is None else [r.ref for r in after]
+    return sorted(set(remaining))

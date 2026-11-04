@@ -130,7 +130,11 @@ async def _reconcile_row(
                     report.errored.append(iid)
             else:  # retry create with the same label
                 with tx(conn):
-                    conn.execute("UPDATE instances SET create_called_at=NULL WHERE id=?", (iid,))
+                    conn.execute(
+                        "UPDATE instances SET create_called_at=NULL, create_unknown=1"
+                        " WHERE id=?",
+                        (iid,),
+                    )
         return
 
     if state in (State.BOOTING, State.LOADING_MODEL):
@@ -141,18 +145,22 @@ async def _reconcile_row(
         return
 
     # READY / BUSY / IDLE
-    if not alive:
-        if machine.mark_lost(conn, iid, now, "resource_gone", cfg=cfg):
-            report.errored.append(iid)
-        return
     healthy = False
-    if endpoint is not None:
+    if alive and endpoint is not None:
         try:
             healthy = await backend.health(endpoint)
         except Exception:  # noqa: BLE001 - adapters may raise anything
             healthy = False
     if not healthy:
-        if machine.mark_lost(conn, iid, now, "health_false", cfg=cfg):
+        if state == State.BUSY:
+            # L4: a loss found during the restart reconcile is not the jobs' attempt: the
+            # old-process jobs go back first without counting it, then E17
+            report.requeued_jobs += machine.requeue_running_jobs(
+                conn, now, instance_id=iid, not_worker=boot_id, count_attempt=False,
+                reason="restart",
+            )  # fmt: skip
+        cause = "health_false" if alive else "resource_gone"
+        if machine.mark_lost(conn, iid, now, cause, cfg=cfg):
             report.errored.append(iid)
         return
     report.adopted.append(iid)
@@ -161,6 +169,8 @@ async def _reconcile_row(
         report.requeued_jobs += machine.requeue_running_jobs(
             conn, now, instance_id=iid, not_worker=boot_id, count_attempt=False
         )
+    if row["pool"] not in cfg.pools:
+        return  # F-R2-3: a removed pool; the controller moves the row to STOPPING
     if state == State.IDLE:
         with tx(conn):
             conn.execute("UPDATE instances SET idle_since=? WHERE id=?", (now, iid))
@@ -199,12 +209,12 @@ async def reconcile_on_start(
             )  # fmt: skip
     for row in rows:
         listed = owned.get(row["provider"])
-        if listed is None:
-            continue
+        backend = inference.get(row["provider"])
+        if listed is None or backend is None:
+            continue  # no adapter / failed list: nothing is decided (the controller reports)
         fresh = conn.execute("SELECT * FROM instances WHERE id=?", (row["id"],)).fetchone()
         await _reconcile_row(
-            conn, adapters[row["provider"]], inference[row["provider"]], fresh, listed, now,
-            cfg, boot_id, report,
+            conn, adapters[row["provider"]], backend, fresh, listed, now, cfg, boot_id, report,
         )  # fmt: skip
     machine.error_to_stopping(conn, now)
     with tx(conn):
