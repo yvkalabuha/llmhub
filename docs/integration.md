@@ -1,6 +1,6 @@
 # Интеграция клиентов с llmhub
 
-> TL;DR: Руководство для клиентов (gameDev на C#/.NET, VoiceBot, агенты): OpenAI-совместимый `/v1/chat/completions` (+ SSE), `/v1/tasks` и `/v1/leases` по raw HTTP, коды ошибок, заголовки, таймауты, правила `data_class`. Нормативный контракт — `docs/openapi.yaml` (генерируется `scripts/export_openapi.py`, тест сверяет с приложением) и примеры `examples/` (каждый исполняется в тестах против живого приложения).
+> TL;DR: Руководство для клиентов (gameDev на C#/.NET, VoiceBot, агенты): OpenAI-совместимый `/v1/chat/completions` (+ SSE), `/v1/tasks` и `/v1/leases` по raw HTTP, коды ошибок, заголовки, таймауты, правила `data_class`; агентам Claude Code — stdio MCP-сервер `llmhub` (§8: регистрация, переменные, таймауты, что делегировать). Нормативный контракт — `docs/openapi.yaml` (генерируется `scripts/export_openapi.py`, тест сверяет с приложением) и примеры `examples/` (каждый исполняется в тестах против живого приложения).
 
 ## 1. Подключение
 - Базовый URL `http://10.8.0.1:8095` (только VPN); OpenAI-клиентам — `OPENAI_BASE_URL=http://10.8.0.1:8095/v1`.
@@ -103,3 +103,74 @@
 - curl (`bash`, без `jq`): `examples/curl/01_models.sh`, `examples/curl/02_chat.sh`, `examples/curl/03_chat_stream.sh`, `examples/curl/04_task_submit_poll_result.sh`, `examples/curl/05_task_cancel.sh`, `examples/curl/06_lease_lifecycle.sh`, `examples/curl/07_idempotency.sh`, `examples/curl/08_errors.sh`, `examples/curl/09_admin_status.sh`.
 - Python: `examples/python/openai_chat.py` (openai-python: chat, stream, заголовки, ошибки, `timeout=600`), `examples/python/raw_tasks.py` (httpx: задача с `Idempotency-Key`, опрос, результат, lease с пульсом).
 - C#/.NET: `examples/csharp/LlmHubExample` (`HttpClient`: chat, задача, lease, разбор `error`; `Timeout` 10 мин). На машине разработки llmhub нет `dotnet` — тест сборки пропускается; **gameDev**: `cd examples/csharp/LlmHubExample && LLMHUB_URL=… LLMHUB_KEY=… dotnet run`. Пути и заголовки `.cs` сверяются с OpenAPI всегда.
+
+## 8. MCP для агентов (`llmhub.mcp_server`, T-373)
+Тонкий stdio MCP-сервер: агент Claude Code вызывает llmhub инструментом, не читая большие входы и не выводя большие ответы. Ходит только в `/v1/tasks*` и `/v1/models`; проверки ответа выполняет сам (Python), решения «годится/нет» модель не принимает.
+
+### Инструменты
+| Инструмент | Что |
+|---|---|
+| `llmhub_ask` | `kind`, `input`, `input_files[]`, `schema` (объект или абсолютный путь к `.json`), `checks[]`, `model` (умолчание `auto`), `priority`, `policy`, `max_tokens`, `data_class` (умолчание `private`), `wait_s`, `deadline_s`, `output_file`, `overwrite=false`, `fresh=false` |
+| `llmhub_result` | `task_id`, `kind`, `schema`, `checks[]`, `output_file`, `overwrite`, `wait_s=0` — результат задачи (те же проверки) |
+| `llmhub_cancel` | `task_id` (облачная задача в работе всё равно оплачена) |
+| `llmhub_models` | псевдонимы (`local`/`cloud`/`ctx_tokens`) и виды задач |
+
+Ответ (`structuredContent`): `verdict` (`ok` / `check_failed` / `pending` / `error`), `task_id`, `status`, `eta_s`, `text` (весь текст или начало), `output_file`, `truncated_inline`, `truncated` (`finish_reason=length`), `finish_reason`, `checks[]` (`name`, `ok`, `reason` — только числа и имена, без текста ответа), `backend`, `fallback`, `warnings`, `tokens`, `error{code,reason,retryable,retry_after_s}`, `hint`. Любая ошибка — это `verdict=error` (не ошибка инструмента MCP), локальные отказы (`outside_roots`, `dot_component`, `exists`, `input_too_large`, `invalid_check`, `cloud_not_enabled`, `config_missing`, `key_unavailable`, …) — до отправки задачи.
+
+- **Виды** (`kind`): `extract_json` (нужна `schema`), `classify`, а также `summarize`, `translate`, `review`, `general` — помечены «пилот: не для рабочих задач без согласования». Свои виды и переопределения — YAML-файлом `LLMHUB_MCP_KINDS` (поля `description`, `system`, `max_tokens`, `think`, `task_type`, `checks`, `requires_schema`).
+- **Проверки**: `not-truncated` всегда; `json-schema` — неявно при `schema` (допускается обёртка ```` ```json ````); `max-bytes:N`, `sections:A,B` (строки-заголовки по порядку), `item-count:N` (массив / объект с одним массивом / непустые строки), `script:<latin|cyrillic|han>:<доля>`, `regex:<re>`, `no-regex:<re>` (≤ 300 символов, таймаут 5 с). Автоповторов при провале нет.
+- **Запись результата**: `ok` + `output_file` → текст в файл, в ответе начало текста; без `output_file` текст больше `LLMHUB_MCP_MAX_INLINE_BYTES` → `<scratch>/<task_id>.txt`, `truncated_inline=true`. `check_failed` → текст только в `<scratch>/<task_id>.rejected.txt` (для разбора), в `output_file` не пишется.
+- **Идемпотентность**: `Idempotency-Key = mcp-` + sha256 тела (с **содержимым** файлов, не путями) + `data_class`/`priority`/`policy`. Повтор того же вызова присоединяется к задаче (так `task_id` восстанавливается после обрыва вызова); изменённый файл по тому же пути — новая задача; `fresh=true` — новый запуск. После `retryable`-провала тот же ключ запускает новую задачу, после неповторяемого возвращает ту же ошибку (§4).
+
+### Регистрация (пример; файлы `.mcp.json` правит владелец проекта)
+```json
+{
+  "mcpServers": {
+    "llmhub": {
+      "type": "stdio",
+      "command": "/home/user/.local/bin/uv",
+      "args": ["--directory", "/var/www/llmhub", "run", "--quiet", "--extra", "mcp", "python", "-m", "llmhub.mcp_server"],
+      "env": {
+        "LLMHUB_URL": "http://10.8.0.1:8095",
+        "LLMHUB_KEY_FILE": "/home/user/.config/llmhub/agents.key",
+        "LLMHUB_MCP_ROOTS": "/var/www/projectVoiceBot:/tmp/claude-1000",
+        "LLMHUB_MCP_SCRATCH": "/home/user/.local/state/llmhub-mcp/out"
+      }
+    }
+  }
+}
+```
+gameDev — то же с `"LLMHUB_MCP_ROOTS": "/var/www/gameDev:/tmp/claude-1000"`. После установки пакета доступна и команда `llmhub-mcp` (то же, что `python -m llmhub.mcp_server`).
+- **Ключ — только файлом** (`LLMHUB_KEY_FILE`: обычный файл, не симлинк, владелец — текущий пользователь, права `600`; первая непустая строка). Переменную с самим ключом в `env` файла `.mcp.json` не писать никогда: такие файлы попадают в git. Ключ нигде не выводится (ни в ответах, ни в stderr).
+- На сервере llmhub для агентов — отдельный клиент `agents` с `cloud_allowed=false`, `max_priority=normal` (выдаёт T-371, `python -m llmhub keys new --name agents`).
+- `data_class`: всегда шлётся заголовок `X-LLMHub-Data-Class: private`; `cloud_allowed` — только параметром вызова **и** при `LLMHUB_MCP_ALLOW_CLOUD=1` в `env` MCP-сервера (без решения заказчика не ставить); сервер llmhub всё равно сужает по клиенту.
+- Пути — только абсолютные (cwd MCP-сервера — `/var/www/llmhub`, не проект агента), только внутри `LLMHUB_MCP_ROOTS` (+ scratch); путь нормализуется, `realpath` проверяется повторно (симлинки наружу запрещены), `..` запрещено, любой файл или каталог с точкой ниже корня (`.env`, `.git`, `.ssh`, `.claude`, …) недоступен; входы — обычные UTF-8 файлы; запись атомарная (`0600`), существующий файл — только с `overwrite=true`.
+- Разрешения инструментов (`mcp__llmhub__llmhub_ask` и др. в `settings.json`) — на усмотрение владельца проекта.
+
+### Переменные окружения
+| Переменная | Умолчание | Что |
+|---|---|---|
+| `LLMHUB_URL` | — (обязательна) | базовый URL API |
+| `LLMHUB_KEY_FILE` | `~/.config/llmhub/key` | файл клиентского ключа (`600`) |
+| `LLMHUB_MCP_ROOTS` | — | разрешённые корни через `:` (несуществующие пропускаются) |
+| `LLMHUB_MCP_SCRATCH` | `~/.local/state/llmhub-mcp/out` | каталог больших и отклонённых ответов (`0700`, неявно корень) |
+| `LLMHUB_MCP_KINDS` | — | YAML со своими видами |
+| `LLMHUB_MCP_ALLOW_CLOUD` | — | `1` — разрешить `data_class=cloud_allowed` |
+| `LLMHUB_MCP_MAX_INPUT_BYTES` | `400000` | сумма `input` + файлов |
+| `LLMHUB_MCP_MAX_INLINE_BYTES` | `16000` | больше — текст в файл |
+| `LLMHUB_MCP_PREVIEW_BYTES` | `2000` | начало текста при записи в файл |
+| `LLMHUB_MCP_DEFAULT_WAIT_S` / `LLMHUB_MCP_MAX_WAIT_S` | `90` / `300` | ожидание результата в одном вызове |
+| `LLMHUB_MCP_HTTP_TIMEOUT_S` | `30` | один HTTP-запрос (ожидание — опросом) |
+| `LLMHUB_MCP_MODEL` | `auto` | псевдоним по умолчанию |
+
+### Таймауты и `pending`
+- Вызов ждёт до `wait_s` (опрос `GET /v1/tasks/{id}` с паузой `eta_s/4` в пределах 0,5–5 с), затем `verdict=pending` + `task_id`; задача на сервере живёт дальше и не отменяется ни при `pending`, ни при обрыве вызова.
+- Claude Code ограничивает время вызова MCP-инструмента переменной `MCP_TOOL_TIMEOUT` (мс, в окружении процесса Claude Code). Правило: `wait_s` + 30 с запаса < `MCP_TOOL_TIMEOUT`/1000. **Рекомендация**: `MCP_TOOL_TIMEOUT=360000` (6 мин) при `LLMHUB_MCP_MAX_WAIT_S=300`. Умолчание `MCP_TOOL_TIMEOUT` в текущей версии Claude Code здесь не зафиксировано (по документации не сверено) — не полагаться на него, задавать явно. Наблюдение (не из документации): в схеме stdio-конфига локальной сборки Claude Code 2.1.318 есть поле сервера `"timeout"` (мс; перекрывает `MCP_TOOL_TIMEOUT` для этого сервера, жёсткий предел на вызов, progress-уведомления его не продлевают, значения < 1000 игнорируются) — можно указать `"timeout": 360000` рядом с `"env"`, если версия Claude Code его поддерживает.
+- Если клиент оборвал вызов раньше, `task_id` можно вернуть повтором того же `llmhub_ask` (тот же ключ идемпотентности → та же задача) или узнать из прошлого `pending`. Долгие задачи: `wait_s=0..30` → `pending` → позже `llmhub_result(task_id, wait_s=…)`.
+- Размер ответа: `LLMHUB_MCP_MAX_INLINE_BYTES` держать ниже лимита вывода MCP Claude Code (`MAX_MCP_OUTPUT_TOKENS`); 16 000 байт ≈ 4–8 тыс. токенов.
+
+### Что делегировать (до нового пилота на llmhub)
+- **Можно** (с `schema`/`checks`, результат обязательно просматривает Claude): извлечение структуры, сверяемой с источником (`extract_json` + `schema` + `item-count`); классификация по явному полю (`classify` + `schema` с `enum`). Выигрыш — на входах от ~8 тыс. токенов; ожидание — минуты.
+- **Нельзя**: заметки к релизу и changelog, переводы, свободная классификация, числовые агрегаты, ревью кода как вердикт, всё с секретами и ключами во входе, всё, где ошибку не поймает проверка и не увидит Claude.
+- **Эскалация**: `verdict ≠ ok` → подзадачу делает Claude целиком; ответ не «чинится», `fresh=true` ради другого ответа не повторяется (кроме `error.retryable=true` после `retry_after_s`). `ok` → Claude просматривает; не годится — делает сам.
+- Локальная LLM одна (CPU, ~9 ток/с): параллельные агенты стоят в общей очереди; `priority=urgent` не использовать.

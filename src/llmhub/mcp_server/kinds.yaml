@@ -1,0 +1,49 @@
+# Built-in task kinds of the llmhub MCP server (T-373). Override or extend with LLMHUB_MCP_KINDS.
+# Fields: description, system, max_tokens, think, task_type, checks, requires_schema.
+extract_json:
+  description: >-
+    Extract structure from the input into JSON that matches `schema` (required). Use only when
+    every value can be verified against the source.
+  system: >-
+    You extract data. Answer with one JSON value that matches the given JSON Schema exactly.
+    Use only facts present in the input; never invent values. No prose, no comments.
+  max_tokens: 2000
+  think: false
+  requires_schema: true
+classify:
+  description: >-
+    Classify items by an explicit field or rule; the answer is JSON with one label per item
+    (give `schema` with an enum of labels).
+  system: >-
+    You classify items. Apply exactly the rule given by the user to every item and answer with
+    JSON only: one label per item, in input order. No prose.
+  max_tokens: 1000
+  think: false
+summarize:
+  description: >-
+    Summarize the input. Pilot: do not use for production work without approval.
+  system: >-
+    Summarize the input faithfully and concisely. Keep names and numbers exactly as written.
+  max_tokens: 1500
+translate:
+  description: >-
+    Translate the input. Pilot: do not use for production work without approval.
+  system: >-
+    Translate the input as asked by the user. Keep formatting, placeholders and markup intact.
+    Answer with the translation only.
+  max_tokens: 3000
+  think: false
+review:
+  description: >-
+    Review the input and list findings. Pilot: do not use for production work without approval;
+    never treat the answer as a verdict.
+  system: >-
+    You review the input. List concrete findings with locations; say "no findings" if none.
+  max_tokens: 2000
+  think: true
+general:
+  description: >-
+    Free-form request. Pilot: do not use for production work without approval.
+  system: >-
+    You are a careful assistant. Answer the request precisely and briefly.
+  max_tokens: 1500

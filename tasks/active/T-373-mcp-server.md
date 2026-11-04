@@ -5,8 +5,8 @@
 - Проект: llmhub
 - Тип: impl
 - Агент: analyst → implementer → reviewer
-- Статус: todo
-- План: tasks/plans/T-373-plan.md (создаёт analyst)
+- Статус: review
+- План: tasks/plans/T-373-plan.md
 - Приоритет: P2
 - Зависит от: T-369
 - Документы: tasks/plans/T-369-plan.md (§4 эндпоинты и коды ошибок, §11 ворота); decisions/ADR-0138-cloud-gpu-manager.md; образец проверок (только для синтаксиса, не импортировать) — /var/www/projectVoiceBot/tools/llm/extllm_checks.py
@@ -34,13 +34,27 @@
 - [ ] Пример регистрации в `docs/integration.md` (не в projectVoiceBot); pytest, ruff, pyright чисто; ревью ≤ 3 раундов.
 
 ## Подзадачи
-- [ ] План
-- [ ] checks + kinds
-- [ ] client + безопасность файлов
-- [ ] server + живой тест + документация
+- [x] План
+- [x] checks + kinds
+- [x] client + безопасность файлов
+- [x] server + живой тест + документация
 
 ## Ревью
 <заполняет reviewer: находки, команды, результаты, вердикт>
 
 ## Журнал
 - 2026-11-04: задача создана по решению координатора на воротах плана T-369 (MCP вынесен из T-369; находки critic по MCP — в критериях).
+- 2026-11-04: analyst — план `tasks/plans/T-373-plan.md`: 16 шагов, потоки 0 → A, B, C (параллельно) → D → E; пакет `llmhub.mcp_server` (settings, secret, paths, checks, kinds, request, client, service, server), тесты in-process на `ApiEnv` + slow stdio на `LiveStack` (`tests/int_live.py`, не `i_fixtures.py`); двойной допуск облака (`data_class` + `LLMHUB_MCP_ALLOW_CLOUD`); правило делегирования — в описаниях инструментов. P2 — ворота не обязательны. Блокирующих вопросов нет. Статус planned.
+- 2026-11-04: implementer — потоки 0, A, B, C, D, E выполнены последовательно (TDD), статус review.
+  - Файлы: `pyproject.toml` (extra `mcp`, dev `mcp==2.2.0`+`jsonschema>=4.20`, script `llmhub-mcp`), `uv.lock`; пакет `src/llmhub/mcp_server/` (`__init__`, `__main__`, `settings`, `secret`, `paths`, `models`, `checks`, `kinds` + `kinds.yaml`, `request`, `client`, `service`, `server`); тесты `tests/m_fixtures.py`, `tests/test_m_{settings,secret,paths,models,checks,kinds,request,client,service,service_api,server,imports,live,docs}.py`; `docs/integration.md` (TL;DR + новый §8 «MCP для агентов»).
+  - Проверки: `uv run pytest tests/test_m_*.py` → 244 passed (с slow `test_m_live.py`, ~16 с); быстрый набор `-m "not slow and not docker"` → 2758 passed + smoke после правки; полный `uv run pytest -q -p no:cacheprovider` (slow + docker) → 2868 passed, 1 skipped, 314 с (до последней правки service: +1 тест, `test_m_*` перепрогнаны — 244 passed); `ruff check src tests scripts` — чисто; `pyright` — 0 errors. kinds.yaml и `llmhub-mcp` есть в wheel (`uv build --wheel --offline` в scratchpad). Документированная команда `uv --directory /var/www/llmhub run --quiet --extra mcp python -m llmhub.mcp_server` запускается (проверено с неверным env → exit 2, stderr).
+  - Отклонения от плана:
+    1. Q1: `uv sync --offline` не нашёл `python-multipart==0.0.33` → выполнен обычный `uv sync` (бесплатно, PyPI).
+    2. `paths`: любой компонент `..` в сыром пути — отказ `dot_component` (строже плана: после `normpath` `root/.git/../a` иначе не ловится); добавлены коды `not_found`, `invalid_path` (NUL), `input_too_large`, `scratch_unavailable`. Запись без `overwrite` — `os.link` временного файла (атомарный отказ `exists`, если файл появился), с `overwrite` — `os.replace`; оба через `dir_fd`, повторная проверка `realpath` каталога и входного файла через `/proc/self/fd`.
+    3. `HubClient.wait` возвращает последний статус всегда (а не `None` по сроку) — вызывающему нужен `eta_s` для `pending`; добавлены `budget_s` у методов и свойство `monotonic`.
+    4. `Check` — dataclass (`name`, `fn`), а не голый Callable: имя нужно для таймаута; `run_checks_async` — каждая проверка в `asyncio.to_thread` с таймаутом 5 с (R5).
+    5. `service.ask`: схема (в т. ч. путь к файлу) разбирается до проверок — `build_checks` нужна схема; пустой вход → `invalid_request`; при `output_file` в ответе только начало текста (`preview_bytes`), полный текст — в файле; ошибка HTTP после submit сохраняет `task_id`.
+    6. `server.py` без `from __future__ import annotations` (MCPServer вычисляет аннотации с замыканиями); `build_server(..., monotonic=)` — для тестов на FakeClock; lifespan не используется.
+    7. `HubClient` ключ кешируется после первой успешной загрузки (`_key_loader`).
+  - Q2 (`MCP_TOOL_TIMEOUT`): по документации не сверено (сети к докам нет). В §8 — как рекомендация `360000`; наблюдение из бинаря локального Claude Code 2.1.318: в схеме stdio-конфига есть поле сервера `timeout` (мс, перекрывает `MCP_TOOL_TIMEOUT`, < 1000 игнорируется) — описано как наблюдение, не факт из документации. Умолчание не найдено.
+  - Известные ограничения: опрос с паузой до 5 с — короткая задача отвечает через ~5 с после готовности; текстовый `content` ответа MCP дублирует `structuredContent` (JSON с отступами, ~+20 % к размеру); поток с зависшим regex продолжает работать после таймаута (R5); `.mcp.json` нигде не правился.

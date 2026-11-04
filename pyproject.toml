@@ -5,8 +5,14 @@ description = "Hybrid LLM dispatcher: local llama-server plus on-demand cloud GP
 requires-python = ">=3.12"
 dependencies = ["fastapi", "uvicorn", "httpx", "pydantic>=2", "pyyaml", "cryptography"]
 
+[project.optional-dependencies]
+mcp = ["mcp==2.2.0", "jsonschema>=4.20"]
+
+[project.scripts]
+llmhub-mcp = "llmhub.mcp_server.__main__:main"
+
 [dependency-groups]
-dev = ["pytest", "pytest-asyncio", "openai", "ruff", "pyright[nodejs]", "types-pyyaml"]
+dev = ["pytest", "pytest-asyncio", "openai", "ruff", "pyright[nodejs]", "types-pyyaml", "mcp==2.2.0", "jsonschema>=4.20"]
 
 [build-system]
 requires = ["hatchling"]
