@@ -9,7 +9,10 @@ if TYPE_CHECKING:
     from llmhub.configuration.loader import (
         ConfigError,
         load_config,
+        load_instance_secret,
         load_label_secret,
+        load_weights_ca,
+        load_weights_secret,
     )
     from llmhub.configuration.models import (
         BudgetConfig,
@@ -22,6 +25,14 @@ if TYPE_CHECKING:
         QueueConfig,
         RetryConfig,
         TimeoutsConfig,
+    )
+    from llmhub.configuration.weights_models import (
+        InferClientConfig,
+        InferConfig,
+        WeightFileConfig,
+        WeightsConfig,
+        WeightSetConfig,
+        WeightSourceConfig,
     )
 
 # public name -> submodule; resolved lazily (PEP 562) so packages never import each
@@ -40,12 +51,23 @@ _EXPORTS: dict[str, str] = {
     "ConfigError": "loader",
     "load_config": "loader",
     "load_label_secret": "loader",
+    "load_instance_secret": "loader",
+    "load_weights_secret": "loader",
+    "load_weights_ca": "loader",
+    "InferClientConfig": "weights_models",
+    "InferConfig": "weights_models",
+    "WeightFileConfig": "weights_models",
+    "WeightSetConfig": "weights_models",
+    "WeightsConfig": "weights_models",
+    "WeightSourceConfig": "weights_models",
 }
 __all__ = [
     "BudgetConfig",
     "Config",
     "ConfigError",
     "DbConfig",
+    "InferClientConfig",
+    "InferConfig",
     "LeaseConfig",
     "PoolConfig",
     "ProvidersConfig",
@@ -53,8 +75,15 @@ __all__ = [
     "QueueConfig",
     "RetryConfig",
     "TimeoutsConfig",
+    "WeightFileConfig",
+    "WeightSetConfig",
+    "WeightSourceConfig",
+    "WeightsConfig",
     "load_config",
+    "load_instance_secret",
     "load_label_secret",
+    "load_weights_ca",
+    "load_weights_secret",
 ]
 
 

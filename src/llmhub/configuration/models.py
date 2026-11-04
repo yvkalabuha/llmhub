@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from llmhub.configuration.weights_models import InferConfig, WeightsConfig
 
 
 class _Model(BaseModel):
@@ -74,6 +76,8 @@ class PoolConfig(_Model):
     disk_gb: int
     models: list[str] = []
     subbudget: str | None = None
+    weights: str | None = None  # key of Config.weights.sets (T-370)
+    infer: InferConfig = InferConfig()
 
 
 class BudgetConfig(_Model):
@@ -128,3 +132,21 @@ class Config(_Model):
     providers: ProvidersConfig = ProvidersConfig()
     db: DbConfig = DbConfig()
     task_type_max_tokens: dict[str, int] = {"default": 8000}
+    weights: WeightsConfig = WeightsConfig()
+
+    @model_validator(mode="after")
+    def _check_weights(self) -> Config:
+        w = self.weights
+        for name, pool in self.pools.items():
+            if pool.weights is None:
+                continue
+            wset = w.sets.get(pool.weights)
+            if wset is None:
+                raise ValueError(f"pools.{name}.weights: unknown weight set {pool.weights!r}")
+            if not w.sources:
+                raise ValueError(f"pools.{name}.weights: weights.sources is empty")
+            for src in w.sources:
+                for f in wset.files:
+                    if f.id not in src.paths:
+                        raise ValueError(f"weights.sources.{src.name}: no path for file {f.id!r}")
+        return self

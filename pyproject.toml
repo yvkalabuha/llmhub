@@ -3,7 +3,7 @@ name = "llmhub"
 dynamic = ["version"]
 description = "Hybrid LLM dispatcher: local llama-server plus on-demand cloud GPU (ADR-0138)"
 requires-python = ">=3.12"
-dependencies = ["fastapi", "uvicorn", "httpx", "pydantic>=2", "pyyaml"]
+dependencies = ["fastapi", "uvicorn", "httpx", "pydantic>=2", "pyyaml", "cryptography"]
 
 [dependency-groups]
 dev = ["pytest", "pytest-asyncio", "ruff", "pyright[nodejs]", "types-pyyaml"]
@@ -21,7 +21,11 @@ packages = ["src/llmhub"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
-markers = ["slow: long-running tests (simulator parity, subprocess reaper)"]
+markers = [
+    "slow: long-running tests (simulator parity, subprocess reaper)",
+    "docker: needs a local docker daemon (never run by default CI)",
+]
+pythonpath = ["infer-image"]
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -29,6 +33,6 @@ line-length = 100
 src = ["src", "tests"]
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "infer-image"]
 pythonVersion = "3.12"
-extraPaths = ["tests"]
+extraPaths = ["tests", "infer-image"]

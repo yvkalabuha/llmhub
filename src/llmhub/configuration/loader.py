@@ -12,6 +12,8 @@ from pydantic import ValidationError
 from llmhub.configuration.models import Config
 
 SECRET_ENV = "LLMHUB_LABEL_SECRET"
+INSTANCE_SECRET_ENV = "LLMHUB_INSTANCE_SECRET"
+WEIGHTS_SECRET_ENV = "LLMHUB_WEIGHTS_SECRET"
 SECRET_MIN_BYTES = 32
 
 
@@ -41,11 +43,40 @@ def load_config(path: Path, env: Mapping[str, str] = os.environ) -> Config:
         raise ConfigError("; ".join(parts)) from None
 
 
-def load_label_secret(env: Mapping[str, str] = os.environ) -> bytes:
-    value = env.get(SECRET_ENV)
+def _load_secret(name: str, env: Mapping[str, str]) -> bytes:
+    value = env.get(name)
     if value is None:
-        raise ConfigError(f"{SECRET_ENV} is not set")
+        raise ConfigError(f"{name} is not set")
     secret = value.encode()
     if len(secret) < SECRET_MIN_BYTES:
-        raise ConfigError(f"{SECRET_ENV} must be at least {SECRET_MIN_BYTES} bytes")
+        raise ConfigError(f"{name} must be at least {SECRET_MIN_BYTES} bytes")
     return secret
+
+
+def load_label_secret(env: Mapping[str, str] = os.environ) -> bytes:
+    return _load_secret(SECRET_ENV, env)
+
+
+def load_instance_secret(env: Mapping[str, str] = os.environ) -> bytes:
+    """Derives per-instance API keys / TLS material (controller only)."""
+    return _load_secret(INSTANCE_SECRET_ENV, env)
+
+
+def load_weights_secret(env: Mapping[str, str] = os.environ) -> bytes:
+    """Signs weights-server tokens (controller and weights validator)."""
+    return _load_secret(WEIGHTS_SECRET_ENV, env)
+
+
+def load_weights_ca(cfg: Config) -> dict[str, str]:
+    """Source name -> PEM text of its pinned CA/certificate (sources with ca_pem_file)."""
+    out: dict[str, str] = {}
+    for src in cfg.weights.sources:
+        if src.ca_pem_file is None:
+            continue
+        try:
+            out[src.name] = Path(src.ca_pem_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ConfigError(
+                f"weights.sources.{src.name}.ca_pem_file: cannot read ({type(exc).__name__})"
+            ) from exc
+    return out

@@ -1,0 +1,45 @@
+# Example cloud pool with a weights chain self_hosted -> hf (T-370). Sizes/sha256 below are
+# placeholders (all-zero sha256): fill them from /opt/models/sha256-T365.txt in T-371.
+data_dir: /var/lib/llmhub
+providers:
+  enabled: [mock]
+pools:
+  cloud-27b:
+    provider: mock
+    gpu: RTX4090
+    vram_gb: 24
+    pp_tps: 1200
+    tg_tps: 78
+    image: ghcr.io/example/llmhub-infer:0.1.0
+    disk_gb: 60
+    models: [qwen3.8-27b]
+    weights: qwen38-27b-q4
+    infer:
+      transport: proxy        # direct needs a public IP on the offer (T-372 decides)
+      # llama_args: defaults are used; -m/--host/--port/--api-key/--ssl-* are forbidden
+weights:
+  sources:
+    - name: self_hosted
+      kind: self_hosted
+      base_url: "https://65.109.95.35:9443/w/{op_id}/"
+      ca_pem_file: /etc/llmhub/weights-cert.pem   # public cert, pinned by the pod
+      min_speed_mb_s: 25
+      segments: 1             # until measured
+      paths:
+        model: qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_M.gguf
+        draft: qwen3.8-27b/mtp-Qwen3.8-27B-Q4_0.gguf
+    - name: hf
+      kind: hf
+      base_url: "https://huggingface.co/<repo>/resolve/<revision>/"
+      min_speed_mb_s: 0
+      segments: 4
+      paths:
+        model: Qwen3.8-27B-UD-Q4_K_M.gguf
+        draft: MTP/mtp-Qwen3.8-27B-Q4_0.gguf
+  sets:
+    qwen38-27b-q4:
+      files:
+        - {id: draft, size: 1470000000, sha256: "0000000000000000000000000000000000000000000000000000000000000000"}
+        - {id: model, size: 17680000000, sha256: "0000000000000000000000000000000000000000000000000000000000000000"}
+  # hf_token_env: HF_READ_TOKEN   # off by default: repo is public, HF_TOKEN is not sent to pods.
+  #                               # If set, use a fine-grained read-only token for that repo only.

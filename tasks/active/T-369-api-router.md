@@ -5,8 +5,8 @@
 - Проект: llmhub
 - Тип: impl
 - Агент: analyst → implementer → reviewer
-- Статус: todo
-- План: tasks/plans/T-369-plan.md (создаёт analyst)
+- Статус: planned
+- План: tasks/plans/T-369-plan.md
 - Приоритет: P1
 - Зависит от: T-368
 - Документы: decisions/ADR-0138-cloud-gpu-manager.md; /var/www/projectVoiceBot/platform/docs/research/T-367-cloud-gpu-manager.md (§6.10, §6.11, §6.12); T-367-tz-v2.md (ТЗ)
@@ -24,7 +24,7 @@
 - [ ] `docs/openapi.yaml` сверяется с приложением; `examples/`: curl, C#/.NET HttpClient, openai-python; контрактный тест: каждый curl-пример проходит против приложения на Mock.
 - [ ] pytest, ruff, pyright чисто; ревью ≤ 3 раундов.
 ## Подзадачи
-- [ ] План + ворота
+- [x] План + ворота (2026-11-04)
 - [ ] api_gateway (openai, tasks, leases, admin, auth, errors)
 - [ ] local_inference + model_router
 - [ ] OpenAPI + examples + контрактный тест
@@ -32,3 +32,5 @@
 <заполняет reviewer: находки, команды, результаты, вердикт>
 ## Журнал
 - 2026-11-04: задача создана координатором при создании репозитория.
+- 2026-11-04: analyst — план `tasks/plans/T-369-plan.md` (36 шагов, потоки G, H, R, W, M, I, O; таблица правил router H1–F3, таблица кодов ошибок, эндпоинты; MCP `llmhub_ask` — тонкий stdio-клиент HTTP API). Минимальные правки ядра: `Controller.wake()`, `complete` учитывает `cancel_requested`, `task_queue/local.py`, миграция 0003. Блокирующих вопросов нет; Q6 (реальный облачный InferenceBackend вне T-369/T-370) — координатору. Статус planned; дальше ворота critic + advocate (P1).
+- 2026-11-04: analyst — находки ворот critic + advocate внесены в план (§11): MCP вынесен в T-373; `cancelled` → 409; перечитывание клиентов (SIGHUP, `/admin/reload_clients`); разрыв ≠ отмена; private/секрет никогда в облако (F2 + отрицательные тесты); детектор по всем строкам запроса; просрочка в очереди (`expire_overdue`, G3a); общий опросчик ожидания; CAS `complete_local`; страж портов 8090–8092; C# — `dotnet build` со skip. 34 шага, потоки G, H, R, W, I, O. Статус planned.
