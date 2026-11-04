@@ -17,6 +17,7 @@ from llmhub.lifecycle_manager import leases
 from llmhub.lifecycle_manager.safety import record_incident
 from llmhub.persistence.db import tx
 from llmhub.provider_adapters.base import UnavailableReason
+from llmhub.task_queue import local
 from llmhub.task_queue.bodies import BodyStore
 from llmhub.task_queue.models import IdempotencyConflict, JobSpec, JobStatus, SubmitResult
 
@@ -98,15 +99,15 @@ def submit(
                 "INSERT INTO jobs(id, client_id, idem_key, idem_expires_at, body_sha256,"
                 " created_at, priority, prio_rank, task_type, model_alias, policy, data_class,"
                 " pool, deadline_at, max_queue_wait_s, timeout_s, status, route, route_reason,"
-                " est_tokens_in, est_tokens_out, req_path, max_attempts)"
-                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " est_tokens_in, est_tokens_out, req_path, max_attempts, est_cost_usd)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job_id, spec.client_id, spec.idem_key,
                  now + cfg.queue.idem_ttl_s if spec.idem_key is not None else None, sha, now,
                  spec.priority, spec.priority.rank, spec.task_type, spec.model_alias,
                  spec.policy, spec.data_class, spec.pool, spec.deadline_at,
                  spec.max_queue_wait_s, spec.timeout_s, JobStatus.QUEUED, spec.route,
                  spec.route_reason, spec.est_tokens_in, out, str(path),
-                 cfg.retry.job_max_attempts),
+                 cfg.retry.job_max_attempts, spec.est_cost_usd),
             )  # fmt: skip
             if spec.pool is not None:
                 leases.create_implicit(conn, job_id, spec.pool, spec.client_id, now)
@@ -167,7 +168,8 @@ def complete(
 
     `res_path` is an S0 addition (optional trailing argument)."""
     conn.execute(
-        "UPDATE jobs SET status='completed', tokens_in=?, tokens_out=?, finish_reason=?,"
+        "UPDATE jobs SET status=CASE WHEN cancel_requested=1 THEN 'cancelled' ELSE 'completed' END,"
+        " tokens_in=?, tokens_out=?, finish_reason=?,"
         " cost_usd=?, finished_at=?, res_path=? WHERE id=?",
         (result.tokens_in, result.tokens_out, result.finish_reason, cost_usd, now, res_path,
          job_id),
@@ -205,7 +207,7 @@ def requeue(
     """
     with _join_or_open(conn):
         row = conn.execute(
-            "SELECT status, attempts, max_attempts, cancel_requested, restarts FROM jobs"
+            "SELECT status, attempts, max_attempts, cancel_requested, restarts, pool FROM jobs"
             " WHERE id=?",
             (job_id,),
         ).fetchone()
@@ -222,6 +224,9 @@ def requeue(
                 dedup_key=f"job_max_restarts:{job_id}",
                 details={"restarts": int(row["restarts"]), "reason": reason},
             )  # fmt: skip
+            if row["pool"] is None:  # local job: a fallback would loop forever
+                local.fail(conn, job_id, "local_unavailable", now, reason="max_restarts")
+                return "failed"
             fallback_local(conn, job_id, "max_restarts", now)
             return "fallback"
         attempts = row["attempts"] if count_attempt else max(row["attempts"] - 1, 0)

@@ -59,7 +59,7 @@ def test_concurrent_migrate_of_v1_db_both_succeed(tmp_path: Path) -> None:
         _make_v1(path)
         assert _race(path, lambda p=path: _migrate(p, 300), lambda p=path: _migrate(p, 5000)) == []
         a = connect(path)
-        assert int(a.execute("PRAGMA user_version").fetchone()[0]) == 2
+        assert int(a.execute("PRAGMA user_version").fetchone()[0]) == 3
         row = a.execute("SELECT create_unknown, first_create_called_at FROM instances").fetchone()
         assert tuple(row) == (0, None)  # existing rows get the defaults
         a.close()

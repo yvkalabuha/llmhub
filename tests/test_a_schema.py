@@ -14,8 +14,8 @@ TABLES = {
 
 def test_migrate_empty_db(tmp_path: Path) -> None:
     conn = connect(tmp_path / "state.db")
-    assert migrate(conn) == 2
-    assert conn.execute("PRAGMA user_version").fetchone()[0] == 2
+    assert migrate(conn) == 3
+    assert conn.execute("PRAGMA user_version").fetchone()[0] == 3
     names = {
         r[0]
         for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
@@ -23,13 +23,13 @@ def test_migrate_empty_db(tmp_path: Path) -> None:
     }
     assert names == TABLES
     row = conn.execute("SELECT value FROM controller_state WHERE key='schema_version'").fetchone()
-    assert row[0] == "2"
+    assert row[0] == "3"
 
 
 def test_migrate_twice_is_noop(tmp_path: Path) -> None:
     conn = connect(tmp_path / "state.db")
     migrate(conn)
-    assert migrate(conn) == 2
+    assert migrate(conn) == 3
 
 
 def test_pragmas(tmp_path: Path) -> None:
@@ -43,7 +43,7 @@ def test_pragmas(tmp_path: Path) -> None:
 
 def test_memory_db() -> None:
     conn = connect(":memory:")
-    assert migrate(conn) == 2
+    assert migrate(conn) == 3
 
 
 def test_check_rejects_bad_state() -> None:

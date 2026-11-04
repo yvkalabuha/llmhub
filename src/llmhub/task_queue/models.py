@@ -43,6 +43,7 @@ class JobSpec:
     timeout_s: float | None = None
     est_tokens_in: int = 0
     max_tokens: int | None = None
+    est_cost_usd: float | None = None
 
 
 @dataclass(frozen=True)

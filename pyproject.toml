@@ -6,7 +6,7 @@ requires-python = ">=3.12"
 dependencies = ["fastapi", "uvicorn", "httpx", "pydantic>=2", "pyyaml", "cryptography"]
 
 [dependency-groups]
-dev = ["pytest", "pytest-asyncio", "ruff", "pyright[nodejs]", "types-pyyaml"]
+dev = ["pytest", "pytest-asyncio", "openai", "ruff", "pyright[nodejs]", "types-pyyaml"]
 
 [build-system]
 requires = ["hatchling"]

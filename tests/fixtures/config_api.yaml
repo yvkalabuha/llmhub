@@ -1,0 +1,33 @@
+data_dir: /tmp/llmhub-test
+pools:
+  p1:
+    provider: mock
+    gpu: RTX4090
+    vram_gb: 24
+    pp_tps: 1200
+    tg_tps: 78
+    image: llmhub-infer:test
+    disk_gb: 50
+    models: [big]
+local_backends:
+  cpu:
+    url: http://127.0.0.1:8091/v1
+    model: local-model
+    ctx_tokens: 32768
+    pp_tps: 50
+    tg_tps: 5
+models:
+  big: {local: cpu, quality_tier: 2}
+  cloudonly: {}
+task_types:
+  summarize: {max_tokens: 1000, think: false}
+router: {auto_alias: big}
+clients:
+  game:
+    key_sha256: "0000000000000000000000000000000000000000000000000000000000000001"
+    allowed_models: ["*"]
+    max_priority: normal
+    default_priority: low
+    cloud_allowed: true
+api:
+  admin_key_sha256: "0000000000000000000000000000000000000000000000000000000000000002"

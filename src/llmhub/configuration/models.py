@@ -6,6 +6,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from llmhub.configuration.api_models import ApiSection, check_api_section
 from llmhub.configuration.weights_models import InferConfig, WeightsConfig
 
 
@@ -121,7 +122,7 @@ class DbConfig(_Model):
     reaper_busy_timeout_ms: int = 5000
 
 
-class Config(_Model):
+class Config(ApiSection):
     data_dir: Path
     pools: dict[str, PoolConfig]
     queue: QueueConfig = QueueConfig()
@@ -131,7 +132,7 @@ class Config(_Model):
     retry: RetryConfig = RetryConfig()
     providers: ProvidersConfig = ProvidersConfig()
     db: DbConfig = DbConfig()
-    task_type_max_tokens: dict[str, int] = {"default": 8000}
+    task_type_max_tokens: dict[str, int] = Field(default_factory=lambda: {"default": 8000})
     weights: WeightsConfig = WeightsConfig()
 
     @model_validator(mode="after")
@@ -149,4 +150,5 @@ class Config(_Model):
                 for f in wset.files:
                     if f.id not in src.paths:
                         raise ValueError(f"weights.sources.{src.name}: no path for file {f.id!r}")
+        check_api_section(self, self.pools)
         return self

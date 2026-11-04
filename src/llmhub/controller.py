@@ -214,6 +214,10 @@ class Controller:
         self._wake.set()
         return result
 
+    def wake(self) -> None:
+        """Public wake-up of `run_forever` (admin operations, prewarm leases, local worker)."""
+        self._wake.set()
+
     def wake_pending(self) -> bool:
         """True when a background task finished since the last step (step again now)."""
         return self._wake.is_set()

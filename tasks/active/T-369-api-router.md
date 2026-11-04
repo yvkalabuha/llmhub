@@ -5,7 +5,7 @@
 - Проект: llmhub
 - Тип: impl
 - Агент: analyst → implementer → reviewer
-- Статус: planned
+- Статус: in-progress
 - План: tasks/plans/T-369-plan.md
 - Приоритет: P1
 - Зависит от: T-368
@@ -34,3 +34,4 @@
 - 2026-11-04: задача создана координатором при создании репозитория.
 - 2026-11-04: analyst — план `tasks/plans/T-369-plan.md` (36 шагов, потоки G, H, R, W, M, I, O; таблица правил router H1–F3, таблица кодов ошибок, эндпоинты; MCP `llmhub_ask` — тонкий stdio-клиент HTTP API). Минимальные правки ядра: `Controller.wake()`, `complete` учитывает `cancel_requested`, `task_queue/local.py`, миграция 0003. Блокирующих вопросов нет; Q6 (реальный облачный InferenceBackend вне T-369/T-370) — координатору. Статус planned; дальше ворота critic + advocate (P1).
 - 2026-11-04: analyst — находки ворот critic + advocate внесены в план (§11): MCP вынесен в T-373; `cancelled` → 409; перечитывание клиентов (SIGHUP, `/admin/reload_clients`); разрыв ≠ отмена; private/секрет никогда в облако (F2 + отрицательные тесты); детектор по всем строкам запроса; просрочка в очереди (`expire_overdue`, G3a); общий опросчик ожидания; CAS `complete_local`; страж портов 8090–8092; C# — `dotnet build` со skip. 34 шага, потоки G, H, R, W, I, O. Статус planned.
+- 2026-11-04: implementer, поток G (фундамент) готов. Файлы: `configuration/api_models.py` (новый; `Config(ApiSection)` — одна правка `models.py`, плоские поля `local_backends/models/task_types/router/local/clients/api`, перекрёстные проверки `check_api_section`), миграция `0003_api.sql` (jobs.backend, jobs.warnings, индексы `jobs_local_queue`, `clients_key`), `task_queue/local.py`, правки ядра: `Controller.wake()`, `queue.complete` -> `cancelled` при `cancel_requested`, `JobSpec.est_cost_usd` (пишется в `submit`), `queue.requeue` при `restarts>5` и `pool IS NULL` -> `local.fail(local_unavailable, reason=max_restarts)`; `pyproject`: dev `+ openai` (sse-starlette не нужен: ответ stream — буфером). Тесты: `test_g_config/migration/local_queue/expire/core_hooks` (+ обновлены версии схемы 2->3 в `test_a_schema`, `test_review_r2_migrate`). Отклонения: проверка «алиас пула в models» пропускается при пустом `models` (иначе ломаются конфиги ядра T-368 с `pools.models=[m1]`); `task_type_max_tokens` на `default_factory` (RUF012 после смены базы); `requeue_local` берёт лимит из `jobs.max_attempts`, необязательный `max_attempts=` переопределяет (LocalConfig.max_attempts). Результаты: `pytest -m "not slow"` 1158 passed, ruff и pyright чисто.
