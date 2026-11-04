@@ -1,0 +1,161 @@
+# llmhub config for the T-372 live test (RunPod Community, <= $5; plan section 4).
+# Template for `deploy/render.py config` (LLMHUB_CONFIG_TEMPLATE=config.t372.example.yaml):
+# - the image digest is filled with LLMHUB_RENDER_SET="pools.cloud-27b.image=ghcr.io/...@sha256:..."
+#   (must equal dist/<ver>/infer.digest; tests/test_t372_deploy_runpod.py checks the shape);
+# - `render.py --weights` fills the self_hosted source and the `local-models` set from
+#   /opt/models/sha256-T365.txt; `--chain` picks the source order (L3: hf, L4: self_hosted,hf,
+#   L5: self_hosted); `--hf-base-url` sets the Hugging Face repo/revision;
+# - the client t372 gets its key hash with --set clients.t372.key_sha256=<sha256>.
+# It stays valid as it is (placeholders are syntactically valid; tests load it).
+# After the test: back to config.example.yaml (providers.enabled: [mock]) and shred the key.
+data_dir: /var/lib/llmhub
+
+api:
+  host: 10.8.0.1
+  port: 8095
+  docs: false
+  admin_key_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+
+providers:
+  enabled: [runpod]         # Mock is off: its ledger is excluded (ledger-exclude, Q5)
+  runpod:
+    cloud_type: COMMUNITY
+    gpu_type_ids: {RTX3090: "NVIDIA GeForce RTX 3090"}
+    allowed_cuda_versions: ["12.8", "12.9"]
+    price_ceiling_usd_h: 0.50
+    max_live_pods: 1
+    list_staleness_s: 30      # replace with the value measured in L2b
+    container_disk_usd_gb_month: 0.10
+    call_timeout_s: 15
+
+budget:                     # plan section 4: llmhub ceiling $4.00 for the whole test
+  hard_cap_month: 4.00
+  budget_month: 4.00
+  budget_day: 4.00
+  budget_session: 0.60
+  budget_job: 0.10
+  reserve_usd: 1.0
+
+timeouts:
+  provisioning_s: 960       # >= offer_wait_s + create_visibility_grace_s (validator)
+  offer_wait_s: 300
+  booting_s: 600
+  loading_model_s: 900
+  max_lifetime_s: 3600
+  create_visibility_grace_s: 600
+
+leases:
+  max_ttl_s: 1800
+
+retry:
+  create_unknown_max_retries: 0   # critic F1: never a second paid create after an unknown one
+  call_timeout_s: 60              # create = price check + live-pod count + POST (15 s each)
+
+local_backends:             # the existing llama-server units, used as clients (never managed)
+  qwen-35b-a3b:
+    url: http://10.8.0.1:8090/v1
+    model: qwen3.6-35b-a3b
+    ctx_tokens: 32768
+    pp_tps: 50
+    tg_tps: 9
+    api_key_file: /run/llama/api-key   # ro mount of /etc/llama/api-key, read lazily (F1)
+    probe: slots                       # GET only (F8 / Q3)
+  qwen-27b:
+    url: http://10.8.0.1:8091/v1
+    model: qwen3.8-27b
+    ctx_tokens: 32768
+    pp_tps: 9.5
+    tg_tps: 2.9
+    api_key_file: /run/llama/api-key
+    probe: slots
+  qwen-9b:
+    url: http://10.8.0.1:8092/v1
+    model: qwen3.5-9b
+    ctx_tokens: 32768
+    pp_tps: 60
+    tg_tps: 6.5
+    api_key_file: /run/llama/api-key
+    probe: slots
+
+local:
+  probe_interval_s: 30      # >= 10 (F8)
+
+models:
+  qwen-35b: {local: qwen-35b-a3b, quality_tier: 2, description: "Qwen3.6-35B-A3B (8090)"}
+  qwen-27b: {local: qwen-27b, quality_tier: 3, description: "Qwen3.8-27B (8091) / cloud-27b"}
+  qwen-9b: {local: qwen-9b, quality_tier: 1, description: "Qwen3.5-9B (8092)"}
+  qwen-27b-cloud: {quality_tier: 3, description: "cloud-27b only (e2e: never local llama)"}
+
+router:
+  auto_alias: qwen-35b
+
+pools:
+  cloud-27b:
+    provider: runpod
+    gpu: RTX3090
+    vram_gb: 24
+    pp_tps: 1200
+    tg_tps: 78
+    max_price_usd_h: 0.30
+    idle_timeout_s: 300
+    image: "ghcr.io/yvkalabuha/llmhub-infer@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+    disk_gb: 40
+    models: [qwen-27b, qwen-27b-cloud]
+    weights: local-models
+    infer:
+      transport: proxy
+
+clients:
+  voicebot:
+    key_sha256: "0000000000000000000000000000000000000000000000000000000000000001"
+    allowed_models: ["*"]
+    max_priority: urgent
+    default_priority: normal
+    cloud_allowed: false
+  gamedev:
+    key_sha256: "0000000000000000000000000000000000000000000000000000000000000002"
+    allowed_models: ["*"]
+    cloud_allowed: false
+  agents:                   # MCP llmhub_ask (S12): local models only
+    key_sha256: "0000000000000000000000000000000000000000000000000000000000000003"
+    allowed_models: ["*"]
+    default_priority: low
+    max_priority: normal
+    cloud_allowed: false
+  t372:                     # the only client allowed into the cloud during the test
+    key_sha256: "0000000000000000000000000000000000000000000000000000000000000005"
+    allowed_models: ["*"]
+    default_priority: normal
+    max_priority: urgent
+    cloud_allowed: true
+    max_active_jobs: 4
+
+weights:
+  auth_listen: 127.0.0.1:8096
+  auth_state_dir: /var/lib/llmhub-weights-auth
+  acct_log: /var/log/llmhub/weights-acct.log
+  min_mem_available_mib: 8192   # F6: validator answers 503 low_memory below this
+  token_ttl_max_s: 1800         # critic F9
+  sources:                      # self_hosted is replaced by `render.py --weights`
+    - name: self_hosted
+      kind: self_hosted
+      base_url: "https://65.109.95.35:9443/w/{op_id}/"
+      ca_pem_file: /etc/llmhub/weights-pub/weights-cert.pem
+      min_speed_mb_s: 25
+      segments: 1
+      paths:
+        model: qwen3.8-27b/Qwen3.8-27B-UD-Q4_K_M.gguf
+        draft: qwen3.8-27b/mtp-Qwen3.8-27B-Q4_0.gguf
+    - name: hf
+      kind: hf
+      base_url: "https://huggingface.co/__HF_REPO__/resolve/__HF_REVISION__/"
+      min_speed_mb_s: 0
+      segments: 4
+      paths:
+        model: Qwen3.8-27B-UD-Q4_K_M.gguf
+        draft: MTP/mtp-Qwen3.8-27B-Q4_0.gguf
+  sets:
+    local-models:               # replaced by `render.py --weights` (sizes + sha256 from T-365)
+      files:
+        - {id: draft, size: 1470000000, sha256: "0000000000000000000000000000000000000000000000000000000000000000"}
+        - {id: model, size: 17680000000, sha256: "0000000000000000000000000000000000000000000000000000000000000000"}

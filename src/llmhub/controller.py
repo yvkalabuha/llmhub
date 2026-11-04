@@ -36,7 +36,7 @@ from llmhub.cloud_manager.provisioner import (
     provision_step,
     weights_hold_until,
 )
-from llmhub.configuration.models import Config
+from llmhub.configuration.models import PROBE_POOL, Config
 from llmhub.cost_tracker import ledger
 from llmhub.cost_tracker.reconcile import (
     ensure_resume_allowed,
@@ -328,14 +328,15 @@ class Controller:
 
     def _stop_removed_pools(self, now: float) -> None:
         """F-R2-3: live rows of a pool removed from the config -> STOPPING (E15/E18, reason
-        `pool_removed`); their queued jobs go to local fallback."""
+        `pool_removed`); their queued jobs go to local fallback. Rows of `PROBE_POOL` belong to
+        a running `lifecycle-probe` (T-372), which ends them itself (PROVISIONING -> ERROR)."""
         pools = tuple(self.cfg.pools)
         marks = ",".join("?" for _ in pools) or "''"
         live = ",".join("?" for _ in LIVE_IN_INDEX)
         rows = self.conn.execute(
             f"SELECT * FROM instances WHERE pool NOT IN ({marks}) AND state IN ({live})"
-            " AND state != 'STOPPING' ORDER BY id",
-            (*pools, *sorted(LIVE_IN_INDEX)),
+            " AND state != 'STOPPING' AND pool != ? ORDER BY id",
+            (*pools, *sorted(LIVE_IN_INDEX), PROBE_POOL),
         ).fetchall()
         jobs = self.conn.execute(
             f"SELECT id FROM jobs WHERE pool IS NOT NULL AND pool NOT IN ({marks})"

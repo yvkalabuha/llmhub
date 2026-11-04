@@ -22,6 +22,7 @@ LLMHUB_INSTANCE_SECRET_FILE=/run/llmhub-secrets/instance
 LLMHUB_WEIGHTS_SECRET_FILE=/run/llmhub-secrets/weights
 -v
 /etc/llmhub/conf:/etc/llmhub/conf:ro
+@include-if-secret runpod _runpod.args
 -v
 /etc/llmhub/secrets/label:/run/llmhub-secrets/label:ro
 -v

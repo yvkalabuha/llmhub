@@ -9,9 +9,9 @@ rewrites `--heartbeat` (the container healthcheck reads its age).
 A damaged state.db (F-R2-4) does not stop the reaper: with a KILL file it destroys every
 HMAC-verified resource from `list_owned` without the DB and retries opening the DB each pass.
 
-Own DB connection (busy_timeout = `db.reaper_busy_timeout_ms`), own adapters, system clock.
-Only the mock provider exists in T-368: its shared store is `<data_dir>/mock_cloud.db`
-(override: env `LLMHUB_MOCK_STORE`). Real providers arrive with T-372.
+Own DB connection (busy_timeout = `db.reaper_busy_timeout_ms`), own adapters (the shared
+`provider_adapters.factory`: mock store `<data_dir>/mock_cloud.db`, override env
+`LLMHUB_MOCK_STORE`; RunPod key from `LLMHUB_RUNPOD_API_KEY_FILE`), system clock.
 """
 
 from __future__ import annotations
@@ -30,8 +30,7 @@ from llmhub.configuration.loader import ConfigError, load_config, load_label_sec
 from llmhub.configuration.models import Config
 from llmhub.killswitch import check_kill_file, emergency_kill_pass
 from llmhub.provider_adapters.base import ProviderAdapter
-from llmhub.provider_adapters.mock import MockProvider
-from llmhub.provider_adapters.mock_store import MockStore
+from llmhub.provider_adapters.factory import build_provider_adapters
 from llmhub.reaper.core import (
     Reaper,
     Watchdog,
@@ -46,14 +45,8 @@ MIN_LOOP_S = 5.0
 EMERGENCY_DEADLINE_S = 45.0
 
 
-def build_adapters(names: Sequence[str], data_dir: Path, clock: SystemClock) -> dict[str, ProviderAdapter]:
-    adapters: dict[str, ProviderAdapter] = {}
-    for name in names:
-        if name != "mock":
-            raise ConfigError(f"provider {name!r} has no adapter yet (T-372)")
-        store = os.environ.get("LLMHUB_MOCK_STORE") or str(data_dir / "mock_cloud.db")
-        adapters[name] = MockProvider(MockStore(store), clock)
-    return adapters
+def build_adapters(cfg: Config, clock: SystemClock) -> dict[str, ProviderAdapter]:
+    return build_provider_adapters(cfg, os.environ, clock)
 
 
 async def _emergency_once(reaper_cfg: Config, adapters: dict[str, ProviderAdapter],
@@ -79,7 +72,7 @@ async def _main(args: argparse.Namespace) -> int:
     clock = SystemClock()
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     db_path = cfg.data_dir / "state.db"
-    adapters = build_adapters(cfg.providers.enabled, cfg.data_dir, clock)
+    adapters = build_adapters(cfg, clock)
     interval = min(float(args.loop), MAX_LOOP_S)
     watchdog: Watchdog | None = None
     if not args.once:

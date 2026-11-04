@@ -1,0 +1,7 @@
+# T-372: RunPod API key, ONLY for llmhub-api and llmhub-reaper and only while
+# /etc/llmhub/secrets/runpod is non-empty (`@include-if-secret runpod _runpod.args`).
+# The env holds the path; the adapter reads the file lazily (0400, owner 64100).
+-e
+LLMHUB_RUNPOD_API_KEY_FILE=/run/llmhub-secrets/runpod
+-v
+/etc/llmhub/secrets/runpod:/run/llmhub-secrets/runpod:ro

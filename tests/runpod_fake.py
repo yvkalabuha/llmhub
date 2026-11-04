@@ -1,0 +1,349 @@
+"""In-process fake of the RunPod API (T-372 A5): REST v1 + GraphQL on `httpx.MockTransport`.
+
+A small state machine on an injected clock:
+- pods: created RUNNING (or `boot_s` in CREATED first), `cost_per_hr` = GPU price + disk;
+- `visible_after_s`: a new pod is missing from `GET /pods` and `GET /pods/{id}` this long;
+- `destroy_lag_s`: a deleted pod stays listed as EXITED this long, then 404;
+- foreign pods, network volumes and templates can be added;
+- faults per request (`inject`): HTTP status with a body, timeouts before/after the effect,
+  bad JSON shapes, a broken second page;
+- billing: hourly buckets per pod from its lifetime.
+The fake answers with the pod `env` (like RunPod), so tests can prove the adapter drops it.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import re
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import parse_qs
+
+import httpx
+
+from llmhub.clock import FakeClock
+from llmhub.configuration.models import RunpodConfig
+from llmhub.provider_adapters.base import InstanceSpec
+from llmhub.provider_adapters.runpod import RunpodAdapter
+from llmhub.provider_adapters.runpod_api import RunpodApi
+
+FAKE_KEY = "rpa_FAKEKEY_0123456789abcdef"  # fictitious
+GPU_ID = "NVIDIA GeForce RTX 3090"
+IMAGE = "ghcr.io/yvkalabuha/llmhub-infer@sha256:" + "ab" * 32
+
+
+def _iso(ts: float) -> str:
+    return dt.datetime.fromtimestamp(ts, dt.UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+@dataclass
+class FakePod:
+    id: str
+    name: str
+    image: str
+    cost: float
+    created_at: float
+    env: dict[str, str]
+    machine_id: str
+    body: dict[str, Any]
+    visible_at: float = 0.0
+    deleted_at: float | None = None
+    exited: bool = False
+
+
+@dataclass
+class Fault:
+    method: str
+    path: str  # prefix of the path after /v1 ("/pods", "/pods/", "graphql:myself", ...)
+    # "status" | "timeout_before" | "read_timeout" | "timeout_after" | "connect" | "shape" |
+    # "page2" | "graphql_error"
+    kind: str
+    status: int = 500
+    body: str = ""
+    headers: dict[str, str] = field(default_factory=dict[str, str])
+    times: int = 1
+
+
+class FakeRunpod:
+    def __init__(
+        self,
+        clock: FakeClock,
+        *,
+        price: float = 0.22,
+        disk_usd_h: float = 0.005,
+        stock: str | None = "High",
+        balance: float = 25.0,
+        boot_s: float = 0.0,
+        visible_after_s: float = 0.0,
+        destroy_lag_s: float = 0.0,
+        cost_override: float | None = None,
+        name_override: str | None = None,
+        paged: bool = False,
+    ) -> None:
+        self.clock = clock
+        self.price = price
+        self.disk_usd_h = disk_usd_h
+        self.stock = stock
+        self.balance0 = balance
+        self.boot_s = boot_s
+        self.visible_after_s = visible_after_s
+        self.destroy_lag_s = destroy_lag_s
+        self.cost_override = cost_override
+        self.name_override = name_override
+        self.paged = paged
+        self.pods: dict[str, FakePod] = {}
+        self.volumes: list[dict[str, Any]] = []
+        self.templates: list[dict[str, Any]] = []
+        self.requests: list[httpx.Request] = []
+        self.faults: list[Fault] = []
+        self.created_bodies: list[dict[str, Any]] = []
+        self._n = 0
+        self.extra_pod_fields: dict[str, Any] = {}
+
+    # --- wiring ----------------------------------------------------------------
+    def transport(self) -> httpx.MockTransport:
+        return httpx.MockTransport(self.handle)
+
+    def api(self, key: Callable[[], str] | None = None) -> RunpodApi:
+        return RunpodApi(key or (lambda: FAKE_KEY), transport=self.transport())
+
+    # --- test helpers ------------------------------------------------------------
+    def inject(self, method: str, path: str, kind: str, **kw: Any) -> None:
+        self.faults.append(Fault(method, path, kind, **kw))
+
+    def add_pod(self, name: str, *, status: str = "RUNNING", cost: float = 0.3,
+                created_at: float | None = None) -> str:  # fmt: skip
+        self._n += 1
+        pid = f"forn{self._n:04d}x"
+        pod = FakePod(pid, name, "someone/else:latest", cost,
+                      self.clock.now() if created_at is None else created_at, {}, f"m-{pid}",
+                      {})  # fmt: skip
+        self.pods[pid] = pod
+        self.extra_pod_fields.setdefault(pid, {})["desiredStatus"] = status
+        return pid
+
+    def live_pods(self) -> list[FakePod]:
+        """Ground truth: pods that bill (also invisible ones and ones in destroy lag)."""
+        now = self.clock.now()
+        return [p for p in self.pods.values()
+                if p.deleted_at is None or now < p.deleted_at + self.destroy_lag_s]  # fmt: skip
+
+    def posts(self) -> int:
+        return sum(1 for r in self.requests if r.method == "POST" and r.url.path == "/v1/pods")
+
+    def billed(self) -> float:
+        now = self.clock.now()
+        total = 0.0
+        for p in self.pods.values():
+            end = now if p.deleted_at is None else min(now, p.deleted_at + self.destroy_lag_s)
+            total += max(0.0, end - p.created_at) * p.cost / 3600
+        return total
+
+    # --- state -------------------------------------------------------------------
+    def _status(self, p: FakePod) -> str:
+        forced = self.extra_pod_fields.get(p.id, {}).get("desiredStatus")
+        now = self.clock.now()
+        if p.deleted_at is not None:
+            return "EXITED"
+        if forced:
+            return str(forced)
+        if p.exited:
+            return "EXITED"
+        if now < p.created_at + self.boot_s:
+            return "CREATED"
+        return "RUNNING"
+
+    def _visible(self, p: FakePod) -> bool:
+        now = self.clock.now()
+        if now < p.visible_at:
+            return False
+        return p.deleted_at is None or now < p.deleted_at + self.destroy_lag_s
+
+    def _json(self, p: FakePod) -> dict[str, Any]:
+        d: dict[str, Any] = {
+            "id": p.id, "name": p.name, "desiredStatus": self._status(p), "costPerHr": p.cost,
+            "machineId": p.machine_id, "image": p.image, "createdAt": _iso(p.created_at),
+            "env": dict(p.env), "gpuCount": 1, "interruptible": False, "ports": ["8080/http"],
+        }  # fmt: skip
+        for k, v in self.extra_pod_fields.get(p.id, {}).items():
+            if k != "desiredStatus":
+                d[k] = v
+        return d
+
+    # --- HTTP ------------------------------------------------------------------------
+    def _fault(self, method: str, path: str, *, paged: bool = False) -> Fault | None:
+        for f in self.faults:
+            if f.kind == "page2" and not paged:
+                continue  # only the request for a later page fails
+            if f.times > 0 and f.method == method and path.startswith(f.path):
+                f.times -= 1
+                self.faults = [x for x in self.faults if x.times > 0]
+                return f
+        return None
+
+    def handle(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        if request.headers.get("authorization") != f"Bearer {FAKE_KEY}":
+            return httpx.Response(401, json={"error": "unauthorized"})
+        host = request.url.host
+        if host == "api.runpod.io":
+            return self._graphql(request)
+        assert host == "rest.runpod.io", host
+        path = request.url.path.removeprefix("/v1")
+        fault = self._fault(request.method, path, paged="cursor=" in str(request.url))
+        if fault is not None:
+            if fault.kind == "status":
+                return httpx.Response(fault.status, text=fault.body, headers=fault.headers)
+            if fault.kind == "timeout_before":
+                raise httpx.ConnectTimeout("fake", request=request)
+            if fault.kind == "read_timeout":  # sent, no effect, no answer
+                raise httpx.ReadTimeout("fake", request=request)
+            if fault.kind == "connect":
+                raise httpx.ConnectError("fake", request=request)
+            if fault.kind == "shape":
+                return httpx.Response(200, json={"unexpected": True} if path != "/pods"
+                                      else [{"id": 5}])  # fmt: skip
+        resp = self._route(request, path, fault)
+        if fault is not None and fault.kind == "timeout_after":
+            raise httpx.ReadTimeout("fake", request=request)
+        return resp
+
+    def _route(self, request: httpx.Request, path: str, fault: Fault | None) -> httpx.Response:
+        m, q = request.method, parse_qs(request.url.query.decode())
+        if path == "/pods" and m == "GET":
+            items = [self._json(p) for p in self.pods.values() if self._visible(p)]
+            if not self.paged:
+                return httpx.Response(200, json=items)
+            if "cursor" not in q:
+                return httpx.Response(200, json={"data": items[:1], "nextCursor": "c2"})
+            if fault is not None and fault.kind == "page2":
+                return httpx.Response(503, text="page failed")
+            return httpx.Response(200, json={"data": items[1:], "nextCursor": None})
+        if path == "/pods" and m == "POST":
+            body = json.loads(request.content)
+            self.created_bodies.append(body)
+            self._n += 1
+            pid = f"pod{self._n:04d}abc"
+            now = self.clock.now()
+            cost = self.cost_override if self.cost_override is not None else round(
+                self.price + self.disk_usd_h, 4)
+            pod = FakePod(pid, self.name_override or body["name"], body["imageName"], cost, now,
+                          dict(body.get("env", {})), f"mach-{self._n}", body,
+                          visible_at=now + self.visible_after_s)  # fmt: skip
+            self.pods[pid] = pod
+            return httpx.Response(200, json=self._json(pod))
+        mm = re.fullmatch(r"/pods/([^/]+)", path)
+        if mm and m in ("GET", "DELETE"):
+            pod = self.pods.get(mm.group(1))
+            if pod is None or not self._visible(pod):
+                if m == "DELETE" and pod is not None and pod.deleted_at is None:
+                    pod.deleted_at = self.clock.now()  # invisible yet, still deletable
+                    return httpx.Response(200, json={})
+                return httpx.Response(404, json={"error": "pod not found"})
+            if m == "GET":
+                return httpx.Response(200, json=self._json(pod))
+            if pod.deleted_at is None:
+                pod.deleted_at = self.clock.now()
+            return httpx.Response(200, content=b"")
+        if path == "/networkvolumes" and m == "GET":
+            return httpx.Response(200, json=self.volumes)
+        if path == "/templates" and m == "GET":
+            return httpx.Response(200, json=self.templates)
+        if path == "/billing/pods" and m == "GET":
+            return httpx.Response(200, json=self._billing(q))
+        return httpx.Response(404, json={"error": "no route"})
+
+    def _billing(self, q: dict[str, list[str]]) -> list[dict[str, Any]]:
+        from llmhub.provider_adapters.runpod_api import parse_time
+
+        start = parse_time(q["startTime"][0])
+        end = parse_time(q["endTime"][0])
+        out: list[dict[str, Any]] = []
+        for p in self.pods.values():
+            stop = self.clock.now() if p.deleted_at is None else p.deleted_at + self.destroy_lag_s
+            t0, t1 = max(p.created_at, start), min(stop, end)
+            if t1 <= t0:
+                continue
+            hour = int(t0 // 3600) * 3600
+            while hour < t1:
+                a, b = max(t0, hour), min(t1, hour + 3600)
+                if b > a:
+                    out.append({"podId": p.id, "time": _iso(hour),
+                                "amount": round((b - a) * p.cost / 3600, 6),
+                                "diskSpaceBilledGb": 0})  # fmt: skip
+                hour += 3600
+        return out
+
+    def _graphql(self, request: httpx.Request) -> httpx.Response:
+        query = json.loads(request.content)["query"]
+        if "myself" in query:
+            fault = self._fault("POST", "graphql:myself")
+            if fault is not None:
+                return httpx.Response(fault.status, text=fault.body)
+            spend = sum(p.cost for p in self.pods.values() if self._status(p) == "RUNNING"
+                        and p.deleted_at is None)  # fmt: skip
+            return httpx.Response(200, json={"data": {"myself": {
+                "clientBalance": round(self.balance0 - self.billed(), 6),
+                "currentSpendPerHr": spend, "spendLimit": 80}}})  # fmt: skip
+        if "gpuTypes" in query:
+            fault = self._fault("POST", "graphql:gpuTypes")
+            if fault is not None:
+                if fault.kind == "graphql_error":
+                    return httpx.Response(200, json={"errors": [{"message": fault.body}],
+                                                     "data": None})  # fmt: skip
+                return httpx.Response(fault.status, text=fault.body)
+            gid = re.search(r'id: "([^"]+)"', query)
+            assert gid is not None
+            if gid.group(1) != GPU_ID:
+                return httpx.Response(200, json={"data": {"gpuTypes": []}})
+            low = None if self.stock is None else {"uninterruptablePrice": self.price,
+                                                   "stockStatus": self.stock}  # fmt: skip
+            return httpx.Response(200, json={"data": {"gpuTypes": [{
+                "id": GPU_ID, "displayName": "RTX 3090", "memoryInGb": 24,
+                "lowestPrice": low}]}})  # fmt: skip
+        return httpx.Response(400, json={"errors": [{"message": "unknown query"}]})
+
+
+def runpod_cfg(**over: Any) -> RunpodConfig:
+    return RunpodConfig(**over)
+
+
+def make_spec(**over: Any) -> InstanceSpec:
+    fields: dict[str, Any] = {
+        "pool": "cloud-27b", "offer_id": GPU_ID, "image": IMAGE, "disk_gb": 40,
+        "max_price_usd_h": 0.30, "max_lifetime_s": 3600,
+        "env": {"LLMHUB_TRANSPORT": "proxy", "LLMHUB_PORT": "8080", "LLMHUB_OP_ID": "x"},
+    }  # fmt: skip
+    fields.update(over)
+    return InstanceSpec(**fields)
+
+
+def make_adapter(fake: FakeRunpod, **cfg_over: Any) -> RunpodAdapter:
+    return RunpodAdapter(fake.api(), runpod_cfg(**cfg_over), fake.clock, disk_gb_hint=40)
+
+
+class RunpodHarness:
+    """AdapterHarness (contract C1..C11) for RunpodAdapter on the fake."""
+
+    def __init__(self, *, lagging: bool = False) -> None:
+        self.clock = FakeClock()
+        self.fake = FakeRunpod(
+            self.clock, destroy_lag_s=30.0 if lagging else 0.0,
+            visible_after_s=0.0, boot_s=20.0 if lagging else 0.0,
+        )  # fmt: skip
+        self.adapter = make_adapter(self.fake)
+        self.lagging = lagging
+
+    async def settle(self) -> None:
+        self.clock.advance_to(self.clock.now() + 120.0)
+
+    def make_spec(self) -> InstanceSpec:
+        return make_spec()
+
+    def add_foreign(self, label: str) -> str:
+        return self.fake.add_pod(label)
+
+    def inject_unknown_create(self) -> None:
+        self.fake.inject("POST", "/pods", "timeout_after")

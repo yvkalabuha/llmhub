@@ -7,7 +7,8 @@ and nothing secret is ever stored:
 - TLS      = Ed25519 key from HMAC(instance_secret, "tls:" + op_id), self-signed certificate
              with validity and serial derived from `created_at` and `op_id` (Ed25519 signs
              deterministically, so the DER and its sha256 fingerprint are stable);
-- weights token = `issue_token(weights_secret, op_id, exp)`, exp = end of LOADING_MODEL.
+- weights token = `issue_token(weights_secret, op_id, exp)`, exp = min(end of LOADING_MODEL,
+  created_at + weights.token_ttl_max_s) (T-372 critic F9: <= 30 min after the row).
 """
 
 from __future__ import annotations
@@ -143,6 +144,12 @@ def weights_plan(
     }
 
 
+def weights_token_exp(created_at: float, deadline_unix: int, cfg: Config) -> int:
+    """F9: the token never outlives `token_ttl_max_s` after the row was created. Derived from
+    the row (not the wall clock), so a repeated create gets the same token."""
+    return min(deadline_unix, int(created_at) + cfg.weights.token_ttl_max_s)
+
+
 def build_material(
     inst: sqlite3.Row | Mapping[str, Any],
     pool: PoolConfig,
@@ -166,7 +173,7 @@ def build_material(
     secret_env = {"LLMHUB_API_KEY": derive_api_key(secrets.instance, op_id)}
     if any(s["auth"] == "weights_token" for s in plan["sources"]):
         secret_env["LLMHUB_WEIGHTS_TOKEN"] = issue_token(
-            secrets.weights, op_id, int(plan["deadline_unix"])
+            secrets.weights, op_id, weights_token_exp(created_at, int(plan["deadline_unix"]), cfg)
         )
     fingerprint: str | None = None
     if infer.transport == "direct":

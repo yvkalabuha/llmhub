@@ -51,7 +51,8 @@ def _store_provider_rows(
 ) -> None:
     """Replace provider-source rows of the period (instance/pool filled when ref is known)."""
     conn.execute(
-        "DELETE FROM ledger WHERE provider=? AND source='provider' AND to_ts > ?",
+        "DELETE FROM ledger WHERE provider=? AND source='provider' AND to_ts > ?"
+        " AND excluded_at IS NULL",
         (provider, since),
     )
     refs: dict[str, sqlite3.Row] = {}
@@ -82,7 +83,8 @@ def _ours_estimate(conn: sqlite3.Connection, provider: str, start: float, end: f
 
     row = conn.execute(
         f"SELECT COALESCE(SUM({PRORATA_SQL}), 0) FROM ledger"
-        " WHERE provider=:p AND source='estimate' AND to_ts > :s AND from_ts < :e",
+        " WHERE provider=:p AND source='estimate' AND to_ts > :s AND from_ts < :e"
+        " AND excluded_at IS NULL",
         {"p": provider, "s": start, "e": end},
     ).fetchone()
     return float(row[0])

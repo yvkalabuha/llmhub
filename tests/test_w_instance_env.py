@@ -136,6 +136,7 @@ def test_build_material_proxy(tmp_path: Path) -> None:
     assert hf["auth"] == "none" and hf["ca_pem"] is None and hf["segments"] == 4
     exp = token_expiry(T0, cfg.timeouts)
     assert plan["deadline_unix"] == exp
+    exp = min(exp, int(T0) + cfg.weights.token_ttl_max_s)  # T-372 F9: <= 30 min
     assert m.secret_env["LLMHUB_WEIGHTS_TOKEN"] == issue_token(WEIGHTS_SECRET, OP, exp)
     # the token is valid for the weights validator while loading
     verdict, op = check_request(

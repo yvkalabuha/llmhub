@@ -1,0 +1,13 @@
+# T-372 D3: external RunPod guard, one pass per timer tick (workstation, systemd --user).
+# Installed ONLY for the live test (L0) and removed after the final zero check (L8):
+#   docs/t372-live-test.md. Keys are files (0600); guard.env holds only their paths.
+[Unit]
+Description=llmhub T-372 RunPod guard (watch --once --auto-destroy)
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/.config/llmhub-guard/guard.env
+ExecStart=/usr/bin/python3 -I %h/.local/lib/llmhub-guard/runpod_guard.py watch --once --auto-destroy --key-file ${GUARD_RO_KEY_FILE} --rw-key-file ${GUARD_RW_KEY_FILE} --before ${GUARD_BEFORE} --state-dir %h/.local/state/llmhub-guard
+# exit 5/6 = STOP condition of the test (journalctl --user -u llmhub-runpod-guard)
+SuccessExitStatus=0
+Nice=10

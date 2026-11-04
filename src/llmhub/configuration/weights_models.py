@@ -120,6 +120,8 @@ class WeightsConfig(_Model):
     # T-371 F6: the validator answers 503 low_memory below this host MemAvailable (0 = off),
     # so a pod download never squeezes the page cache of the local llama models
     min_mem_available_mib: int = Field(default=8192, ge=0)
+    # T-372 critic F9: a pod's weights token lives at most this long after the row was created
+    token_ttl_max_s: int = Field(default=1800, ge=300, le=1800)
 
     @field_validator("auth_listen")
     @classmethod

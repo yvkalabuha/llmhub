@@ -7,6 +7,7 @@
         [--weights --sums /opt/models/sha256-T365.txt --models-dir /opt/models
          --model REL [--draft REL] --public-ip 65.109.95.35 --port 9443
          --ca /etc/llmhub/weights/weights-cert.pem [--set-name NAME]]
+        [--chain self_hosted,hf] [--hf-base-url https://huggingface.co/ORG/REPO/resolve/REV/]
     render.py nginx --template nginx-weights.conf --out nginx.conf --var PUBLIC_IP=... ...
 
 `--hashes`: lines `<name> <sha256>`; `admin` -> api.admin_key_sha256, other names ->
@@ -142,12 +143,43 @@ def fill_weight_sets(
         files.append({"id": fid, "size": int(size), "sha256": sums[rel]})
         paths[fid] = rel
     w = raw.setdefault("weights", {})
+    # T-372: other template sources (e.g. hf) stay behind self_hosted (the failover chain)
+    others = [s for s in w.get("sources") or [] if isinstance(s, dict)
+              and s.get("kind") != "self_hosted"]  # fmt: skip
     w["sources"] = [{
         "name": source_name, "kind": "self_hosted",
         "base_url": f"https://{public_ip}:{port}/w/{{op_id}}/", "ca_pem_file": ca_pem_file,
         "segments": 1, "paths": paths,
-    }]  # fmt: skip
+    }, *others]  # fmt: skip
     w.setdefault("sets", {})[set_name] = {"files": files}
+
+
+_HF_URL = re.compile(r"^https://huggingface\.co/[A-Za-z0-9._-]+/[A-Za-z0-9._-]+/resolve/[A-Za-z0-9._-]+/$")
+
+
+def apply_chain(raw: dict[str, Any], chain: Sequence[str] | None, hf_base_url: str | None) -> None:
+    """T-372: `--hf-base-url` sets the hf source; `--chain a,b` keeps these sources in this
+    order. A kept source whose base_url still holds a `__PLACEHOLDER__` is an error."""
+    w = raw.get("weights") or {}
+    sources = [s for s in w.get("sources") or [] if isinstance(s, dict)]
+    if hf_base_url is not None:
+        if not _HF_URL.match(hf_base_url):
+            raise RenderError("--hf-base-url must be https://huggingface.co/<org>/<repo>/resolve/<rev>/")
+        hf = [s for s in sources if s.get("kind") == "hf"]
+        if not hf:
+            raise RenderError("--hf-base-url: the template has no hf source")
+        for s in hf:
+            s["base_url"] = hf_base_url
+    if chain is not None:
+        by_name = {str(s.get("name")): s for s in sources}
+        missing = [n for n in chain if n not in by_name]
+        if missing or len(set(chain)) != len(chain) or not chain:
+            raise RenderError(f"--chain: unknown or repeated source names {missing or list(chain)}")
+        sources = [by_name[n] for n in chain]
+        w["sources"] = sources
+    for s in sources:
+        if _PLACEHOLDER.search(str(s.get("base_url", ""))):
+            raise RenderError(f"weights source {s.get('name')!r}: base_url still has a placeholder")
 
 
 def render_config(
@@ -211,6 +243,8 @@ def _cmd_config(a: argparse.Namespace) -> None:
         fill_weight_sets(raw, sums, sizes, model=a.model, draft=a.draft,
                          public_ip=a.public_ip, port=a.port, ca_pem_file=a.ca,
                          set_name=a.set_name)  # fmt: skip
+    chain = [c for c in a.chain.split(",") if c] if a.chain else None
+    apply_chain(raw, chain, a.hf_base_url)  # also refuses a kept __PLACEHOLDER__ base_url
     out = Path(a.out)
     tmp = out.with_name(out.name + ".tmp")
     tmp.write_text("# rendered by deploy/render.py - edit the template, not this file\n"
@@ -252,6 +286,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     c.add_argument("--port", type=int, default=9443)
     c.add_argument("--ca")
     c.add_argument("--set-name", default="local-models")
+    c.add_argument("--chain", default=None, help="T-372: weights sources to keep, in order (a,b)")
+    c.add_argument("--hf-base-url", default=None, help="T-372: base_url of the hf source")
     n = sub.add_parser("nginx")
     n.add_argument("--template", required=True)
     n.add_argument("--out", required=True)

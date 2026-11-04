@@ -4,7 +4,7 @@
 
 | ID | Задача | Тип | Статус | Зависит |
 |---|---|---|---|---|
-| T-372 | Этап 4: spike dstack + тест RunPod ≤ $5 | test | blocked | T-371 |
+| T-372 | Этап 4: RunpodAdapter + тест RunPod ≤ $5 (код — review; живые P0, L0–L8 — координатор) | test | review | T-371 |
 
 ## Входящие
 <!-- "YYYY-MM-DD от <источник>: <что> (T-XXX)". -->
@@ -19,3 +19,4 @@
 - 2026-11-04 от reviewer T-369 (SEC-L4): лимит одновременных запросов/задач на клиента (429); `waiter._tick` — `IN (...)` пачками по 500 (> 32766 переменных ломает тик) (T-371).
 - 2026-11-04 от ворот T-371 (advocate F6/OPEN-3): `waiter._tick` — `IN (...)` пачками по 500 (> 32766 переменных ломает тик) (T-372).
 - 2026-11-04 от ворот T-371 (advocate F6/OPEN-3, R3-3 T-370): нижняя граница `retry.host_blacklist_s` (`ge=3600`) (T-372).
+- 2026-11-04 от ворот T-372 (critic F12): вынесено из T-372 — desk-spike dstack (0,5 дня), пессимизм `_eta` (R2-6), HF 429 → hold пула (R3-1), `waiter._tick` пачками `IN` по 500, удаление network volumes/шаблонов RunPod, `transport: direct` + `endpoint` в BOOTING, учение обрыва сети iptables (новая задача).

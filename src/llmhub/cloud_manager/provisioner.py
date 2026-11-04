@@ -8,7 +8,12 @@ Rules (plan sections 3.4, 3.9, 7.3, gates 2026-11-04):
   PROVISIONING destroys the late ref at once;
 - unknown outcome: after `create_visibility_grace_s` the label is looked up in `list_owned`;
   found -> adopt (oldest wins, the rest are duplicates), not found -> retry with the SAME label
-  until `create_max_attempts`, then E3;
+  until `create_max_attempts` and `retry.create_unknown_max_retries` (0 for real providers:
+  E3 `create_unknown_unresolved` + a high incident, T-372 F1);
+- a failed `list_offers` stores its normalized reason in `last_error`; when `offer_wait_s`
+  runs out the row fails with that reason (`provider_api_error`), "no offer" stays
+  `gpu_unavailable` (T-372 C1);
+- a pod placed on a blacklisted host is destroyed and retried (T-372 C3);
 - E2 right after create once `get(ref)` shows the resource (PENDING/RUNNING; the boot is
   then timed by BOOTING, E5). A row that keeps a ref without E2 (restart, ghost) polls `get`
   until RUNNING; a ghost ref (`get` = None while another resource carries the label) moves the
@@ -112,6 +117,109 @@ def _fail_provisioning(conn: sqlite3.Connection, iid: str, now: float, cause: st
                           last_error=cause, reason=cause)  # fmt: skip
 
 
+UNKNOWN_UNRESOLVED = "create_unknown_unresolved"
+PENDING_GONE_PREFIX = "pending_gone:"
+
+
+def unknown_retries_exhausted(inst: sqlite3.Row, cfg: Config) -> bool:
+    """`attempts - 1 >= retry.create_unknown_max_retries` (critic F1; 0 for real providers)."""
+    return int(inst["attempts"]) - 1 >= cfg.retry.create_unknown_max_retries
+
+
+def fail_create_unknown(conn: sqlite3.Connection, inst: sqlite3.Row, now: float, cfg: Config
+                        ) -> bool:  # fmt: skip
+    """E3 `create_unknown_unresolved` + a high incident: the create's outcome stays unknown after
+    the grace and no repeated create is allowed. Teardown keeps looking for the label
+    (`no_ref_wait_until`) and destroys whatever shows up later."""
+    if not _fail_provisioning(conn, inst["id"], now, UNKNOWN_UNRESOLVED):
+        return False
+    record_incident(
+        conn, now, UNKNOWN_UNRESOLVED, "high", ref=inst["id"],
+        dedup_key=f"{UNKNOWN_UNRESOLVED}:{inst['id']}",
+        details={"label": inst["label"], "provider": inst["provider"],
+                 "attempts": int(inst["attempts"]),
+                 "grace_s": cfg.timeouts.create_visibility_grace_s},
+    )  # fmt: skip
+    return True
+
+
+def _pending_gone_key(instance_id: str) -> str:
+    return f"{PENDING_GONE_PREFIX}{instance_id}"
+
+
+async def _reject_blacklisted(
+    conn: sqlite3.Connection,
+    adapter: ProviderAdapter,
+    inst: sqlite3.Row,
+    res: RemoteResource,
+    cfg: Config,
+    now: float,
+) -> CreateOutcome:
+    """T-372 C3: the provider put the pod on a blacklisted host (RunPod picks the machine
+    itself). Destroy it, exclude the host and retry within `create_max_attempts`; the next
+    create waits until the label shows zero (`pending_gone:<id>`), so a deleting pod never
+    counts twice against `max_live_pods`."""
+    iid = inst["id"]
+    record_incident(
+        conn, now, "blacklisted_host_assigned", "warning", ref=iid,
+        dedup_key=f"blacklisted_host_assigned:{res.ref}",
+        details={"provider_ref": res.ref, "host_id": res.host_id},
+    )  # fmt: skip
+    try:
+        await adapter.destroy(res.ref)
+    except Exception:  # noqa: BLE001 - teardown retries with the ref kept on the row
+        _fail_provisioning(conn, iid, now, "blacklisted_host")
+        return CreateOutcome.FAILED
+    with tx(conn):
+        hosts = sorted(_excluded(conn, iid) | {str(res.host_id)})
+        set_key(conn, _exclude_key(iid), json.dumps(hosts), now)
+        attempts = int(
+            conn.execute("SELECT attempts FROM instances WHERE id=?", (iid,)).fetchone()[0]
+        )
+        if attempts >= cfg.retry.create_max_attempts:
+            failed = True
+        else:
+            failed = False
+            conn.execute(
+                "UPDATE instances SET provider_ref=NULL, host_id=NULL, endpoint=NULL,"
+                " create_called_at=NULL, last_error='blacklisted_host' WHERE id=?"
+                " AND state='PROVISIONING' AND provider_ref=?",
+                (iid, res.ref),
+            )
+            set_key(conn, _pending_gone_key(iid), json.dumps({"ref": res.ref, "at": now}), now)
+    if failed:  # the ref stays on the row: teardown confirms zero
+        _fail_provisioning(conn, iid, now, "blacklisted_host")
+        return CreateOutcome.FAILED
+    return CreateOutcome.RETRY_LATER
+
+
+async def _wait_pending_gone(
+    conn: sqlite3.Connection, adapter: ProviderAdapter, inst: sqlite3.Row, now: float
+) -> bool:
+    """True when no earlier pod of this row is still listed (after a blacklisted host)."""
+    raw = get_key(conn, _pending_gone_key(inst["id"]))
+    if raw is None:
+        return True
+    try:
+        seen_at = float(json.loads(raw)["at"])
+    except (ValueError, KeyError, TypeError):
+        seen_at = now
+    owned = [r for r in await adapter.list_owned(inst["label"]) if r.label == inst["label"]]
+    if owned:
+        for r in owned:
+            try:
+                await adapter.destroy(r.ref)
+            except Exception:  # noqa: BLE001, S112 - tried again on the next step
+                continue
+        return False
+    stale = float(getattr(adapter, "list_staleness_s", 0.0) or 0.0)
+    if now < seen_at + stale:
+        return False
+    with tx(conn):
+        delete_key(conn, _pending_gone_key(inst["id"]))
+    return True
+
+
 async def _do_create(
     conn: sqlite3.Connection,
     adapter: ProviderAdapter,
@@ -131,6 +239,8 @@ async def _do_create(
         return _create_failed(conn, inst, err, host_id, cfg, now_fn())
     if not await adopt_ref_or_destroy(conn, adapter, iid, res, now_fn()):
         return CreateOutcome.FAILED
+    if res.host_id and res.host_id in blacklisted_hosts(conn, inst["provider"], now_fn()):
+        return await _reject_blacklisted(conn, adapter, inst, res, cfg, now_fn())
     try:  # a ghost ref is not visible: the PROVISIONING step moves the row to the label
         seen = await adapter.get(res.ref)
     except Exception:  # noqa: BLE001 - the PROVISIONING step polls again
@@ -193,17 +303,31 @@ async def _start_create(
 ) -> CreateOutcome:
     pool = rt.cfg
     adapter = rt.adapter
+    offer_deadline = float(inst["state_since"]) + cfg.timeouts.offer_wait_s
     if _breaker_open(adapter):
+        if now >= offer_deadline:  # C1: the provider API kept failing, not "no GPU"
+            _fail_provisioning(conn, inst["id"], now, str(UnavailableReason.PROVIDER_API_ERROR))
+            return CreateOutcome.FAILED
+        return CreateOutcome.RETRY_LATER
+    try:
+        if not await _wait_pending_gone(conn, adapter, inst, now):
+            return CreateOutcome.RETRY_LATER
+    except Exception:  # noqa: BLE001 - cannot see the provider: try again next step
         return CreateOutcome.RETRY_LATER
     query = OfferQuery(
         gpu=pool.gpu, min_vram_gb=pool.vram_gb, max_price_usd_h=pool.max_price_usd_h,
         exclude_hosts=_excluded(conn, inst["id"]),
         need_public_ip=pool.infer.transport == "direct",  # direct TLS needs a reachable IP
     )  # fmt: skip
+    listing_error: NormalizedError | None = None
     try:
         offers = await adapter.list_offers(query)
-    except Exception:  # noqa: BLE001 - adapters may raise anything; retried next step
+    except Exception as exc:  # noqa: BLE001 - adapters may raise anything; retried next step
         offers = []
+        listing_error = exc.err if isinstance(exc, ProviderError) else adapter.normalize_error(exc)
+        with tx(conn):  # C1 (T-369 review): the cause is the API, not a missing GPU
+            conn.execute("UPDATE instances SET last_error=? WHERE id=?",
+                         (str(listing_error.reason), inst["id"]))  # fmt: skip
     material: InstanceMaterial | None = None
     if rt.material is not None:
         try:  # derived from the row: a repeated create with the same label gets the same
@@ -218,8 +342,10 @@ async def _start_create(
             return CreateOutcome.FAILED
     offer: Offer | None = select_offer(offers, query, blacklisted_hosts(conn, pool.provider, now))
     if offer is None:
-        if now >= float(inst["state_since"]) + cfg.timeouts.offer_wait_s:
-            _fail_provisioning(conn, inst["id"], now, str(UnavailableReason.GPU_UNAVAILABLE))
+        if now >= offer_deadline:
+            cause = (UnavailableReason.GPU_UNAVAILABLE if listing_error is None
+                     else listing_error.reason)  # fmt: skip
+            _fail_provisioning(conn, inst["id"], now, str(cause))
             return CreateOutcome.FAILED
         return CreateOutcome.NO_OFFER
     offer_json = json.dumps(
@@ -333,6 +459,9 @@ async def _provisioning(
             return
         if int(inst["attempts"]) >= cfg.retry.create_max_attempts:
             _fail_provisioning(conn, iid, now, "create_unknown_max_attempts")
+            return
+        if unknown_retries_exhausted(inst, cfg):  # T-372 F1: never a second paid create
+            fail_create_unknown(conn, inst, now, cfg)
             return
         with tx(conn):  # retry with the same label (the outcome of the last call is unknown)
             conn.execute(

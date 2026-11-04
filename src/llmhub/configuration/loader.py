@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 
 import yaml
@@ -119,3 +119,31 @@ def load_weights_ca(cfg: Config) -> dict[str, str]:
                 f"weights.sources.{src.name}.ca_pem_file: cannot read ({type(exc).__name__})"
             ) from exc
     return out
+
+
+def provider_key_env(provider: str) -> str:
+    return f"LLMHUB_{provider.upper()}_API_KEY{FILE_SUFFIX}"
+
+
+def load_provider_key(provider: str, env: Mapping[str, str] = os.environ) -> Callable[[], str]:
+    """Lazy reader of `LLMHUB_<P>_API_KEY_FILE` (T-372 B2; `read_secret_file` rules).
+
+    A plain `LLMHUB_<P>_API_KEY` value is refused (it would show in `docker inspect`). The file
+    is read on every call, so a replaced key is used without a restart; errors never carry the
+    content."""
+    name = provider_key_env(provider)
+    plain = name.removesuffix(FILE_SUFFIX)
+    if plain in env:
+        raise ConfigError(f"{plain}: plain values are not accepted; use {name} (a 0400 file)")
+    path = env.get(name)
+    if not path:
+        raise ConfigError(f"{name} is not set")
+    file = Path(path)
+
+    def read() -> str:
+        value = read_secret_file(file).decode("utf-8", "replace")
+        if not value:
+            raise ConfigError(f"{name}: file is empty")
+        return value
+
+    return read

@@ -2,7 +2,7 @@
 # llmhub server steps (T-371 plan §6): llmhub-deploy.sh <step> check|apply|rollback
 #
 # Steps: s0 preflight snapshot | s1 artifacts | s2 owners+dirs | s3 images | s4 secrets+keys |
-#        s5 config | s6 api+reaper+backup timer | s7 ufw API | s8a weights cert |
+#        s5 config | s6 api+reaper+backup timer | s6k RunPod key (T-372) | s7 ufw API | s8a weights cert |
 #        s8b weights config | s8c validator+nginx+logrotate | s9 ufw weights |
 #        s10x remove the e2e client | s11 post-check vs s0 | s14 full rollback
 # Rules (tested by tests/test_t371_docker_files.py and test_t371_deploy_script.py):
@@ -15,13 +15,18 @@
 # - the config lives in the DIRECTORY $ETC/conf (mounted as a dir: a rename inside it is seen by
 #   running containers, SEC-D2); a changed config restarts api/reaper/validator;
 # - renders run as $UID_API into a private staging dir, never as root over $ETC (L6);
-# - ufw rules and accounts are removed only when this script recorded creating them (L1, L2).
+# - ufw rules and accounts are removed only when this script recorded creating them (L1, L2);
+# - T-372: the RunPod key ($ETC/secrets/runpod, one line, 0400 64100:0) is delivered by the
+#   operator over ssh stdin, never by this script; it is mounted ro ONLY into api and reaper,
+#   and only while the file is non-empty (`@include-if-secret`); s6k applies/rotates/removes it.
 # Environment (defaults = the server; the F5 test overrides them):
 #   LLMHUB_DIST (dir of this script)  LLMHUB_UFW (ufw)  LLMHUB_SYSTEMCTL (systemctl)
 #   LLMHUB_LOGROTATE (logrotate)  LLMHUB_API_HOST (10.8.0.1)  LLMHUB_PUBLIC_IP (65.109.95.35)
 #   LLMHUB_VPN_IF (tun0)  LLMHUB_PUBLIC_IF (enp9s0)  LLMHUB_LLAMA_GID (998)
 #   LLMHUB_RENDER_SET ("k=v;k=v" extra render --set)  LLMHUB_WEIGHTS_MODEL/_DRAFT (rel paths)
 #   LLMHUB_BACKUP_DIR (/root)  LLMHUB_HEALTH_WAIT_S (120)
+#   T-372: LLMHUB_CONFIG_TEMPLATE (config.example.yaml | config.t372.example.yaml)
+#   LLMHUB_WEIGHTS_CHAIN (e.g. hf or self_hosted,hf)  LLMHUB_HF_BASE_URL (hf source base_url)
 set -euo pipefail
 umask 027
 
@@ -139,6 +144,12 @@ args_of() {  # args_of FILE -> one argument per line on stdout, placeholders fil
         case "$line" in
             '' | '#'*) continue ;;
             '@include '*) args_of "$DIST/run-args/${line#@include }"; continue ;;
+            '@include-if-secret '*)  # @include-if-secret NAME FILE: only for a non-empty secret
+                local rest=${line#@include-if-secret } sname sfile
+                sname=${rest%% *}
+                sfile=${rest#* }
+                if [ -s "$ETC/secrets/$sname" ]; then args_of "$DIST/run-args/$sfile"; fi
+                continue ;;
         esac
         line=${line//@IMAGE@/$(image_id)}
         line=${line//@NGINX_IMAGE@/$(nginx_id)}
@@ -233,7 +244,8 @@ daemon_reload() {  # I1: never activate pending edits of llama units as a side e
 env_has_no_secret() {  # docker inspect Env must not contain the content of any secret file
     local name=$1 env f
     env=$(docker inspect -f '{{json .Config.Env}}' "$name")
-    for f in "$ETC/secrets/label" "$ETC/secrets/instance" "$ETC/secrets/weights"; do
+    for f in "$ETC/secrets/label" "$ETC/secrets/instance" "$ETC/secrets/weights" \
+        "$ETC/secrets/runpod"; do
         [ -s "$f" ] || continue
         # SEC-D1: the secret is the pattern FILE, never an argument (ps, /proc/*/cmdline)
         if grep -qF -f "$f" <<<"$env"; then fail "$name: Env contains a secret"; return 1; fi
@@ -516,6 +528,7 @@ check_s4() {
     stat_is "$ETC/secrets/instance" "0:$UID_API 640" || return 1
     stat_is "$ETC/secrets/weights" "0:$UID_WAUTH 640" || return 1
     stat_is "$ETC/secrets/providers" "0:0 600" || return 1
+    if [ -e "$ETC/secrets/runpod" ]; then stat_is "$ETC/secrets/runpod" "$UID_API:0 400" || return 1; fi
     stat_is "$ETC/admin.key" "0:0 600" || return 1
     local a b
     for a in label instance weights; do
@@ -553,8 +566,21 @@ rollback_s4() {
 }
 
 # ------------------------------------------------------------------ S5 / S8b config
+config_template() {  # T-372: LLMHUB_CONFIG_TEMPLATE picks one of the shipped templates
+    case "${LLMHUB_CONFIG_TEMPLATE:-config.example.yaml}" in
+        config.example.yaml | config.t372.example.yaml) printf '%s' "${LLMHUB_CONFIG_TEMPLATE:-config.example.yaml}" ;;
+        *) die "LLMHUB_CONFIG_TEMPLATE must be config.example.yaml or config.t372.example.yaml" ;;
+    esac
+}
+
 render_config() {  # -> $CONF/config.yaml.new (rendered by $UID_API in $STAGE, L6)
-    local sets=() item extra=() weights=()
+    local sets=() item extra=() weights=() tpl
+    tpl=$(config_template)
+    if [ -n "${LLMHUB_WEIGHTS_CHAIN:-}" ]; then
+        [[ "$LLMHUB_WEIGHTS_CHAIN" =~ ^[a-z_]+(,[a-z_]+)*$ ]] || die "bad LLMHUB_WEIGHTS_CHAIN"
+        extra+=(--chain "$LLMHUB_WEIGHTS_CHAIN")
+    fi
+    if [ -n "${LLMHUB_HF_BASE_URL:-}" ]; then extra+=(--hf-base-url "$LLMHUB_HF_BASE_URL"); fi
     IFS=';' read -r -a sets <<<"${LLMHUB_RENDER_SET:-}"
     for item in "${sets[@]}"; do if [ -n "$item" ]; then extra+=(--set "$item"); fi; done
     if has_marker s10x; then extra+=(--drop-client e2e); fi
@@ -570,7 +596,7 @@ render_config() {  # -> $CONF/config.yaml.new (rendered by $UID_API in $STAGE, L
     drun_once --network none --user "$UID_API:$UID_API" -v "$STAGE:/out" \
         -v "$MARK/hashes.txt:/in/hashes.txt:ro" -v "$MODELS:$MODELS:ro" "${pub[@]}" "$(image_id)" \
         python /opt/llmhub/deploy/render.py config \
-        --template /opt/llmhub/deploy/config.example.yaml --out /out/config.yaml \
+        --template "/opt/llmhub/deploy/$tpl" --out /out/config.yaml \
         --hashes /in/hashes.txt "${extra[@]}" "${weights[@]}"
     cp "$STAGE/config.yaml" "$CONF/config.yaml.new"
     rm -rf "$STAGE"
@@ -597,12 +623,15 @@ install_checked_config() {  # R3-1: config-check the rendered .new BEFORE it bec
 }
 
 config_check() {  # config_check [PATH under $CONF] (default: the live config.yaml)
-    local out path=${1:-$CONF/config.yaml}
+    local out path=${1:-$CONF/config.yaml} rp=()
+    if [ -s "$ETC/secrets/runpod" ]; then  # T-372: config-check reads the key file (never prints it)
+        rp=(-v "$ETC/secrets/runpod:/run/s/runpod:ro" -e LLMHUB_RUNPOD_API_KEY_FILE=/run/s/runpod)
+    fi
     out=$(drun_once --network none --user "$UID_API:$UID_API" \
         -v "$CONF:$CONF:ro" \
         -v "$ETC/secrets/label:/run/s/label:ro" -v "$ETC/secrets/instance:/run/s/instance:ro" \
         -e LLMHUB_LABEL_SECRET_FILE=/run/s/label -e LLMHUB_INSTANCE_SECRET_FILE=/run/s/instance \
-        "$(image_id)" python -m llmhub config-check --config "$path") \
+        "${rp[@]}" "$(image_id)" python -m llmhub config-check --config "$path") \
         || { fail "config-check"; return 1; }
     [ "$out" = ok ] || fail "config-check: $out"
 }
@@ -668,6 +697,58 @@ rollback_s6() {
         daemon_reload
     fi
     rm -f "$MARK/s6.done"
+}
+
+# ------------------------------------------------------------------ S6k RunPod key (T-372)
+RUNPOD_KEY_DEST=/run/llmhub-secrets/runpod
+has_runpod_mount() {  # has_runpod_mount NAME
+    docker inspect -f '{{range .Mounts}}{{.Destination}}{{"\n"}}{{end}}' "$1" 2>/dev/null \
+        | grep -qxF "$RUNPOD_KEY_DEST"
+}
+runpod_mounts_match() {  # the key is mounted in api+reaper iff the file is non-empty
+    local c want=0
+    if [ -s "$ETC/secrets/runpod" ]; then want=1; fi
+    for c in llmhub-api llmhub-reaper; do
+        exists "$c" || { fail "$c missing"; return 1; }
+        if has_runpod_mount "$c"; then
+            [ "$want" = 1 ] || { fail "$c mounts the RunPod key but the file is gone"; return 1; }
+        else
+            [ "$want" = 0 ] || { fail "$c lacks the RunPod key mount (s6k apply)"; return 1; }
+        fi
+    done
+    for c in llmhub-weights-auth llmhub-weights-nginx; do
+        if exists "$c" && has_runpod_mount "$c"; then fail "$c mounts the RunPod key"; return 1; fi
+    done
+}
+recreate_api_reaper() {  # new containers pick up the (changed) mount list from run-args
+    local c
+    for c in llmhub-reaper llmhub-api; do if exists "$c"; then dctl rm "$c"; fi; done
+    drun_named llmhub-api
+    drun_named llmhub-reaper
+    wait_healthy llmhub-api llmhub-reaper
+}
+check_s6k() {
+    if [ -e "$ETC/secrets/runpod" ]; then
+        stat_is "$ETC/secrets/runpod" "$UID_API:0 400" || return 1
+        [ "$(head -n1 "$ETC/secrets/runpod" | tr -d '\n' | wc -c)" -ge 16 ] || { fail "runpod key too short"; return 1; }
+    fi
+    runpod_mounts_match || return 1
+    env_has_no_secret llmhub-api || return 1
+    env_has_no_secret llmhub-reaper
+}
+apply_s6k() {
+    # the operator delivers the key first (value never in argv/env/logs):
+    #   ssh root@HOST 'install -m 0400 -o 64100 -g 0 /dev/stdin /etc/llmhub/secrets/runpod' < KEYFILE
+    [ -s "$ETC/secrets/runpod" ] || die "no $ETC/secrets/runpod; deliver the key over ssh stdin first"
+    stat_is "$ETC/secrets/runpod" "$UID_API:0 400" || die "fix owner/mode of the RunPod key"
+    # a replaced file is a new inode: a bind mount keeps the old one, so always recreate
+    recreate_api_reaper
+    check_s6k
+}
+rollback_s6k() {
+    if [ -e "$ETC/secrets/runpod" ]; then shred -u "$ETC/secrets/runpod"; fi
+    recreate_api_reaper
+    check_s6k
 }
 
 # ------------------------------------------------------------------ S7 / S9 ufw
@@ -937,7 +1018,7 @@ apply_s14() {
 rollback_s14() { log "s14: restore = tar xzf the archive (fixed uids), then s2..s9 apply"; }
 
 # ------------------------------------------------------------------ main
-STEPS="s0 s1 s2 s3 s4 s5 s6 s7 s8a s8b s8c s9 s10x s11 s14"
+STEPS="s0 s1 s2 s3 s4 s5 s6 s6k s7 s8a s8b s8c s9 s10x s11 s14"
 usage() { echo "usage: $0 <${STEPS// /|}> check|apply|rollback" >&2; exit 2; }
 [ $# -eq 2 ] || usage
 case " $STEPS " in *" $1 "*) ;; *) usage ;; esac

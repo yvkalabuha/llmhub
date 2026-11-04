@@ -115,7 +115,8 @@ async def budget(request: Request) -> JSONResponse:
     ledger = _rows(
         request,
         "SELECT pool, kind, source, round(sum(amount_usd), 6) AS usd FROM ledger"
-        " WHERE from_ts>=? AND from_ts<? GROUP BY pool, kind, source LIMIT 200",
+        " WHERE from_ts>=? AND from_ts<? AND excluded_at IS NULL GROUP BY pool, kind, source"
+        " LIMIT 200",
         w.month_start, w.month_end,
     )  # fmt: skip
     return JSONResponse({**_budget(request), "ledger_month": ledger})

@@ -5,6 +5,10 @@ and the future API on 10.8.0.1) and the public address 65.109.95.35. The guard
 wraps `socket.socket.connect`/`connect_ex` (used by httpx, asyncio and http.client alike) and
 raises `PermissionError` before a packet leaves. Subprocesses and containers are not covered:
 the deploy test (F5) runs its "server" with `--network none` for that reason.
+
+T-372 A1: name resolution of RunPod hosts (`*.runpod.io`, `*.runpod.net`, the bare domains) is
+refused as well (`socket.getaddrinfo`), so no test can reach the real RunPod API or a pod proxy
+even by accident; the adapter tests use `httpx.MockTransport` only.
 """
 
 from __future__ import annotations
@@ -13,6 +17,7 @@ import ipaddress
 import socket
 from typing import Any
 
+BLOCKED_DOMAINS = ("runpod.io", "runpod.net")
 BLOCKED_NETS = (ipaddress.ip_network("10.8.0.0/24"), ipaddress.ip_network("65.109.95.35/32"))
 
 
@@ -59,3 +64,26 @@ def _guarded_connect_ex(self: socket.socket, address: Any) -> int:
 
 socket.socket.connect = _guarded_connect  # type: ignore[method-assign]
 socket.socket.connect_ex = _guarded_connect_ex  # type: ignore[method-assign]
+
+
+def blocked_host(host: Any) -> bool:
+    """True for a RunPod host name (the domain itself or any sub-domain, any case)."""
+    if isinstance(host, bytes):
+        host = host.decode(errors="replace")
+    if not isinstance(host, str):
+        return False
+    name = host.strip().rstrip(".").lower()
+    return any(name == d or name.endswith("." + d) for d in BLOCKED_DOMAINS)
+
+
+_real_getaddrinfo = socket.getaddrinfo
+
+
+def _guarded_getaddrinfo(host: Any, *args: Any, **kwargs: Any) -> Any:
+    if blocked_host(host):
+        BLOCKED_ATTEMPTS.append(repr(host))
+        raise PermissionError(f"test network guard: resolving {host!r} is forbidden")
+    return _real_getaddrinfo(host, *args, **kwargs)
+
+
+socket.getaddrinfo = _guarded_getaddrinfo  # type: ignore[assignment]

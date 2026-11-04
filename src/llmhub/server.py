@@ -5,9 +5,10 @@ One process, one asyncio loop, one SQLite connection: the `Controller` (cloud pl
 gateway all live on the same loop and use the same connection. The reaper stays a separate
 process (`python -m llmhub.reaper`) with its own connection and adapters.
 
-Providers: only `mock` has an adapter (real adapters arrive with T-372). Mock pools use
-`MockInference`; any other provider gets the shared `HttpInferenceBackend` (T-370) whose
-`on_timings` feeds the per-pool speed EWMA and the MTP acceptance EWMA in `controller_state`.
+Providers: adapters come from `provider_adapters.factory` (`mock`, `runpod` since T-372). Mock
+pools use `MockInference`; any other provider gets the shared `HttpInferenceBackend` (T-370)
+whose `on_timings` feeds the per-pool speed EWMA and the MTP acceptance EWMA in
+`controller_state`.
 """
 
 from __future__ import annotations
@@ -54,14 +55,16 @@ from llmhub.local_inference.worker import LocalWorker
 from llmhub.model_router.views import CloudState
 from llmhub.persistence.integrity import open_state_db
 from llmhub.provider_adapters.base import ProviderAdapter
+from llmhub.provider_adapters.factory import (
+    aclose_adapters,
+    build_provider_adapters,
+)
 from llmhub.provider_adapters.mock import MockProvider
 from llmhub.provider_adapters.mock_inference import MockInference
-from llmhub.provider_adapters.mock_store import MockStore
 from llmhub.task_queue.bodies import BodyStore
 
 log = logging.getLogger("llmhub.server")
 
-MOCK_STORE_ENV = "LLMHUB_MOCK_STORE"
 SPEED_ALPHA = 0.3
 
 
@@ -97,15 +100,9 @@ def make_speed_consumer(
 
 
 def build_adapters(cfg: Config, env: Mapping[str, str], clock: Clock) -> dict[str, ProviderAdapter]:
-    """Adapters of `providers.enabled`. Only `mock` exists (store shared with the reaper:
-    `<data_dir>/mock_cloud.db`, override `LLMHUB_MOCK_STORE`)."""
-    adapters: dict[str, ProviderAdapter] = {}
-    for name in cfg.providers.enabled:
-        if name != "mock":
-            raise ConfigError(f"provider {name!r} has no adapter yet (T-372)")
-        store = env.get(MOCK_STORE_ENV) or str(cfg.data_dir / "mock_cloud.db")
-        adapters[name] = MockProvider(MockStore(store), clock)
-    return adapters
+    """Adapters of `providers.enabled` via the shared factory (mock store shared with the
+    reaper: `<data_dir>/mock_cloud.db`, override `LLMHUB_MOCK_STORE`)."""
+    return build_provider_adapters(cfg, env, clock)
 
 
 def load_instance_secrets(cfg: Config, env: Mapping[str, str]) -> InstanceSecrets:
@@ -142,6 +139,7 @@ class Service:
                 log.exception("closing local backend %s failed", b.name)
         if self.http_inference is not None:
             await self.http_inference.aclose()
+        await aclose_adapters(self.rt.controller.raw_adapters)
 
 
 def build_service(

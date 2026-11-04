@@ -8,7 +8,8 @@
   only its sha256 for `clients.<name>.key_sha256` / `api.admin_key_sha256`.
 - operator commands over the admin API and local helpers (`llmhub.admin_cli`): status, budget,
   client list, reload-clients, hold, release, kill, resume, clear-weights-hold, config-check,
-  backup, healthcheck.
+  backup, healthcheck; T-372 live-test helpers: ledger-exclude, provider-check,
+  lifecycle-probe, scan-secrets, weights-token-check.
 """
 
 from __future__ import annotations

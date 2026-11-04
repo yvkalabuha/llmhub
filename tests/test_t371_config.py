@@ -57,7 +57,12 @@ def test_mock_only_client_requires_mock_providers(tmp_path: Path) -> None:
 
 def test_mock_only_false_allows_any_provider_list(tmp_path: Path) -> None:
     client = {"key_sha256": H, "allowed_models": []}
-    p = _write(tmp_path, clients={"c": client}, providers={"enabled": ["mock", "runpod"]})
+    # T-372: runpod needs its section and the spend guards (tests/test_t372_config.py)
+    p = _write(tmp_path, clients={"c": client},
+               providers={"enabled": ["mock", "runpod"], "runpod": {}},
+               timeouts={"create_visibility_grace_s": 600, "offer_wait_s": 300,
+                         "provisioning_s": 900},
+               retry={"create_unknown_max_retries": 0})  # fmt: skip
     assert load_config(p).clients["c"].mock_only is False
 
 

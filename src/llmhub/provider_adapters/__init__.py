@@ -1,4 +1,4 @@
-"""Provider adapters: ProviderAdapter protocol, Capability, Mock (stage 3a); real ones in stage 4."""
+"""Provider adapters: ProviderAdapter protocol, Capability, Mock (stage 3a), RunPod (T-372)."""
 
 from __future__ import annotations
 
@@ -27,6 +27,10 @@ if TYPE_CHECKING:
         AdapterHarness,
         run_contract,
     )
+    from llmhub.provider_adapters.factory import (
+        aclose_adapters,
+        build_provider_adapters,
+    )
     from llmhub.provider_adapters.guarded import (
         CircuitBreaker,
         GuardedAdapter,
@@ -48,6 +52,14 @@ if TYPE_CHECKING:
     )
     from llmhub.provider_adapters.mock_store import (
         MockStore,
+    )
+    from llmhub.provider_adapters.runpod import (
+        RunpodAdapter,
+    )
+    from llmhub.provider_adapters.runpod_api import (
+        RunpodApi,
+        RunpodHttpError,
+        RunpodParseError,
     )
 
 # public name -> submodule; resolved lazily (PEP 562) so packages never import each
@@ -82,6 +94,12 @@ _EXPORTS: dict[str, str] = {
     "AdapterHarness": "contract",
     "CONTRACT_ITEMS": "contract",
     "run_contract": "contract",
+    "aclose_adapters": "factory",
+    "build_provider_adapters": "factory",
+    "RunpodAdapter": "runpod",
+    "RunpodApi": "runpod_api",
+    "RunpodHttpError": "runpod_api",
+    "RunpodParseError": "runpod_api",
 }
 __all__ = [
     "CONTRACT_ITEMS",
@@ -107,7 +125,13 @@ __all__ = [
     "RemoteResource",
     "RemoteStatus",
     "ResourceKind",
+    "RunpodAdapter",
+    "RunpodApi",
+    "RunpodHttpError",
+    "RunpodParseError",
     "UnavailableReason",
+    "aclose_adapters",
+    "build_provider_adapters",
     "make_label",
     "new_op_id",
     "parse_label",

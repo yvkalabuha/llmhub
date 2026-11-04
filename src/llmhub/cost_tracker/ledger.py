@@ -1,4 +1,7 @@
-"""Ledger: per-instance accrual (source=estimate) and spend over a window."""
+"""Ledger: per-instance accrual (source=estimate) and spend over a window.
+
+Every sum reads only rows with `excluded_at IS NULL` (T-372 D1: excluded rows stay for the
+record, e.g. the Mock ledger before the first real provider)."""
 
 from __future__ import annotations
 
@@ -102,7 +105,7 @@ def spent(
     Rows straddling the window edges are pro-rated by overlap. `pools` restricts to ledger
     rows of those pools (provider rows are attributed to a pool only when their ref is known).
     """
-    where = ["(to_ts > :s OR from_ts >= :s)", "from_ts < :e"]
+    where = ["(to_ts > :s OR from_ts >= :s)", "from_ts < :e", "excluded_at IS NULL"]
     params: dict[str, object] = {"s": start, "e": end}
     if provider is not None:
         where.append("provider = :p")
@@ -127,7 +130,8 @@ def spent(
 def session_cost(conn: sqlite3.Connection, instance_id: str) -> float:
     """Spend of one instance so far (max of estimate and provider rows with this id)."""
     rows = conn.execute(
-        "SELECT source, SUM(amount_usd) AS t FROM ledger WHERE instance_id=? GROUP BY source",
+        "SELECT source, SUM(amount_usd) AS t FROM ledger WHERE instance_id=?"
+        " AND excluded_at IS NULL GROUP BY source",
         (instance_id,),
     ).fetchall()
     return max((float(r["t"]) for r in rows), default=0.0)

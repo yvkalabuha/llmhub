@@ -1,0 +1,12 @@
+# T-372 D3: every 60 s while the live test runs (enable in L0 before the first pod,
+# `systemctl --user disable --now llmhub-runpod-guard.timer` and remove in L8).
+[Unit]
+Description=llmhub T-372 RunPod guard timer
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=60
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

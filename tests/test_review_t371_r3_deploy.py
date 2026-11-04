@@ -322,6 +322,7 @@ def test_world_readable_deploy_dir_holds_only_templates() -> None:
     files = sorted(re.findall(r'"\$ROOT/deploy/([^"]+)"', m.group(1)))
     assert files == [
         "config.example.yaml",
+        "config.t372.example.yaml",  # T-372: template of the live-test config (no secrets)
         "gen_weights_cert.py",
         "nginx-weights.conf",
         "render.py",

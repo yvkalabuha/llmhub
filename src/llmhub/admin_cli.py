@@ -12,6 +12,7 @@ Exit codes: 0 ok, 1 the API refused / is unreachable, 2 arguments or config.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import sqlite3
@@ -203,9 +204,10 @@ def _config_check(args: argparse.Namespace) -> int:
         uses_weights = any(p.weights is not None for p in cfg.pools.values())
         if uses_weights and (instance is None or weights is None):
             raise ConfigError("weight sets need LLMHUB_INSTANCE_SECRET and LLMHUB_WEIGHTS_SECRET")
-        for name in cfg.providers.enabled:
-            if name != "mock":
-                raise ConfigError(f"provider {name!r} has no adapter yet (T-372)")
+        if "runpod" in cfg.providers.enabled:  # T-372: the key file must be readable (0400)
+            from llmhub.configuration.loader import load_provider_key
+
+            load_provider_key("runpod", env)()
     except ConfigError as exc:
         raise AdminCliError(f"config error: {exc}", exit_code=2) from None
     print("ok")
@@ -240,6 +242,188 @@ def _healthcheck(args: argparse.Namespace) -> int:
     if r.status_code != 200:
         print(f"unhealthy: HTTP {r.status_code}", file=sys.stderr)
         return 1
+    return 0
+
+
+# ------------------------------------------------------------------ T-372 live-test helpers
+RUNPOD_TRANSPORT: Any = None  # test seam: httpx transport of the RunPod adapter
+WEIGHTS_TRANSPORT: Any = None  # test seam: httpx transport of weights-token-check
+
+
+def _db(cfg: Config) -> sqlite3.Connection:
+    from llmhub.persistence.db import connect
+
+    path = cfg.data_dir / "state.db"
+    if not path.is_file():
+        raise AdminCliError(f"{path}: no state.db", exit_code=2)
+    return connect(path, busy_timeout_ms=cfg.db.reaper_busy_timeout_ms)
+
+
+def _adapter(cfg: Config, provider: str) -> Any:
+    from llmhub.clock import SystemClock
+    from llmhub.provider_adapters.factory import build_provider_adapters
+
+    if provider not in cfg.providers.enabled:
+        raise AdminCliError(f"{provider} is not in providers.enabled", exit_code=2)
+    try:
+        adapters = build_provider_adapters(cfg, os.environ, SystemClock(),
+                                           runpod_transport=RUNPOD_TRANSPORT)  # fmt: skip
+    except ConfigError as exc:
+        raise AdminCliError(f"config error: {exc}", exit_code=2) from None
+    return adapters[provider]
+
+
+def _run_async(coro: Any) -> Any:
+    import asyncio
+
+    from llmhub.provider_adapters.base import ProviderError
+
+    try:
+        return asyncio.run(coro)
+    except ProviderError as exc:
+        raise AdminCliError(f"provider error: {exc.err.message}") from None
+
+
+def _ops_error(exc: Exception) -> AdminCliError:
+    return AdminCliError(str(exc), exit_code=2)
+
+
+def _ledger_exclude(args: argparse.Namespace) -> int:
+    import time
+
+    from llmhub.tools.t372_ops import OpsError, ledger_exclude
+
+    cfg = _load(args)
+    conn = _db(cfg)
+    try:
+        res = ledger_exclude(
+            conn, cfg, args.provider, reason=args.reason, yes=args.yes, now=time.time(),
+            backup_dir=Path(args.backup_dir) if args.backup_dir else cfg.data_dir / "backups",
+        )  # fmt: skip
+    except OpsError as exc:
+        raise _ops_error(exc) from None
+    finally:
+        conn.close()
+    _print({"provider": res.provider, "rows": res.rows, "usd": res.usd,
+            "dry_run": res.dry_run, "backup": res.backup})  # fmt: skip
+    return 0
+
+
+def _provider_check(args: argparse.Namespace) -> int:
+    import time
+
+    from llmhub.provider_adapters.factory import aclose_adapters
+    from llmhub.tools.t372_ops import provider_check
+
+    cfg = _load(args)
+    adapter = _adapter(cfg, args.provider)
+
+    async def go() -> dict[str, Any]:
+        try:
+            return await provider_check(adapter, cfg, time.time())
+        finally:
+            await aclose_adapters({args.provider: adapter})
+
+    _print(_run_async(go()))
+    return 0
+
+
+def _lifecycle_probe(args: argparse.Namespace) -> int:
+    from dataclasses import asdict
+
+    from llmhub.clock import SystemClock
+    from llmhub.configuration.loader import load_label_secret
+    from llmhub.provider_adapters.factory import aclose_adapters
+    from llmhub.tools.t372_ops import OpsError, lifecycle_probe
+
+    cfg = _load(args)
+    rp = cfg.providers.runpod
+    if rp is None or args.gpu not in rp.gpu_type_ids:
+        raise AdminCliError("--gpu must be a key of providers.runpod.gpu_type_ids", exit_code=2)
+    adapter = _adapter(cfg, "runpod")
+    try:
+        secret = load_label_secret()
+    except ConfigError as exc:
+        raise AdminCliError(f"config error: {exc}", exit_code=2) from None
+    conn = _db(cfg)
+
+    async def go() -> Any:
+        try:
+            return await lifecycle_probe(
+                conn, adapter, secret, SystemClock(), cfg, image=args.image,
+                gpu_type_id=rp.gpu_type_ids[args.gpu], disk_gb=args.disk_gb,
+                max_price_usd_h=args.max_price, max_s=args.max_s, poll_s=args.poll_s,
+            )  # fmt: skip
+        finally:
+            await aclose_adapters({"runpod": adapter})
+
+    try:
+        rep = _run_async(go())
+    except OpsError as exc:
+        raise _ops_error(exc) from None
+    finally:
+        conn.close()
+    _print(asdict(rep))
+    return 0 if rep.zero and rep.error is None else 1
+
+
+def _scan_secrets(args: argparse.Namespace) -> int:
+    from llmhub.cloud_manager.instance_env import derive_api_key
+    from llmhub.configuration.loader import (
+        INSTANCE_SECRET_ENV,
+        load_instance_secret,
+        load_provider_key,
+    )
+    from llmhub.tools.t372_ops import OpsError, scan_secrets
+
+    env = os.environ
+    exact: list[str] = []
+    if INSTANCE_SECRET_ENV in env or INSTANCE_SECRET_ENV + "_FILE" in env:
+        try:
+            exact.append(derive_api_key(load_instance_secret(env), args.op))
+        except ConfigError as exc:
+            raise AdminCliError(f"config error: {exc}", exit_code=2) from None
+    if "LLMHUB_RUNPOD_API_KEY_FILE" in env:
+        with contextlib.suppress(ConfigError):
+            exact.append(load_provider_key("runpod", env)())
+    text = sys.stdin.read()
+    try:
+        n = scan_secrets(text, args.op, exact)
+    except OpsError as exc:
+        raise _ops_error(exc) from None
+    _print({"op": args.op, "matches": n, "api_key_checked": bool(exact)})
+    return 0 if n == 0 else 3
+
+
+def _weights_token_check(args: argparse.Namespace) -> int:
+    import httpx
+
+    from llmhub.configuration.loader import load_weights_secret
+    from llmhub.tools.t372_ops import (
+        OpsError,
+        default_weights_url,
+        weights_status,
+        weights_token_for,
+    )
+
+    cfg = _load(args)
+    conn = _db(cfg)
+    try:
+        token = weights_token_for(conn, cfg, load_weights_secret(os.environ), args.op)
+        url, ca = default_weights_url(cfg, args.op)
+    except OpsError as exc:
+        raise _ops_error(exc) from None
+    except ConfigError as exc:
+        raise AdminCliError(f"config error: {exc}", exit_code=2) from None
+    finally:
+        conn.close()
+    if args.url:
+        url = args.url
+    try:
+        status = weights_status(url, token, ca, transport=WEIGHTS_TRANSPORT)
+    except httpx.HTTPError as exc:
+        raise AdminCliError(f"weights request: {type(exc).__name__}") from None
+    _print({"op": args.op, "http_status": status})
     return 0
 
 
@@ -278,6 +462,29 @@ def add_commands(sub: Any) -> None:
     b.add_argument("--config", default=DEFAULT_CONFIG)
     b.add_argument("--to", required=True)
     b.add_argument("--keep", type=int, default=14)
+    le = sub.add_parser("ledger-exclude", help="exclude a provider's ledger rows (T-372)")
+    le.add_argument("--config", default=DEFAULT_CONFIG)
+    le.add_argument("--provider", required=True)
+    le.add_argument("--reason", default="t372-mock")
+    le.add_argument("--backup-dir", default=None, help="default <data_dir>/backups")
+    le.add_argument("--yes", action="store_true", help="apply (default: dry run)")
+    pc = sub.add_parser("provider-check", help="read-only provider view (T-372)")
+    pc.add_argument("--config", default=DEFAULT_CONFIG)
+    pc.add_argument("--provider", default="runpod")
+    lp = sub.add_parser("lifecycle-probe", help="one small RunPod pod, timings only (T-372)")
+    lp.add_argument("--config", default=DEFAULT_CONFIG)
+    lp.add_argument("--image", required=True, help="<name>@sha256:<64 hex>")
+    lp.add_argument("--gpu", default="RTX3090")
+    lp.add_argument("--disk-gb", type=int, default=20)
+    lp.add_argument("--max-price", type=float, default=0.30)
+    lp.add_argument("--max-s", type=float, default=480.0)
+    lp.add_argument("--poll-s", type=float, default=5.0)
+    ss = sub.add_parser("scan-secrets", help="count secrets of an op in stdin (T-372)")
+    ss.add_argument("--op", required=True)
+    wt = sub.add_parser("weights-token-check", help="HTTP status for an op's token (T-372)")
+    wt.add_argument("--config", default=DEFAULT_CONFIG)
+    wt.add_argument("--op", required=True)
+    wt.add_argument("--url", default=None)
     h = sub.add_parser("healthcheck", help="GET URL, exit 0 on HTTP 200")
     h.add_argument("--url", required=True)
     h.add_argument("--timeout", type=float, default=5.0)
@@ -293,8 +500,14 @@ def _common(p: argparse.ArgumentParser) -> None:
 
 COMMANDS = frozenset(
     {"status", "budget", "client", "reload-clients", "hold", "release", "kill", "resume",
-     "clear-weights-hold", "config-check", "backup", "healthcheck"}
+     "clear-weights-hold", "config-check", "backup", "healthcheck", "ledger-exclude",
+     "provider-check", "lifecycle-probe", "scan-secrets", "weights-token-check"}
 )  # fmt: skip
+_LOCAL = {
+    "ledger-exclude": _ledger_exclude, "provider-check": _provider_check,
+    "lifecycle-probe": _lifecycle_probe, "scan-secrets": _scan_secrets,
+    "weights-token-check": _weights_token_check,
+}  # fmt: skip
 
 
 def dispatch(args: argparse.Namespace) -> int:
@@ -306,6 +519,8 @@ def dispatch(args: argparse.Namespace) -> int:
             return _backup(args)
         if cmd == "healthcheck":
             return _healthcheck(args)
+        if cmd in _LOCAL:
+            return _LOCAL[cmd](args)
         name = "client list" if cmd == "client" else cmd
         return _api_command(name, args)
     except AdminCliError as exc:

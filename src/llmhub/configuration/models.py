@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -107,14 +109,37 @@ class RetryConfig(_Model):
     breaker_errors: int = 3
     breaker_window_s: float = 600
     breaker_open_s: float = 900
-    host_blacklist_s: float = 86400
+    host_blacklist_s: float = Field(default=86400, ge=3600)  # T-372: >= 1 h (R3-3 T-370)
     destroy_backoff_s: float = 5.0
     destroy_backoff_max_s: float = 120.0
     call_timeout_s: float = 20
+    # T-372 critic F1: repeated creates after an unknown outcome (same label). A real provider
+    # must use 0: a pod that shows up after the grace would otherwise be a paid duplicate.
+    create_unknown_max_retries: int = Field(default=1, ge=0, le=3)
+
+
+KNOWN_PROVIDERS = ("mock", "runpod")
+PROBE_POOL = "_probe"  # rows of `lifecycle-probe` (T-372 L2b); config pools never start with "_"
+IMAGE_DIGEST_RE = re.compile(r"^[^@\s]+@sha256:[0-9a-f]{64}$")
+RUNPOD_MIN_GRACE_S = 600.0
+
+
+class RunpodConfig(_Model):
+    """RunPod adapter (T-372 plan 3.5): Community Cloud pods only, spend guards as bounds."""
+
+    cloud_type: Literal["COMMUNITY"] = "COMMUNITY"
+    gpu_type_ids: dict[str, str] = {"RTX3090": "NVIDIA GeForce RTX 3090"}  # pool gpu -> id
+    allowed_cuda_versions: list[str] = ["12.8", "12.9"]  # advocate F7b (image needs >= 12.8)
+    price_ceiling_usd_h: float = Field(default=0.50, gt=0, le=0.50)
+    max_live_pods: int = Field(default=1, ge=1, le=4)
+    list_staleness_s: float = Field(default=30, ge=0, le=600)
+    container_disk_usd_gb_month: float = Field(default=0.10, ge=0)
+    call_timeout_s: float = Field(default=20, gt=0, le=60)
 
 
 class ProvidersConfig(_Model):
     enabled: list[str] = ["mock"]
+    runpod: RunpodConfig | None = None
 
 
 class DbConfig(_Model):
@@ -157,4 +182,46 @@ class Config(ApiSection):
                     raise ValueError(
                         f"clients.{cname}.mock_only: requires providers.enabled == ['mock']"
                     )
+        return self
+
+    @model_validator(mode="after")
+    def _check_providers(self) -> Config:
+        """T-372 spend guards: a real provider only with its section and safe settings."""
+        for name in self.pools:
+            if name.startswith("_"):
+                raise ValueError(f"pools.{name}: names starting with '_' are reserved")
+        for name in self.providers.enabled:
+            if name not in KNOWN_PROVIDERS:
+                raise ValueError(f"providers.enabled: unknown provider {name!r}")
+        if "runpod" not in self.providers.enabled:
+            return self
+        rp = self.providers.runpod
+        if rp is None:
+            raise ValueError("providers.runpod: section required when runpod is enabled")
+        if self.timeouts.create_visibility_grace_s < RUNPOD_MIN_GRACE_S:
+            raise ValueError(
+                f"timeouts.create_visibility_grace_s: must be >= {RUNPOD_MIN_GRACE_S:g} for runpod"
+            )
+        if self.retry.create_unknown_max_retries != 0:
+            raise ValueError("retry.create_unknown_max_retries: must be 0 for runpod")
+        t = self.timeouts
+        if t.provisioning_s < t.offer_wait_s + t.create_visibility_grace_s:
+            # an unknown create must resolve (E3 create_unknown_unresolved + incident) before
+            # the PROVISIONING timeout hides it
+            raise ValueError("timeouts.provisioning_s: must be >= offer_wait_s +"
+                             " create_visibility_grace_s for runpod")  # fmt: skip
+        for name, pool in self.pools.items():
+            if pool.provider != "runpod":
+                continue
+            where = f"pools.{name}"
+            if pool.gpu not in rp.gpu_type_ids:
+                raise ValueError(f"{where}.gpu: not in providers.runpod.gpu_type_ids")
+            if pool.max_price_usd_h > rp.price_ceiling_usd_h:
+                raise ValueError(f"{where}.max_price_usd_h: above providers.runpod.price_ceiling")
+            if not IMAGE_DIGEST_RE.match(pool.image):
+                raise ValueError(f"{where}.image: must be pinned as <name>@sha256:<64 hex>")
+            if pool.infer.transport != "proxy":
+                raise ValueError(f"{where}.infer.transport: runpod supports only proxy (T-372)")
+            if pool.disk_gb <= 0:
+                raise ValueError(f"{where}.disk_gb: must be > 0")
         return self

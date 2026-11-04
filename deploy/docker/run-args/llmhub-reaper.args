@@ -13,6 +13,7 @@ python -m llmhub.reaper healthcheck --heartbeat /var/lib/llmhub/reaper.hb --max-
 LLMHUB_LABEL_SECRET_FILE=/run/llmhub-secrets/label
 -v
 /etc/llmhub/conf:/etc/llmhub/conf:ro
+@include-if-secret runpod _runpod.args
 -v
 /etc/llmhub/secrets/label:/run/llmhub-secrets/label:ro
 -v

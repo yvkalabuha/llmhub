@@ -128,6 +128,16 @@ async def _reconcile_row(
             if row["attempts"] >= cfg.retry.create_max_attempts:
                 if machine.mark_lost(conn, iid, now, "create_unknown_max_attempts", cfg=cfg):
                     report.errored.append(iid)
+            elif int(row["attempts"]) - 1 >= cfg.retry.create_unknown_max_retries:
+                # T-372 F1: no second paid create after a restart either
+                if machine.mark_lost(conn, iid, now, "create_unknown_unresolved", cfg=cfg):
+                    report.errored.append(iid)
+                    record_incident(
+                        conn, now, "create_unknown_unresolved", "high", ref=iid,
+                        dedup_key=f"create_unknown_unresolved:{iid}",
+                        details={"label": row["label"], "provider": row["provider"],
+                                 "attempts": int(row["attempts"]), "after": "restart"},
+                    )  # fmt: skip
             else:  # retry create with the same label
                 with tx(conn):
                     conn.execute(
