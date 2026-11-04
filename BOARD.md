@@ -4,7 +4,6 @@
 
 | ID | Задача | Тип | Статус | Зависит |
 |---|---|---|---|---|
-| T-368 | 3a: ядро на Mock (SQLite, автомат, leases, очередь, бюджет, сторож) | impl | review | — |
 | T-369 | 3b: API (OpenAI+tasks+leases+admin), router, адаптер llama-server | impl | todo | T-368 |
 | T-370 | 3c: веса (WeightSource, сервер весов) и образ llmhub-infer | impl | todo | T-368 |
 | T-371 | 3d: деплой systemd на 65.109.95.35, e2e на Mock, integration.md | impl | todo | T-369, T-370 |
@@ -12,3 +11,4 @@
 
 ## Входящие
 <!-- "YYYY-MM-DD от <источник>: <что> (T-XXX)". -->
+- 2026-11-04 от reviewer T-368: `integrity._try_open` считает «database is locked» порчей → карантин; отличать при старте (T-371).

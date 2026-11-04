@@ -5,7 +5,7 @@
 - Проект: llmhub
 - Тип: impl
 - Агент: analyst → implementer → reviewer (ворота critic + advocate на план, P1)
-- Статус: review
+- Статус: done
 - План: tasks/plans/T-368-plan.md
 - Приоритет: P1
 - Зависит от: —
@@ -14,18 +14,18 @@
 ## Цель
 Реализовать ядро (этап 3a и очередь/деньги прежнего 3b исследования) целиком на MockProvider: ни одного реального вызова провайдера и ни одного ключа. Модули: configuration, persistence, lifecycle_manager, task_queue, scheduler, budget_manager, cost_tracker, reaper, cloud_manager, provider_adapters/{base,mock}.
 ## Критерии приёмки
-- [ ] Схема SQLite WAL по §6.6 (clients, jobs, leases, instances, transitions, ledger, reservations, provider_accounts, provider_snapshots, incidents, controller_state); миграции, `integrity_check`, бэкап; порча БД -> безопасный режим HALTED.
-- [ ] Частичный UNIQUE(pool) WHERE state NOT IN ('STOPPED','PENDING_DELETE','LEAKED'); тест: новый цикл пула при PENDING_DELETE без второго живого инстанса в индексе.
-- [ ] Автомат STOPPED→PROVISIONING→BOOTING→LOADING_MODEL→READY⇄BUSY⇄IDLE→STOPPING→STOPPED, ERROR→STOPPING; PENDING_DELETE (destroy принят) и LEAKED (нет нуля за 15 мин -> инцидент, блок провайдера, HALTED); таймауты состояний, `max_lifetime` 3 ч; решение IDLE→STOPPING в одной транзакции с проверкой очереди и leases; каждый переход и строка таблицы §6.3 покрыты тестом.
-- [ ] Leases implicit/explicit (пульс, TTL 10 мин)/hold (≤ 8 ч)/prewarm; тест: агент молчит 20 мин с живым lease — GPU жива; drain после пачки; `idle_timeout` 0–15, по умолчанию 5.
-- [ ] Очередь urgent/normal/low, пакеты low (5 задач / 30 мин, ожидание ≤ 90 мин), round-robin по клиентам, Idempotency-Key 7 суток, неявная дедупликация sha256(client+тело) ~15 мин, 409 при конфликте; триггеры запуска пула по §6.7.
-- [ ] Бюджет: оценка P·(T_cold_p90+ΣT_work+T_idle)+трафик, резервы, лимиты (сторож $50, менеджер $45/мес, $3/сут, $1/сеанс, $0,25/задание, подбюджет exception $10), предупреждения 50/80/95 % и по темпу, ступени 80 % ECONOMY / 95 % только urgent / 100 % нет запусков; нехватка баланса — блокировка провайдера без повторов и автопополнения, resume только вручную; распределение простоя по клиентам.
-- [ ] Ledger (gpu/disk/traffic/storage), сверка с балансом/биллингом Mock; расхождение ≤ max($0,05; 5 %).
-- [ ] Сторож (reaper) — отдельный процесс; kill-switch: kill -> 0 ресурсов ≤ 60 с (на Mock); удаление только при совпадении HMAC-метки `llmhub-<op_id>-<hmac8>` и записи в БД; восстановление сверкой с `list_owned`.
-- [ ] `ProviderAdapter` Protocol (list_offers, create(spec,label), get, list_owned, идемпотентный destroy, balance, billing_since, normalize_error) + Capability; метода stop нет. MockProvider с инъекцией: задержки старта/загрузки, ошибки API, 429, неизвестный исход create, нехватка баланса, нет GPU, «остановлен, но платит», orphan. Контрактные тесты адаптеров (`contract.py`): новый провайдер проходит их без изменения ядра.
-- [ ] Сценарии ТЗ §15 отдельными тестами: 10 запросов -> 1 create; urgent не ждёт пакета; один Idempotency-Key -> одна задача; перезапуск в PROVISIONING и BUSY без потерь и лишних ресурсов; прерывание GPU -> повторная постановка; задача во время STOPPING -> новый цикл; исчерпание бюджета/баланса; неизвестный исход create -> один ресурс; порча БД.
-- [ ] Прогон S1–S6/RF2–RF6 симулятора через Mock с ускоренными часами: число запусков и $ совпадают ±5 %.
-- [ ] `uv run pytest`, `ruff check`, `pyright` чисто; ревью ≤ 3 раундов; автомат/leases/бюджет/create-reconcile — 2 независимых цикла ревью.
+- [x] Схема SQLite WAL по §6.6 (clients, jobs, leases, instances, transitions, ledger, reservations, provider_accounts, provider_snapshots, incidents, controller_state); миграции, `integrity_check`, бэкап; порча БД -> безопасный режим HALTED.
+- [x] Частичный UNIQUE(pool) WHERE state NOT IN ('STOPPED','PENDING_DELETE','LEAKED'); тест: новый цикл пула при PENDING_DELETE без второго живого инстанса в индексе.
+- [x] Автомат STOPPED→PROVISIONING→BOOTING→LOADING_MODEL→READY⇄BUSY⇄IDLE→STOPPING→STOPPED, ERROR→STOPPING; PENDING_DELETE (destroy принят) и LEAKED (нет нуля за 15 мин -> инцидент, блок провайдера, HALTED); таймауты состояний, `max_lifetime` 3 ч; решение IDLE→STOPPING в одной транзакции с проверкой очереди и leases; каждый переход и строка таблицы §6.3 покрыты тестом.
+- [x] Leases implicit/explicit (пульс, TTL 10 мин)/hold (≤ 8 ч)/prewarm; тест: агент молчит 20 мин с живым lease — GPU жива; drain после пачки; `idle_timeout` 0–15, по умолчанию 5.
+- [x] Очередь urgent/normal/low, пакеты low (5 задач / 30 мин, ожидание ≤ 90 мин), round-robin по клиентам, Idempotency-Key 7 суток, неявная дедупликация sha256(client+тело) ~15 мин, 409 при конфликте; триггеры запуска пула по §6.7.
+- [x] Бюджет: оценка P·(T_cold_p90+ΣT_work+T_idle)+трафик, резервы, лимиты (сторож $50, менеджер $45/мес, $3/сут, $1/сеанс, $0,25/задание, подбюджет exception $10), предупреждения 50/80/95 % и по темпу, ступени 80 % ECONOMY / 95 % только urgent / 100 % нет запусков; нехватка баланса — блокировка провайдера без повторов и автопополнения, resume только вручную; распределение простоя по клиентам.
+- [x] Ledger (gpu/disk/traffic/storage), сверка с балансом/биллингом Mock; расхождение ≤ max($0,05; 5 %).
+- [x] Сторож (reaper) — отдельный процесс; kill-switch: kill -> 0 ресурсов ≤ 60 с (на Mock); удаление только при совпадении HMAC-метки `llmhub-<op_id>-<hmac8>` и записи в БД; восстановление сверкой с `list_owned`.
+- [x] `ProviderAdapter` Protocol (list_offers, create(spec,label), get, list_owned, идемпотентный destroy, balance, billing_since, normalize_error) + Capability; метода stop нет. MockProvider с инъекцией: задержки старта/загрузки, ошибки API, 429, неизвестный исход create, нехватка баланса, нет GPU, «остановлен, но платит», orphan. Контрактные тесты адаптеров (`contract.py`): новый провайдер проходит их без изменения ядра.
+- [x] Сценарии ТЗ §15 отдельными тестами: 10 запросов -> 1 create; urgent не ждёт пакета; один Idempotency-Key -> одна задача; перезапуск в PROVISIONING и BUSY без потерь и лишних ресурсов; прерывание GPU -> повторная постановка; задача во время STOPPING -> новый цикл; исчерпание бюджета/баланса; неизвестный исход create -> один ресурс; порча БД.
+- [x] Прогон S1–S6/RF2–RF6 симулятора через Mock с ускоренными часами: число запусков и $ совпадают ±5 %.
+- [x] `uv run pytest`, `ruff check`, `pyright` чисто; ревью ≤ 3 раундов; автомат/leases/бюджет/create-reconcile — 2 независимых цикла ревью.
 ## Подзадачи
 - [x] Ворота critic + advocate на план (2026-11-04)
 - [x] persistence + configuration
@@ -116,6 +116,39 @@
 - `uv run ruff check src tests` — чисто; `uv run pyright` — 0 ошибок.
 
 **Вердикт: changes required.** Блокируют F-R2-4 и F-R2-3b (major); F-R2-3a и F-R2-1 (medium) нужно исправить в этом же раунде. После исправлений снять `xfail` с 4 тестов в `tests/test_review2_failures.py`.
+## Ревью (раунд 2)
+> TL;DR: повторное ревью после раунда исправлений 1 (commit a5ebe8a, диф `4024b98..a5ebe8a`). Все находки циклов 1 и 2 исправлены и покрыты тестами, которые падают на старом коде. Новых путей утечки денег нет. Нашлись 2 проблемы в самих исправлениях (гонка миграции 0002 при одновременном старте контроллера и сторожа → ложный карантин и HALTED; периодический sweep контроллера не срабатывал в простое); обе исправлены ревьюером, с тестами. 6 решений implementer приняты. Вердикт: **accept → done**.
+
+**1. Находки циклов 1 и 2 — исправлены.** Тесты из `test_review1_logic.py`, `test_review2_failures.py` и `test_fix1_round.py` прогнаны на рабочей копии 4024b98 с `--runxfail`: 36 из 40 падают (4 зелёных — тесты «проверено, не ошибка»). На a5ebe8a зелёные все. Диф `src/` прочитан целиком; каждая строка журнала «Раунд исправлений 1» соответствует коду.
+
+**2. Новые пути утечки и гонки (проверено):**
+- `adopt_ref_or_destroy`: чтение и запись — в одной транзакции `BEGIN IMMEDIATE`. Правило «тот же ref и строка не в PROVISIONING → ничего» безопасно во всех состояниях. Live: ресурс принадлежит строке. STOPPING/PENDING_DELETE: teardown уничтожает ресурс по ref. STOPPED: ноль уже подтверждён по label и `get(ref)`, а запасной путь — sweep STOPPED-строк. Чужой ref строки не перезаписывается, пришедший ресурс уничтожается. Остаётся старое поведение: в PROVISIONING с уже усыновлённым ref второй ответ create перезаписывает ref. Этот случай ловит `_duplicate_sweep`.
+- Аварийный режим сторожа без БД: `emergency_kill_pass` уничтожает только ресурсы `list_owned("llmhub-")` с верным HMAC (`verify_label`); это та же семантика, что у `kill_pass`. Без KILL-файла ничего не уничтожается, пишется только stderr. Ошибка `list_owned` → ничего не уничтожается.
+- Sweep STOPPED/ERROR раз в 60 с: `unknown=False`, Q1 (ресурсы без строки) не трогается, вне safe mode строки без записи не уничтожаются. **Найдено (minor, исправлено):** при пустой очереди и без живых инстансов `step()` возвращал INF. `run_forever` засыпал до вызова API, и 60-секундный sweep не выполнялся; страховал только сторож. Тест харнесса `test_controller_sweeps_resource_of_stopped_row` этого не видел: `run_until` всегда делает шаг в конце интервала. Исправление: `controller._orphan_wake` будит контроллер к следующему sweep, пока есть строка ERROR или STOPPED моложе `ORPHAN_WATCH_S` = 1 ч. Тесты `tests/test_review_r2_orphan_wake.py` (3; на коде a5ebe8a 2 из них падают).
+- Миграция 0002 на существующей БД: `ALTER TABLE ... ADD COLUMN`, существующие строки получают `create_unknown=0` и NULL. **Найдено (major для деплоя, исправлено):** `migrate` читал `user_version` вне транзакции. Если контроллер и сторож стартуют одновременно (рестарт systemd после обновления), проигравший падал с `duplicate column name`. Контроллер в `integrity._try_open` принимает любую `sqlite3.DatabaseError` за порчу. Итог: карантин здоровой БД, HALTED и safe mode, а в safe mode sweep уничтожает все наши ресурсы без строк. Воспроизведение — 60 из 60 гонок. Исправление `persistence/db.migrate`: при `OperationalError` — ROLLBACK, повторное чтение `user_version`; если версию уже применил другой процесс, это успех, иначе ошибка пробрасывается. Тесты `tests/test_review_r2_migrate.py` (2; на старом коде оба падают: `duplicate column`, `(True, 'db_corrupt')`).
+- Удаление из `launch_jobs` при раздаче — в той же транзакции, что `mark_running` и E8/E11/E13. Повтор идёт через `reserve_job_on_running`; утечки резерва нет: `requeue` и `fallback_local` освобождают `job`.
+- 95 %: в `_maybe_launch` в запуск берутся только urgent. На живой GPU не-urgent уходят в `fallback_local` (`stage:urgent_only`), задачи запуска оплачены резервом сеанса. Ступень берётся из `_stage`, который обновляется раз в 30 с: задержка до 30 с, как у остальных ступеней.
+
+**3. Решения implementer — приняты:**
+1. `UNKNOWN_GRACE_FACTOR=3` константой — да; для реальных адаптеров (T-372) вынести в конфиг, если провайдер показывает ресурсы позже 3·grace (страховка — sweep контроллера и сторожа).
+2. Fallback на 6-м рестарте (`restarts > 5`) — да, задача не теряется.
+3. Сторож останавливает инстансы без running-задач при пульсе контроллера старше 15 мин, даже под hold — да. Без контроллера GPU никто не обслуживает (API только через контроллер), а ADR-0138 ставит деньги выше скорости. Hold — сигнал «GPU нужна» для живой службы, а не обязательство платить при мёртвой.
+4. `get()==None` ref не уничтожается — да. Если `get` у провайдера с отложенной видимостью (eventually consistent) даёт None, поздно проявившийся ресурс уничтожит sweep STOPPED-строк. Для T-372: `get` реального адаптера после create должен быть консистентным или `list_staleness_s` > 0.
+5. 95 %: не-urgent на живой GPU → local fallback — соответствует ТЗ/ADR («95 % → облако только urgent»).
+6. Изменены 2 ожидания тестов ревью. В хелпере F-R2-1 PENDING_DELETE вместо STOPPED: это прямое следствие исправления, тест сторожа по-прежнему проверяет уничтожение. В `test_already_gone_is_accepted_too` `destroy_calls == []`: ghost не уничтожается, E19 есть. Оба изменения корректны.
+
+**Замечания, не блокирующие (в следующие задачи):**
+- low (вне дифа, T-371): `integrity._try_open` принимает `OperationalError` «database is locked» за порчу и отправляет БД в карантин. Гонку миграций закрыло исправление выше, но долгую блокировку при старте нужно отличать от порчи (`type(exc) is sqlite3.DatabaseError`, как `reaper.core.is_corrupt`).
+- info: метка `unknown_destroyed:<ref>` (сутки) уничтожает повторно показанный ресурс с нашим HMAC без 30-минутного Q1. Риск — провайдер переиспользует числовой id для нового ресурса без строки. Для mock неважно; для T-372 проверить формат id.
+- info: `controller.py` не отформатирован `ruff format` (старые места; `ruff check` чисто).
+
+**Команды и результаты:**
+- До правок ревьюера, 3 полных прогона `uv run pytest -q -p no:cacheprovider -m "slow or not slow"`: 645 passed ×3 (147 / 119 / 107 с; во 2-м и 3-м прогоне ещё 1 временный тест ревьюера).
+- После правок, 3 полных прогона: 650 passed ×3 (146 / 148 / 148 с), xfail нет, флейков нет.
+- `uv run ruff check src tests` — All checks passed; `uv run pyright` — 0 errors.
+- Правки ревьюера: `src/llmhub/persistence/db.py` (`migrate`), `src/llmhub/controller.py` (`ORPHAN_WATCH_S`, `_orphan_wake`); тесты `tests/test_review_r2_migrate.py`, `tests/test_review_r2_orphan_wake.py`. Коммита нет.
+
+**Вердикт: accept → done.** Blocker/major не осталось, критерии приёмки подтверждены тестами циклов 1–2 и этого раунда. Раунд ревью 2 из 3.
 ## Журнал
 - 2026-11-04: задача создана координатором при создании репозитория.
 - 2026-11-04: analyst — план `tasks/plans/T-368-plan.md` (41 шаг, потоки A–F, DDL, таблица переходов E1–E22, тесты §15 и 19 ситуаций); статус planned; следующий шаг — ворота critic + advocate.
@@ -167,3 +200,4 @@
   - Файлы: `src/llmhub/{controller,killswitch}.py`, `reaper/{core,__main__}.py`, `lifecycle_manager/{teardown,machine,leases,recovery}.py`, `cloud_manager/provisioner.py`, `budget_manager/{reservations,limits}.py`, `task_queue/queue.py`, `provider_adapters/{base,contract}.py`, `persistence/migrations/0002_create_times.sql`; тесты: новый `tests/test_fix1_round.py` (23), правки `test_review1_logic.py`, `test_review2_failures.py`, `test_a_schema.py`, `test_c_recovery.py`, `test_c_teardown.py`, `test_e_reservations.py`, `test_f_tz15.py`; план §6 (FIFO).
   - Проверка: `uv run pytest -q -p no:cacheprovider -m "slow or not slow"` три раза подряд — 645 passed (135 с / 112 с / 118 с), xfail нет. Флейк R1-12: 120 параллельных прогонов — 0 падений. `uv run ruff check src tests` — чисто. `uv run pyright` — 0 errors. Коммита нет (по указанию координатора).
   - Отклонения и решения раунда: (1) схема v2 (миграция 0002), а не только ключи `controller_state`; (2) N = 3 для `first_create + N·grace` (константа `UNKNOWN_GRACE_FACTOR`, поля в конфиге нет); (3) L5: fallback при `restarts > 5`, то есть на 6-м рестарте (`test_d_requeue_cancel::test_orphans_never_exhaust_attempts` с 5 рестартами не менялся); (4) L8: порог 15 мин, hold не мешает остановке; (5) R1-11: ghost-ref (`get` = None) больше не передаётся в destroy; (6) URGENT_ONLY: не-urgent на живой GPU уходят в `fallback_local`, а не ждут в очереди, иначе очередь держит GPU в BUSY/IDLE→BUSY.
+- 2026-11-04: reviewer — ревью раунд 2: исправления раунда 1 приняты; ревьюер закрыл гонку миграции 0002 (ложный карантин БД) и сон контроллера мимо sweep; 650 passed ×3, ruff/pyright чисто. Статус done.

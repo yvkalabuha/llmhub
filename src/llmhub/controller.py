@@ -71,6 +71,7 @@ ALIVE_CHECK_S = 30.0  # provider/endpoint liveness of READY/BUSY/IDLE instances
 DUP_SWEEP_S = 60.0  # duplicate-resource sweep (section 3.9)
 PURGE_S = 3600.0
 ORPHAN_SWEEP_S = 60.0  # HMAC resources of STOPPED/ERROR rows (F-R2-1)
+ORPHAN_WATCH_S = 3600.0  # review r2: keep waking for the sweep this long after a row stopped
 ACCRUE_S = 60.0  # ledger accrual granularity (keeps the ledger small; reservations cover it)
 BUDGET_CHECK_S = 30.0  # stage / warnings / 100 % actions
 MAX_FAILED_CYCLES = 3  # consecutive failed launch cycles of a pool before local fallback
@@ -258,6 +259,7 @@ class Controller:
             wake = min(wake, await self._kill_file_pass(now))
         if self.busy_ops():
             wake = min(wake, now + self.poll_s)
+        wake = min(wake, self._orphan_wake(now))
         if self._jobs:
             wake = min(wake, now + self.cfg.timeouts.worker_heartbeat_s)
         return max(wake, now)
@@ -430,6 +432,17 @@ class Controller:
         await orphan_sweep(
             self.conn, self.adapters, self.secret, now, self.cfg, "controller", unknown=False
         )
+
+    def _orphan_wake(self, now: float) -> float:
+        """Review r2: an idle controller (nothing live, empty queue) would sleep until an API
+        call and skip the 60 s sweep; while a row is ERROR or stopped within ORPHAN_WATCH_S
+        the next step is due at the next sweep (the reaper stays the unconditional guard)."""
+        row = self.conn.execute(
+            "SELECT 1 FROM instances WHERE state='ERROR' OR (state='STOPPED' AND state_since >= ?)"
+            " LIMIT 1",
+            (now - ORPHAN_WATCH_S,),
+        ).fetchone()
+        return INF if row is None else max(self._orphan_at + ORPHAN_SWEEP_S, now)
 
     def _teardown(self, now: float) -> float:
         """STOPPING / PENDING_DELETE / LEAKED of EVERY row (also of a removed pool, F-R2-3a);

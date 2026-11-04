@@ -72,7 +72,19 @@ def migrate(conn: sqlite3.Connection) -> int:
         if version <= current:
             continue
         script = f.read_text(encoding="utf-8")
-        conn.executescript(f"BEGIN IMMEDIATE;\n{script}\nPRAGMA user_version={version};\nCOMMIT;")
+        try:
+            conn.executescript(
+                f"BEGIN IMMEDIATE;\n{script}\nPRAGMA user_version={version};\nCOMMIT;"
+            )
+        except sqlite3.OperationalError:
+            # Review r2: controller and reaper may migrate the same file at once (deploy);
+            # the loser read the old user_version before the winner committed. Its script
+            # fails ("duplicate column", "already exists"): roll back and accept the
+            # winner's result instead of reporting a healthy DB as damaged (quarantine).
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
+            if int(conn.execute("PRAGMA user_version").fetchone()[0]) < version:
+                raise
         current = version
     if current:
         with tx(conn):
