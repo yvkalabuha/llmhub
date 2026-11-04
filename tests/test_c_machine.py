@@ -151,11 +151,11 @@ def test_requeue_running_jobs_counts_or_not() -> None:
     add_job(conn, "j1", "running", instance_id="a", worker_id="w", attempts=1)
     add_job(conn, "j2", "running", instance_id="a", worker_id="w", attempts=2)
     ids = machine.requeue_running_jobs(conn, T0, instance_id="a", count_attempt=True)
-    assert ids == ["j1"]  # j2 hit max_attempts
+    assert ids == ["j1"]  # j2 hit max_attempts: local fallback (queue.requeue, stream F)
     j1 = conn.execute("SELECT * FROM jobs WHERE id='j1'").fetchone()
     j2 = conn.execute("SELECT * FROM jobs WHERE id='j2'").fetchone()
     assert (j1["status"], j1["attempts"], j1["instance_id"]) == ("queued", 1, None)
-    assert (j2["status"], j2["error_code"]) == ("failed", "max_attempts")
+    assert (j2["status"], j2["route"], j2["pool"]) == ("queued", "local:fallback", None)
     assert conn.execute("SELECT closed_at FROM leases WHERE job_id='j2'").fetchone()[0] == T0
     assert conn.execute("SELECT closed_at FROM leases WHERE job_id='j1'").fetchone()[0] is None
     # restart path: attempt is given back, restarts counted

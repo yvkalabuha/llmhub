@@ -12,15 +12,12 @@ from llmhub.budget_manager.limits import windows
 from llmhub.configuration.models import Config
 from llmhub.cost_tracker.txutil import add_incident, join_or_open, state_get, state_set
 from llmhub.persistence.db import assert_not_in_tx
+from llmhub.persistence.state import ReconcileRequired
 from llmhub.provider_adapters.base import BillingRecord, Capability, ProviderAdapter
 
 LIVE_INTERVAL_S = 900.0
 IDLE_INTERVAL_S = 86400.0
 _KINDS = ("gpu", "disk", "traffic", "storage")
-
-
-class ReconcileRequired(Exception):
-    """resume refused: provider billing since month start is not loaded after DB corruption."""
 
 
 @dataclass(frozen=True)
@@ -184,4 +181,5 @@ async def reload_billing(
                 )  # fmt: skip
     with join_or_open(conn):
         state_set(conn, "billing_reloaded_at", repr(now), now)
+        state_set(conn, "db_reconciled", "1", now)  # persistence.state.unhalt checks it
     return results

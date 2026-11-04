@@ -44,6 +44,8 @@ class MockKnobs:
     stale_s: float = 300  # LIST_STALE: list_owned shows the world as of this many seconds ago
     hang_s: float = 3600  # CREATE_HANG: the call returns only after this long
     volume_usd_h: float = 0.01  # price of the volume left by DESTROY_PARTIAL
+    # declared stale-list window (teardown needs two zeros this far apart); pair with LIST_STALE
+    list_staleness_s: float = 0.0
 
 
 class Fault(enum.StrEnum):
@@ -143,6 +145,11 @@ class MockProvider:
         self.knobs = knobs or MockKnobs()
         self.create_calls = 0
         self._faults: list[_Injected] = []
+
+    @property
+    def list_staleness_s(self) -> float:
+        """Optional adapter attribute read by teardown.confirm_zero (stream C)."""
+        return self.knobs.list_staleness_s
 
     # --- ProviderAdapter -------------------------------------------------
     async def list_offers(self, q: OfferQuery) -> list[Offer]:
@@ -273,6 +280,13 @@ class MockProvider:
 
     def add_orphan(self, label: str) -> str:
         return self._add_raw(label)
+
+    def add_attached(self, label: str, kind: ResourceKind, price_usd_h: float = 0.01) -> str:
+        """A billed non-instance resource (volume / other) carrying `label`."""
+        return self.store.insert(
+            label=label, kind=kind.value, created_at=self.clock.now(), boot_s=0.0,
+            price_usd_h=price_usd_h, host_id="host-x",
+        )  # fmt: skip
 
     def live_refs(self) -> list[str]:
         """Ground truth for tests, including resources invisible to list_owned."""

@@ -718,19 +718,21 @@ CREATE TABLE cost_allocations (
 | E-7 | `test_e_reconcile.py`: Mock-биллинг против ledger: расхождение 0,04 → нет инцидента; 0,06 при $0,5 → инцидент; дальше лимиты по максимуму | `reconcile.py` |
 | E-8 | `test_e_allocation.py`: 2 клиента 1:3 работы → shared 1:3; hold без работы → держателю; hold + работа | `allocation.py` |
 
-### Поток F — интеграция (opus). Владеет: `cloud_manager/{pools,offers,provisioner}.py`, `controller.py`, `killswitch.py`, `reaper/*`, все `__init__.py` с экспортами пакетов, `tests/test_f_*.py`, `tests/harness.py`, `tests/fixtures/sim/*`, обновление `tests/test_smoke.py` (новые модули). Зависит от A–E
+### Поток F — интеграция (opus). [x] F1–F10 выполнены 2026-11-04 (отклонения — в журнале T-368).
+
+Владеет: `cloud_manager/{pools,offers,provisioner}.py`, `controller.py`, `killswitch.py`, `reaper/*`, все `__init__.py` с экспортами пакетов, `tests/test_f_*.py`, `tests/harness.py`, `tests/fixtures/sim/*`, обновление `tests/test_smoke.py` (новые модули). Зависит от A–E
 | Шаг | Тест | Реализация |
 |---|---|---|
-| F1 | `test_f_offers.py`: цена, blacklist, `max_price`, пусто → None | `offers.py`, `pools.py` |
-| F2 | `test_f_provisioner.py`: путь PROVISIONING → READY; неизвестный исход — 4 ветки §7.3; `insufficient_balance`; `gpu_unavailable` / `offer_wait` | `provisioner.py` |
-| F3 | `tests/harness.py` + `test_f_harness.py`: `Harness(cfg, knobs)` собирает FakeClock, Mock, Controller; `run_until`, `arrive_at(t, spec)`; детерминизм (2 прогона → одинаковые `transitions`) | `controller.py` (step, submit, run_forever) |
-| F4 | `test_f_transitions.py`: параметризован по `TRANSITIONS` — на каждое ребро E1–E22 свой сценарий через Harness, ассерт строки `transitions`; guard-тест: множество id сценариев == множеству рёбер; E11 (BUSY → BUSY, без строки `transitions`) проверяется отдельно: 2 задачи подряд без IDLE и без второго create | `controller.py` |
-| F5 | `test_f_situations.py`: 19 ситуаций §6.3 — по тесту на каждую (таблица §10.2) | — |
-| F6 | `test_f_tz15.py`: сценарии ТЗ §15 (§10.1) | — |
-| F7 | `test_f_killswitch.py`: 3 ресурса (один с `destroy_delay_s` 20 с, один orphan) → 0 ≤ 60 с FakeClock; KILL-файл; create висит (CREATE_HANG) + kill → 0 ≤ 60 с; kill во время create при lag > grace; после kill новых запусков нет, `resume` снимает | `killswitch.py` |
-| F8 | `test_f_reaper.py`: `run_once` — PENDING_DELETE → STOPPED, LEAKED, orphan в safe_mode, живой дубль, без строки в обычном режиме (critical + HALT, через 30 мин удаление), чужой не тронут, hard_cap при мёртвом контроллере (accrue по CAS), max_lifetime-предохранитель; «только сторож»: контроллер остановлен, KILL-файл → 0 ресурсов ≤ 60 с при `--loop 15`; `test_f_reaper_process.py` (marker `slow`): `subprocess` `python -m llmhub.reaper --once` на файловом MockStore и state.db (SystemClock, задержки 0) удаляет orphan | `reaper/core.py`, `__main__.py` |
-| F9 | `test_f_sim_parity.py` (marker `slow`): трассы S1–S6, RF2, RF4, RF6 из `tests/fixtures/sim/` → Harness с `deadline_includes_work=False` → число запусков **точно** равно эталону, $ в пределах ±5 %. Тест обязан пройти; «описать расхождение вместо прохождения» не допускается | — |
-| F10 | обновить `test_smoke.py`; полный `uv run pytest`, ruff, pyright | экспорты `__init__` |
+| [x] F1 | `test_f_offers.py`: цена, blacklist, `max_price`, пусто → None | `offers.py`, `pools.py` |
+| [x] F2 | `test_f_provisioner.py`: путь PROVISIONING → READY; неизвестный исход — 4 ветки §7.3; `insufficient_balance`; `gpu_unavailable` / `offer_wait` | `provisioner.py` |
+| [x] F3 | `tests/harness.py` + `test_f_harness.py`: `Harness(cfg, knobs)` собирает FakeClock, Mock, Controller; `run_until`, `arrive_at(t, spec)`; детерминизм (2 прогона → одинаковые `transitions`) | `controller.py` (step, submit, run_forever) |
+| [x] F4 | `test_f_transitions.py`: параметризован по `TRANSITIONS` — на каждое ребро E1–E22 свой сценарий через Harness, ассерт строки `transitions`; guard-тест: множество id сценариев == множеству рёбер; E11 (BUSY → BUSY, без строки `transitions`) проверяется отдельно: 2 задачи подряд без IDLE и без второго create | `controller.py` |
+| [x] F5 | `test_f_situations.py`: 19 ситуаций §6.3 — по тесту на каждую (таблица §10.2) | — |
+| [x] F6 | `test_f_tz15.py`: сценарии ТЗ §15 (§10.1) | — |
+| [x] F7 | `test_f_killswitch.py`: 3 ресурса (один с `destroy_delay_s` 20 с, один orphan) → 0 ≤ 60 с FakeClock; KILL-файл; create висит (CREATE_HANG) + kill → 0 ≤ 60 с; kill во время create при lag > grace; после kill новых запусков нет, `resume` снимает | `killswitch.py` |
+| [x] F8 | `test_f_reaper.py`: `run_once` — PENDING_DELETE → STOPPED, LEAKED, orphan в safe_mode, живой дубль, без строки в обычном режиме (critical + HALT, через 30 мин удаление), чужой не тронут, hard_cap при мёртвом контроллере (accrue по CAS), max_lifetime-предохранитель; «только сторож»: контроллер остановлен, KILL-файл → 0 ресурсов ≤ 60 с при `--loop 15`; `test_f_reaper_process.py` (marker `slow`): `subprocess` `python -m llmhub.reaper --once` на файловом MockStore и state.db (SystemClock, задержки 0) удаляет orphan | `reaper/core.py`, `__main__.py` |
+| [x] F9 | `test_f_sim_parity.py` (marker `slow`): трассы S1–S6, RF2, RF4, RF6 из `tests/fixtures/sim/` → Harness с `deadline_includes_work=False` → число запусков **точно** равно эталону, $ в пределах ±5 %. Тест обязан пройти; «описать расхождение вместо прохождения» не допускается | — |
+| [x] F10 | обновить `test_smoke.py`; полный `uv run pytest`, ruff, pyright | экспорты `__init__` |
 
 **Фикстуры симулятора (F9).** Скрипт в scratchpad (не в репозитории, без импорта в llmhub) загружает `/var/www/projectVoiceBot/tools/bench/T-367-sim/sim.py` по пути. Для 3 seeds и стратегий `idle 5m` и `batch 5/30m drain` (S1–S6 — Params заказчика: $0,36/ч, старт 300 с; RF — конфигурация «старт 9 мин», 0,22 $/ч) он выгружает JSON: заголовок (sha256 sim.py, команда, дата), заявки (`t`, `prio`, `in`, `out`, `max_wait_s`, `agent`), стратегию и эталон `simulate()` (launches, total $). Настройки Harness для паритета:
 - `boot_s + load_s = startup_s`, `provisioning` 0, destroy мгновенный, lag 0;

@@ -54,6 +54,13 @@ def _find_implicit(
     return row
 
 
+def _recovery_meta(spec: JobSpec) -> dict[str, object]:
+    """Everything but the body, so safe mode can re-queue a job whose row was lost (F)."""
+    meta = {k: getattr(spec, k) for k in spec.__dataclass_fields__ if k != "body"}
+    meta["priority"] = spec.priority.value
+    return meta
+
+
 def submit(
     conn: sqlite3.Connection, bodies: BodyStore, spec: JobSpec, now: float, cfg: Config
 ) -> SubmitResult:
@@ -66,7 +73,7 @@ def submit(
     sha = hashlib.sha256(spec.client_id.encode() + b"\x00" + spec.body).hexdigest()
     job_id = uuid.uuid4().hex[:12]
     # The body file is written before the transaction; removed again on a duplicate.
-    path = bodies.write_request(job_id, spec.body, {"client_id": spec.client_id})
+    path = bodies.write_request(job_id, spec.body, _recovery_meta(spec))
     out = spec.max_tokens or cfg.task_type_max_tokens.get(
         spec.task_type or "default", cfg.task_type_max_tokens["default"]
     )

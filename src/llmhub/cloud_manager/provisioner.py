@@ -1,23 +1,53 @@
-"""Provisioning: create / adopt / advance PROVISIONING -> READY (S0: happy path only)."""
+"""Provisioning: create / adopt / advance PROVISIONING -> BOOTING -> LOADING_MODEL -> READY.
+
+Rules (plan sections 3.4, 3.9, 7.3, gates 2026-11-04):
+- the intent (`create_called_at`, `attempts+1`, `offer_json`) is written BEFORE `create`; the
+  call itself runs as a background task (`spawn`), so a hanging create never blocks `step()`
+  or a kill;
+- a create answer is always stored (`adopt_ref_or_destroy`, no state CAS); a row that has left
+  PROVISIONING destroys the late ref at once;
+- unknown outcome: after `create_visibility_grace_s` the label is looked up in `list_owned`;
+  found -> adopt (oldest wins, the rest are duplicates), not found -> retry with the SAME label
+  until `create_max_attempts`, then E3;
+- E2 right after create once `get(ref)` shows the resource (PENDING/RUNNING; the boot is
+  then timed by BOOTING, E5). A row that keeps a ref without E2 (restart, ghost) polls `get`
+  until RUNNING; a ghost ref (`get` = None while another resource carries the label) moves the
+  row to that resource.
+Provider calls never run inside a DB transaction.
+"""
 
 from __future__ import annotations
 
 import enum
 import json
 import sqlite3
+from collections.abc import Callable, Coroutine
+from typing import Any
 
+from llmhub.budget_manager.accounts import handle_provider_error
 from llmhub.cloud_manager.offers import select_offer
 from llmhub.cloud_manager.pools import PoolRuntime
 from llmhub.configuration.models import Config
-from llmhub.lifecycle_manager.machine import set_provider_ref, transition
+from llmhub.lifecycle_manager import machine, timeouts
+from llmhub.lifecycle_manager.machine import transition
+from llmhub.lifecycle_manager.recovery import destroy_duplicates, split_duplicates
+from llmhub.lifecycle_manager.safety import delete_key, get_key, record_incident, set_key
 from llmhub.lifecycle_manager.states import State
+from llmhub.lifecycle_manager.teardown import adopt_ref_or_destroy
 from llmhub.persistence.db import assert_not_in_tx, tx
 from llmhub.provider_adapters.base import (
     InstanceSpec,
+    NormalizedError,
+    Offer,
     OfferQuery,
     ProviderAdapter,
+    ProviderError,
     RemoteResource,
+    RemoteStatus,
+    UnavailableReason,
 )
+
+Spawn = Callable[[str, Coroutine[Any, Any, Any]], None]
 
 
 class CreateOutcome(enum.StrEnum):
@@ -27,6 +57,171 @@ class CreateOutcome(enum.StrEnum):
     NO_OFFER = "no_offer"
     BLOCKED = "blocked"
     FAILED = "failed"
+    SPAWNED = "spawned"  # the create call runs in the background
+
+
+_CIRCUIT_OPEN = "circuit open"
+
+
+def find_duplicates(owned: list[RemoteResource], inst: sqlite3.Row) -> list[RemoteResource]:
+    """Resources carrying the row's label that are not the row's resource (section 3.9).
+
+    With `provider_ref` set and listed: every other resource with the label. With no ref (or a
+    ghost ref not listed): all but the oldest (`created_at`, then ref).
+    """
+    mine = [r for r in owned if r.label == inst["label"]]
+    known = next((r for r in mine if r.ref == inst["provider_ref"]), None)
+    return split_duplicates(inst, mine, known)[1]
+
+
+def _exclude_key(instance_id: str) -> str:
+    return f"exclude_hosts:{instance_id}"
+
+
+def _excluded(conn: sqlite3.Connection, instance_id: str) -> frozenset[str]:
+    raw = get_key(conn, _exclude_key(instance_id))
+    return frozenset(json.loads(raw)) if raw else frozenset()
+
+
+def blacklisted_hosts(conn: sqlite3.Connection, provider: str, now: float) -> frozenset[str]:
+    rows = conn.execute(
+        "SELECT host_id FROM host_blacklist WHERE provider=? AND until>?", (provider, now)
+    ).fetchall()
+    return frozenset(str(r["host_id"]) for r in rows)
+
+
+def _breaker_open(adapter: ProviderAdapter) -> bool:
+    breaker = getattr(adapter, "breaker", None)
+    if breaker is None:
+        return False
+    return bool(breaker.state == "open" and breaker.retry_in() > 0)
+
+
+def _fail_provisioning(conn: sqlite3.Connection, iid: str, now: float, cause: str) -> bool:
+    with tx(conn):
+        return transition(conn, iid, State.PROVISIONING, State.ERROR, "E3", now, "controller",
+                          last_error=cause, reason=cause)  # fmt: skip
+
+
+async def _do_create(
+    conn: sqlite3.Connection,
+    adapter: ProviderAdapter,
+    inst: sqlite3.Row,
+    spec: InstanceSpec,
+    host_id: str,
+    cfg: Config,
+    now_fn: Callable[[], float],
+) -> CreateOutcome:
+    """The create call itself (background). Outcome handling per section 7.3."""
+    assert_not_in_tx()
+    iid = inst["id"]
+    try:
+        res = await adapter.create(spec, inst["label"])
+    except Exception as exc:  # noqa: BLE001 - adapters may raise anything
+        err = exc.err if isinstance(exc, ProviderError) else adapter.normalize_error(exc)
+        return _create_failed(conn, inst, err, host_id, cfg, now_fn())
+    if not await adopt_ref_or_destroy(conn, adapter, iid, res, now_fn()):
+        return CreateOutcome.FAILED
+    try:  # a ghost ref is not visible: the PROVISIONING step moves the row to the label
+        seen = await adapter.get(res.ref)
+    except Exception:  # noqa: BLE001 - the PROVISIONING step polls again
+        seen = None
+    if seen is not None and seen.status in (RemoteStatus.PENDING, RemoteStatus.RUNNING):
+        with tx(conn):
+            transition(conn, iid, State.PROVISIONING, State.BOOTING, "E2", now_fn(),
+                       "controller", endpoint=seen.endpoint)  # fmt: skip
+            delete_key(conn, _exclude_key(iid))
+    return CreateOutcome.CREATED
+
+
+def _create_failed(
+    conn: sqlite3.Connection,
+    inst: sqlite3.Row,
+    err: NormalizedError,
+    host_id: str,
+    cfg: Config,
+    now: float,
+) -> CreateOutcome:
+    iid = inst["id"]
+    msg = err.message[:200]
+    if err.outcome_unknown:  # resolved by the label lookup after the grace period
+        with tx(conn):
+            conn.execute("UPDATE instances SET last_error=? WHERE id=?", (msg, iid))
+        return CreateOutcome.RETRY_LATER
+    if handle_provider_error(conn, inst["provider"], err, now):  # balance / quota: no retries
+        _fail_provisioning(conn, iid, now, str(err.reason))
+        return CreateOutcome.BLOCKED
+    refund = err.message == _CIRCUIT_OPEN
+    with tx(conn):
+        if err.reason == UnavailableReason.GPU_UNAVAILABLE:
+            hosts = sorted(_excluded(conn, iid) | {host_id})
+            set_key(conn, _exclude_key(iid), json.dumps(hosts), now)
+            refund = True  # the next offer is a new try, not a repeated one
+        conn.execute(
+            "UPDATE instances SET create_called_at=NULL, last_error=?,"
+            " attempts=CASE WHEN ? THEN max(attempts-1, 0) ELSE attempts END WHERE id=?",
+            (msg, int(refund), iid),
+        )
+        attempts = int(
+            conn.execute("SELECT attempts FROM instances WHERE id=?", (iid,)).fetchone()[0]
+        )
+    if not refund and attempts >= cfg.retry.create_max_attempts:
+        _fail_provisioning(conn, iid, now, "create_failed")
+        return CreateOutcome.FAILED
+    return CreateOutcome.RETRY_LATER
+
+
+async def _start_create(
+    conn: sqlite3.Connection,
+    rt: PoolRuntime,
+    inst: sqlite3.Row,
+    now: float,
+    cfg: Config,
+    spawn: Spawn | None,
+    now_fn: Callable[[], float],
+) -> CreateOutcome:
+    pool = rt.cfg
+    adapter = rt.adapter
+    if _breaker_open(adapter):
+        return CreateOutcome.RETRY_LATER
+    query = OfferQuery(
+        gpu=pool.gpu, min_vram_gb=pool.vram_gb, max_price_usd_h=pool.max_price_usd_h,
+        exclude_hosts=_excluded(conn, inst["id"]),
+    )  # fmt: skip
+    try:
+        offers = await adapter.list_offers(query)
+    except Exception:  # noqa: BLE001 - adapters may raise anything; retried next step
+        offers = []
+    offer: Offer | None = select_offer(
+        offers, query, blacklisted_hosts(conn, pool.provider, now)
+    )
+    if offer is None:
+        if now >= float(inst["state_since"]) + cfg.timeouts.offer_wait_s:
+            _fail_provisioning(conn, inst["id"], now, str(UnavailableReason.GPU_UNAVAILABLE))
+            return CreateOutcome.FAILED
+        return CreateOutcome.NO_OFFER
+    offer_json = json.dumps(
+        {"offer_id": offer.offer_id, "host_id": offer.host_id, "price_usd_h": offer.price_usd_h,
+         "disk_usd_h": offer.disk_usd_h},
+        sort_keys=True,
+    )  # fmt: skip
+    with tx(conn):  # the intent is in the DB before the call
+        cur = conn.execute(
+            "UPDATE instances SET offer_json=?, create_called_at=?, attempts=attempts+1,"
+            " gpu=? WHERE id=? AND state='PROVISIONING' AND create_called_at IS NULL",
+            (offer_json, now, offer.gpu, inst["id"]),
+        )
+        if cur.rowcount != 1:
+            return CreateOutcome.RETRY_LATER
+    spec = InstanceSpec(
+        pool=pool.name, offer_id=offer.offer_id, image=pool.image, disk_gb=pool.disk_gb,
+        max_price_usd_h=pool.max_price_usd_h, max_lifetime_s=cfg.timeouts.max_lifetime_s, env={},
+    )  # fmt: skip
+    coro = _do_create(conn, adapter, inst, spec, offer.host_id, cfg, now_fn)
+    if spawn is None:
+        return await coro
+    spawn(inst["id"], coro)
+    return CreateOutcome.SPAWNED
 
 
 async def create_or_adopt(
@@ -37,26 +232,89 @@ async def create_or_adopt(
     now: float,
     cfg: Config,
 ) -> CreateOutcome:
-    """S0: the intent is recorded first, then create is called outside any transaction."""
+    """Inline variant (tests, tools): record the intent, call create, adopt the answer."""
     assert_not_in_tx()
     with tx(conn):
         conn.execute(
             "UPDATE instances SET create_called_at=?, attempts=attempts+1 WHERE id=?",
             (now, inst["id"]),
         )
-    res = await adapter.create(spec, inst["label"])
-    state = set_provider_ref(conn, inst["id"], res.ref, res.host_id, res.price_usd_h, now)
-    if state != State.PROVISIONING:
-        await adapter.destroy(res.ref)
-        return CreateOutcome.FAILED
-    with tx(conn):
-        transition(conn, inst["id"], State.PROVISIONING, State.BOOTING, "E2", now, "controller",
-                   endpoint=res.endpoint)  # fmt: skip
-    return CreateOutcome.CREATED
+    return await _do_create(conn, adapter, inst, spec, "", cfg, lambda: now)
 
 
-def find_duplicates(owned: list[RemoteResource], inst: sqlite3.Row) -> list[RemoteResource]:
-    raise NotImplementedError("stream F (F2)")
+async def _adopt_by_label(
+    conn: sqlite3.Connection,
+    adapter: ProviderAdapter,
+    inst: sqlite3.Row,
+    now: float,
+) -> RemoteResource | None:
+    """Look the label up; adopt the oldest resource, destroy the other ones (duplicates)."""
+    owned = [r for r in await adapter.list_owned(inst["label"]) if r.label == inst["label"]]
+    owned = [r for r in owned if r.status not in (RemoteStatus.TERMINATED, RemoteStatus.EXITED)]
+    target, extras = split_duplicates(inst, owned, None)
+    if target is None:
+        return None
+    if extras:
+        await destroy_duplicates(conn, adapter, inst, extras, now)
+    if inst["provider_ref"] is not None and inst["provider_ref"] != target.ref:
+        record_incident(
+            conn, now, "ghost_ref", "high", ref=inst["id"],
+            dedup_key=f"ghost:{inst['provider_ref']}",
+            details={"ghost_ref": inst["provider_ref"], "adopted_ref": target.ref},
+        )  # fmt: skip
+    if not await adopt_ref_or_destroy(conn, adapter, inst["id"], target, now):
+        return None
+    return target
+
+
+async def _provisioning(
+    conn: sqlite3.Connection,
+    rt: PoolRuntime,
+    inst: sqlite3.Row,
+    now: float,
+    cfg: Config,
+    spawn: Spawn | None,
+    now_fn: Callable[[], float],
+) -> None:
+    adapter = rt.adapter
+    iid = inst["id"]
+    grace_end = (
+        float(inst["create_called_at"]) + cfg.timeouts.create_visibility_grace_s
+        if inst["create_called_at"] is not None
+        else now
+    )
+    if inst["provider_ref"] is not None:
+        res = await adapter.get(inst["provider_ref"])
+        if res is None or res.status in (RemoteStatus.TERMINATED, RemoteStatus.EXITED):
+            moved = await _adopt_by_label(conn, adapter, inst, now)  # ghost ref
+            if moved is None:
+                if now >= grace_end:
+                    machine.mark_lost(conn, iid, now, "resource_gone", cfg=cfg)
+                return
+            res = moved
+        if res.status == RemoteStatus.RUNNING:  # adopted after a restart: poll until RUNNING
+            with tx(conn):
+                transition(conn, iid, State.PROVISIONING, State.BOOTING, "E2", now, "controller",
+                           endpoint=res.endpoint)  # fmt: skip
+                delete_key(conn, _exclude_key(iid))
+        return
+    if inst["create_called_at"] is not None:  # unknown outcome or a restart during create
+        found = await _adopt_by_label(conn, adapter, inst, now)
+        if found is not None or now < grace_end:
+            return
+        if int(inst["attempts"]) >= cfg.retry.create_max_attempts:
+            _fail_provisioning(conn, iid, now, "create_unknown_max_attempts")
+            return
+        with tx(conn):  # retry with the same label
+            conn.execute(
+                "UPDATE instances SET create_called_at=NULL WHERE id=? AND provider_ref IS NULL",
+                (iid,),
+            )
+        fresh = conn.execute("SELECT * FROM instances WHERE id=?", (iid,)).fetchone()
+        if fresh is None or fresh["provider_ref"] is not None:
+            return
+        inst = fresh
+    await _start_create(conn, rt, inst, now, cfg, spawn, now_fn)
 
 
 async def provision_step(
@@ -66,39 +324,38 @@ async def provision_step(
     now: float,
     cfg: Config,
     secret: bytes,
+    *,
+    spawn: Spawn | None = None,
+    now_fn: Callable[[], float] | None = None,
 ) -> None:
-    """One step of PROVISIONING / BOOTING / LOADING_MODEL. At most one transition."""
+    """One step of PROVISIONING / BOOTING / LOADING_MODEL; at most one transition.
+
+    `spawn(instance_id, coro)` runs the create call in the background (the controller passes
+    it); without it the call is awaited inline. Timeouts (E3/E5/E7) are applied by
+    `timeouts.apply_timeouts`, liveness by `timeouts.check_alive`.
+    """
+    _ = secret  # labels are made at insert time; kept for the plan signature
     state = State(inst["state"])
-    pool = pool_rt.cfg
-    if state == State.PROVISIONING and inst["create_called_at"] is None:
-        query = OfferQuery(
-            gpu=pool.gpu, min_vram_gb=pool.vram_gb, max_price_usd_h=pool.max_price_usd_h,
-            exclude_hosts=frozenset(),
-        )  # fmt: skip
-        offer = select_offer(await pool_rt.adapter.list_offers(query), query, ())
-        if offer is None:
-            return  # stream F: offer_wait / gpu_unavailable handling
-        with tx(conn):
-            conn.execute(
-                "UPDATE instances SET offer_json=? WHERE id=?",
-                (json.dumps({"offer_id": offer.offer_id, "host_id": offer.host_id}), inst["id"]),
-            )
-        spec = InstanceSpec(
-            pool=pool.name, offer_id=offer.offer_id, image=pool.image, disk_gb=pool.disk_gb,
-            max_price_usd_h=pool.max_price_usd_h, max_lifetime_s=cfg.timeouts.max_lifetime_s,
-            env={},
-        )  # fmt: skip
-        await create_or_adopt(conn, pool_rt.adapter, inst, spec, now, cfg)
-    elif state == State.BOOTING:
-        assert inst["endpoint"] is not None
-        if await pool_rt.inference.ping(inst["endpoint"]):
-            with tx(conn):
-                transition(conn, inst["id"], State.BOOTING, State.LOADING_MODEL, "E4", now,
-                           "controller")  # fmt: skip
-    elif state == State.LOADING_MODEL:
-        assert inst["endpoint"] is not None
-        ep = inst["endpoint"]
-        if await pool_rt.inference.health(ep) and await pool_rt.inference.test_request(ep):
-            with tx(conn):
-                transition(conn, inst["id"], State.LOADING_MODEL, State.READY, "E6", now,
-                           "controller", ready_at=now)  # fmt: skip
+    clock_now = now_fn or (lambda: now)
+    try:
+        if state == State.PROVISIONING:
+            await _provisioning(conn, pool_rt, inst, now, cfg, spawn, clock_now)
+        elif state == State.BOOTING:
+            assert inst["endpoint"] is not None
+            if await pool_rt.inference.ping(inst["endpoint"]):
+                with tx(conn):
+                    transition(conn, inst["id"], State.BOOTING, State.LOADING_MODEL, "E4", now,
+                               "controller")  # fmt: skip
+        elif state == State.LOADING_MODEL:
+            assert inst["endpoint"] is not None
+            ep = inst["endpoint"]
+            if not await pool_rt.inference.health(ep):
+                return  # still loading; the 20 min timeout is E7 in apply_timeouts
+            if await pool_rt.inference.test_request(ep):
+                with tx(conn):
+                    transition(conn, inst["id"], State.LOADING_MODEL, State.READY, "E6", now,
+                               "controller", ready_at=now)  # fmt: skip
+            else:
+                timeouts.note_model_test_failure(conn, inst["id"], now, cfg)
+    except ProviderError:
+        return  # reads are retried by GuardedAdapter; still failing -> next step

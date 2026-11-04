@@ -1,0 +1,208 @@
+{
+ "header": {
+  "sim_sha256": "0d5eb6114c34c12cec8cd07936bc7aa5fec5e3857df3b35a69f6c5625766c71f",
+  "sim_path": "/var/www/projectVoiceBot/tools/bench/T-367-sim/sim.py",
+  "command": "uv run python tests/fixtures/sim/generate_sim_fixtures.py /var/www/projectVoiceBot/tools/bench/T-367-sim/sim.py",
+  "generated": "2026-11-04"
+ },
+ "trace": "S1",
+ "seed": 1,
+ "duration_s": 86400.0,
+ "params": {
+  "price_per_h": 0.36,
+  "startup_s": 300.0,
+  "gen_tps": 47.05882352941177,
+  "prefill_tps": 0.0
+ },
+ "strategy": {
+  "key": "batch_drain",
+  "name": "batch 5/30m drain",
+  "idle_s": 0,
+  "min_batch": 5,
+  "max_batch_wait_s": 1800.0,
+  "max_queue_wait_s": 2700.0,
+  "urgent_bypass": true
+ },
+ "requests": [
+  {
+   "t": 5734.193064152161,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 5951.687122040301,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 11092.904409764904,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 18241.11555692529,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 18585.67767157173,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 26965.848861834544,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 32514.50605595213,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 34393.781053616316,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36082.75783291528,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 39852.115450941565,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 41696.63997244746,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 44752.64858767454,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 48122.125019428786,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 48309.52510845116,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 53118.89448911076,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 57556.50131709735,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 66748.2367357933,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71266.42466731674,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 75105.6536451822,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 79915.2853257054,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 80662.97411865708,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 83172.57263185356,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  }
+ ],
+ "expected": {
+  "launches": 16,
+  "total_usd": 0.8540000000000002
+ }
+}

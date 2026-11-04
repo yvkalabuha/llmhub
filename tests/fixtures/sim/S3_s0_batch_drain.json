@@ -1,0 +1,672 @@
+{
+ "header": {
+  "sim_sha256": "0d5eb6114c34c12cec8cd07936bc7aa5fec5e3857df3b35a69f6c5625766c71f",
+  "sim_path": "/var/www/projectVoiceBot/tools/bench/T-367-sim/sim.py",
+  "command": "uv run python tests/fixtures/sim/generate_sim_fixtures.py /var/www/projectVoiceBot/tools/bench/T-367-sim/sim.py",
+  "generated": "2026-11-04"
+ },
+ "trace": "S3",
+ "seed": 0,
+ "duration_s": 86400.0,
+ "params": {
+  "price_per_h": 0.36,
+  "startup_s": 300.0,
+  "gen_tps": 47.05882352941177,
+  "prefill_tps": 0.0
+ },
+ "strategy": {
+  "key": "batch_drain",
+  "name": "batch 5/30m drain",
+  "idle_s": 0,
+  "min_batch": 5,
+  "max_batch_wait_s": 1800.0,
+  "max_queue_wait_s": 2700.0,
+  "urgent_bypass": true
+ },
+ "requests": [
+  {
+   "t": 3778.451287064671,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 3834.5676302855863,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 4235.346920142261,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 4255.612948705276,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 4442.233937221516,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 4562.43073464758,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 4805.686007206649,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 4808.238242814479,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 4999.241956861015,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 5360.956309642315,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 14473.300315598923,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 14765.421979321296,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 14809.793456172478,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 15224.515304934173,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 15230.904954547248,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 15277.456933684032,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 15279.904272891574,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 15599.157076028447,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 15685.46488045476,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 16153.721631680091,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 25241.92820770279,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 25517.127736041355,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 25948.310669099952,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 26043.290533795516,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 26457.580367237355,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 26660.663662759704,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 26700.311282012182,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 26798.421038402754,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 26902.06467950857,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 26969.55908075082,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36029.7696318096,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36167.14849324426,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36195.94028036229,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36288.47472157116,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36349.79521805957,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36523.828869562254,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36565.31174380711,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36986.57372902602,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 37404.08565540306,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 37537.28842632545,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 47216.73786374201,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 47325.66888992496,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 47328.85248420321,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 47375.01499931898,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 47624.76865544499,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 47672.96363616802,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 47914.97460659163,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 47985.47680236823,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 48364.98157542543,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 48411.60949764398,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 57621.49944825757,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 57734.98772390448,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 57857.22138292791,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 58104.698884845704,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 58125.741664106,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 58192.12250343108,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 58773.55898978041,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 59028.197349945185,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 59240.867581567756,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 59371.63636324771,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 68769.507980136,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 68926.3408553984,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 68995.51840740796,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 69025.3203303134,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 69066.70520326118,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 69261.19793977831,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 69306.3257869054,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 69538.61961028095,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 69777.715382358,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 69984.14638821242,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 79562.76721226385,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 79635.08387761314,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 79782.62869128103,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 79946.42884613673,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 80559.32138810093,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 80578.72203195714,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 80761.6052121328,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 80768.8129135837,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 80806.41087099712,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 80878.1826472645,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  }
+ ],
+ "expected": {
+  "launches": 8,
+  "total_usd": 1.5999999999999996
+ }
+}

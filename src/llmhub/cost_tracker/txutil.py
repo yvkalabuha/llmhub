@@ -1,21 +1,12 @@
-"""Join an open transaction or open a short one (same convention as lifecycle_manager)."""
+"""Thin aliases of lifecycle_manager.safety for the budget/cost modules (one safety API)."""
 
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Iterator
-from contextlib import contextmanager
 
-from llmhub.persistence.db import tx
+from llmhub.lifecycle_manager.safety import get_key, join_or_open
 
-
-@contextmanager
-def join_or_open(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    if conn.in_transaction:
-        yield conn
-    else:
-        with tx(conn):
-            yield conn
+__all__ = ["add_incident", "join_or_open", "state_get", "state_set"]
 
 
 def add_incident(
@@ -37,9 +28,7 @@ def add_incident(
     return cur.rowcount > 0
 
 
-def state_get(conn: sqlite3.Connection, key: str) -> str | None:
-    row = conn.execute("SELECT value FROM controller_state WHERE key=?", (key,)).fetchone()
-    return None if row is None else str(row["value"])
+state_get = get_key
 
 
 def state_set(conn: sqlite3.Connection, key: str, value: str, now: float) -> None:

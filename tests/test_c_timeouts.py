@@ -127,12 +127,13 @@ def test_mark_lost_uses_the_edge_of_the_state(
     assert not machine.mark_lost(conn, "a", T0 + 8, "again", cfg=CFG)  # ERROR: no second edge
 
 
-def test_mark_lost_busy_job_at_max_attempts_fails() -> None:
+def test_mark_lost_busy_job_at_max_attempts_falls_back() -> None:
     conn = make_conn()
     add_instance(conn, "a", "BUSY")
     add_job(conn, "j1", "running", instance_id="a", worker_id="w", attempts=2)
     machine.mark_lost(conn, "a", T0, "interrupted", cfg=CFG)
-    assert conn.execute("SELECT status FROM jobs").fetchone()[0] == "failed"
+    row = conn.execute("SELECT status, route FROM jobs").fetchone()
+    assert (row["status"], row["route"]) == ("queued", "local:fallback")  # queue.requeue (F)
 
 
 def test_error_to_stopping_e18() -> None:

@@ -15,7 +15,8 @@ from llmhub.budget_manager import accounts, reservations
 from llmhub.budget_manager.estimate import JobLoad, LaunchEstimate, get_speeds, work_seconds
 from llmhub.configuration.models import Config
 from llmhub.cost_tracker.ledger import session_cost, spent
-from llmhub.cost_tracker.txutil import add_incident, join_or_open, state_get
+from llmhub.cost_tracker.txutil import add_incident, join_or_open
+from llmhub.lifecycle_manager.safety import is_halted
 from llmhub.provider_adapters.base import UnavailableReason
 from llmhub.task_queue.models import Priority
 
@@ -120,10 +121,6 @@ def stage(conn: sqlite3.Connection, now: float, cfg: Config) -> Stage:
     if ratio + _EPS >= b.stage_economy:
         return Stage.ECONOMY
     return Stage.NORMAL
-
-
-def is_halted(conn: sqlite3.Connection) -> bool:
-    return state_get(conn, "halted") in ("1", "true")
 
 
 def _fail(reason: UnavailableReason, detail: str) -> Gate:

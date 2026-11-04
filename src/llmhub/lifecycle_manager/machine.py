@@ -171,15 +171,16 @@ def requeue_running_jobs(
     instance_id: str | None = None,
     not_worker: str | None = None,
     count_attempt: bool,
+    reason: str = "instance_lost",
 ) -> list[str]:
-    """Put `running` jobs back to `queued` (select by instance and/or foreign worker_id).
+    """Put `running` jobs back to the queue through `task_queue.queue.requeue` (one owner).
 
-    `mark_running` already did `attempts+1`. `count_attempt=False` undoes it and counts a
-    restart instead (a restart is not the job's fault). `count_attempt=True` keeps it; a job at
-    `max_attempts` becomes `failed` (`error_code=max_attempts`) and its implicit lease is closed.
-    Stream D's `queue.requeue` is the long-term owner of this logic (fallback_local instead of
-    failed); this is the lifecycle-side equivalent used by E15/E17 and recovery.
+    Select by instance and/or foreign worker_id. `count_attempt=False` (restart, kill) refunds
+    the attempt and counts a restart; `count_attempt=True` keeps it, and a job at
+    `max_attempts` goes to local fallback. Returns the ids put back to `queued` in the pool.
     """
+    from llmhub.task_queue import queue  # local import: queue -> leases -> safety
+
     where = ["status='running'"]
     params: list[Any] = []
     if instance_id is not None:
@@ -191,34 +192,15 @@ def requeue_running_jobs(
     ids: list[str] = []
     with join_or_open(conn):
         rows = conn.execute(
-            f"SELECT id, attempts, max_attempts FROM jobs WHERE {' AND '.join(where)} ORDER BY id",
-            params,
+            f"SELECT id FROM jobs WHERE {' AND '.join(where)} ORDER BY id", params
         ).fetchall()
         for r in rows:
-            if count_attempt and r["attempts"] >= r["max_attempts"]:
-                conn.execute(
-                    "UPDATE jobs SET status='failed', error_code='max_attempts', finished_at=?"
-                    " WHERE id=?",
-                    (now, r["id"]),
-                )
-                leases.close_for_job(conn, r["id"], now)
-                continue
-            if count_attempt:
-                conn.execute(_REQUEUE_SQL.format(attempts="attempts", restarts="restarts"),
-                             (r["id"],))  # fmt: skip
-            else:
-                conn.execute(
-                    _REQUEUE_SQL.format(attempts="max(attempts-1, 0)", restarts="restarts+1"),
-                    (r["id"],),
-                )
-            ids.append(str(r["id"]))
+            if not count_attempt:
+                conn.execute("UPDATE jobs SET restarts=restarts+1 WHERE id=?", (r["id"],))
+            out = queue.requeue(conn, r["id"], now, count_attempt=count_attempt, reason=reason)
+            if out == "queued":
+                ids.append(str(r["id"]))
     return ids
-
-
-_REQUEUE_SQL = (
-    "UPDATE jobs SET status='queued', instance_id=NULL, worker_id=NULL, started_at=NULL,"
-    " worker_heartbeat_at=NULL, attempts={attempts}, restarts={restarts} WHERE id=?"
-)
 
 
 def running_count(conn: sqlite3.Connection, instance_id: str) -> int:

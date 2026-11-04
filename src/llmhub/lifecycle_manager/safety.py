@@ -1,5 +1,6 @@
-"""Incidents, HALT, provider blocks and host blacklist: small DB helpers for the lifecycle.
+"""Incidents, HALT, provider blocks and host blacklist: the one safety API of the core.
 
+budget_manager.accounts and cost_tracker.txutil re-export these helpers (no second copy).
 All functions join the caller's transaction when one is open, or open their own. They only
 write rows; nothing here talks to a provider. `details` must never hold request text or secrets.
 """
@@ -78,22 +79,49 @@ def is_halted(conn: sqlite3.Connection) -> bool:
 
 
 def block_provider(conn: sqlite3.Connection, provider: str, reason: str, now: float) -> None:
-    """Block launches on a provider (no retries, no auto-resume); idempotent."""
+    """Block new launches on a provider: no retries, no auto top-up, no auto-resume.
+
+    Idempotent while blocked (the first reason is kept); a new block writes one
+    `provider_blocked` incident. Lifted only by `resume_provider` (admin).
+    """
     with join_or_open(conn):
-        conn.execute(
-            "INSERT INTO provider_accounts(provider, blocked_reason, blocked_at) VALUES (?,?,?)"
-            " ON CONFLICT(provider) DO UPDATE SET"
-            " blocked_reason=COALESCE(provider_accounts.blocked_reason, excluded.blocked_reason),"
-            " blocked_at=COALESCE(provider_accounts.blocked_at, excluded.blocked_at)",
-            (provider, reason, now),
+        conn.execute("INSERT OR IGNORE INTO provider_accounts(provider) VALUES (?)", (provider,))
+        cur = conn.execute(
+            "UPDATE provider_accounts SET blocked_reason=?, blocked_at=?"
+            " WHERE provider=? AND blocked_reason IS NULL",
+            (reason, now, provider),
         )
+        if cur.rowcount:
+            record_incident(
+                conn, now, "provider_blocked", "high", ref=provider,
+                dedup_key=f"provider_blocked:{provider}:{reason}:{int(now)}",
+                details={"reason": reason},
+            )  # fmt: skip
 
 
-def provider_blocked(conn: sqlite3.Connection, provider: str) -> str | None:
+def is_blocked(conn: sqlite3.Connection, provider: str) -> str | None:
     row = conn.execute(
         "SELECT blocked_reason FROM provider_accounts WHERE provider=?", (provider,)
     ).fetchone()
     return None if row is None else row["blocked_reason"]
+
+
+provider_blocked = is_blocked  # lifecycle-side name
+
+
+def resume_provider(conn: sqlite3.Connection, provider: str, now: float) -> None:
+    """Manual unblock only (admin). Balance growth or time never unblock by themselves."""
+    with join_or_open(conn):
+        conn.execute("INSERT OR IGNORE INTO provider_accounts(provider) VALUES (?)", (provider,))
+        conn.execute(
+            "UPDATE provider_accounts SET blocked_reason=NULL, blocked_at=NULL WHERE provider=?",
+            (provider,),
+        )
+        conn.execute(
+            "UPDATE incidents SET resolved_at=? WHERE kind='provider_blocked' AND ref=?"
+            " AND resolved_at IS NULL",
+            (now, provider),
+        )
 
 
 def blacklist_host(

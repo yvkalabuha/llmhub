@@ -1,0 +1,896 @@
+{
+ "header": {
+  "sim_sha256": "0d5eb6114c34c12cec8cd07936bc7aa5fec5e3857df3b35a69f6c5625766c71f",
+  "sim_path": "/var/www/projectVoiceBot/tools/bench/T-367-sim/sim.py",
+  "command": "uv run python tests/fixtures/sim/generate_sim_fixtures.py /var/www/projectVoiceBot/tools/bench/T-367-sim/sim.py",
+  "generated": "2026-11-04"
+ },
+ "trace": "S6",
+ "seed": 0,
+ "duration_s": 43200.0,
+ "params": {
+  "price_per_h": 0.36,
+  "startup_s": 300.0,
+  "gen_tps": 47.05882352941177,
+  "prefill_tps": 0.0
+ },
+ "strategy": {
+  "key": "batch_drain",
+  "name": "batch 5/30m drain",
+  "idle_s": 0,
+  "min_batch": 5,
+  "max_batch_wait_s": 1800.0,
+  "max_queue_wait_s": 2700.0,
+  "urgent_bypass": true
+ },
+ "requests": [
+  {
+   "t": 1501.695164792695,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 1829.0055918408764,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 1838.841912752069,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 1849.7619230757819,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 1891.9148021304754,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 1907.094058066475,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 1911.8788431509672,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 2703.931348284342,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 4121.80637507519,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 4698.572830504671,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 4886.501788549438,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 5670.155922519613,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 6805.8450228551865,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 7793.585166434961,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 7968.01033153232,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 8182.913384526857,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 9019.869933216973,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 9047.56214216745,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 9056.182931699355,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 9058.34364778517,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 9067.356628668236,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 9070.900317465988,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 9113.882603303064,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 9151.28617417834,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 9308.486839341238,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 9396.199748394825,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 9735.47108413447,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 9750.48036187329,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 11482.517034260569,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 11792.047171048649,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 13154.956822842929,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 13869.814810724918,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 14064.288511290279,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 14375.117230441805,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 14721.489489231979,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 15078.462571090791,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 15329.786859170803,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 15688.715227887544,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 15925.723107463242,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 16205.716217497433,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 16247.595564293206,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 16303.245109500012,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 16310.256791732694,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 16312.704079356085,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 16318.287315039242,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 16795.20053953923,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 17332.174948106407,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 18147.426443812317,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 18826.523035161412,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 19355.342054301076,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 19763.790712425292,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 20658.813262492997,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 20971.893217475194,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 21523.473719584,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 21738.765834753383,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 22120.66795607175,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 22203.767639763348,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 22416.80708395411,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 22775.836866545334,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 23306.46109164349,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 23381.295687078476,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 23411.80977351166,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 23415.99147458273,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 23424.125501903956,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 23432.122749380127,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 23441.23308616876,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 23505.903924233393,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 26511.22748019881,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 26522.04191823885,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 26660.82333795707,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 27610.76193644341,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 27680.920688063306,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 27991.800805656476,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 29411.261672544766,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 29970.856825063638,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 30619.053682525482,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 30625.117548606202,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 30640.879908891606,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 30675.81437502983,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 30687.191333958835,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 30691.94562680715,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 31173.99101753426,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 31594.48641368883,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 32010.878186552192,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 32217.6695755286,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 32288.51366876018,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 34126.516915776134,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 34542.61430523803,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 35027.608429862965,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 35509.914337896844,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 35657.78901487105,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 36019.35267860109,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 36403.464737016686,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 36714.76815887872,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 37820.22424139266,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 37825.94253057663,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 37858.642431449436,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 37870.92941152246,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 37886.20013167692,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 37910.86630615536,
+   "prio": 2,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": 5400,
+   "agent": "batch"
+  },
+  {
+   "t": 38019.64432589727,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 38605.48788274203,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 38808.048250497704,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 39450.763724417295,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 39493.18797659708,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  },
+  {
+   "t": 40655.13144741973,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 41921.63494221147,
+   "prio": 1,
+   "in": 0,
+   "out": 3000,
+   "max_wait_s": 900,
+   "agent": "normal"
+  },
+  {
+   "t": 42720.22368291639,
+   "prio": 0,
+   "in": 0,
+   "out": 1000,
+   "max_wait_s": null,
+   "agent": "interactive"
+  }
+ ],
+ "expected": {
+  "launches": 28,
+  "total_usd": 1.8090000000000002
+ }
+}

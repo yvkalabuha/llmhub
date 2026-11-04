@@ -1,0 +1,1016 @@
+{
+ "header": {
+  "sim_sha256": "0d5eb6114c34c12cec8cd07936bc7aa5fec5e3857df3b35a69f6c5625766c71f",
+  "sim_path": "/var/www/projectVoiceBot/tools/bench/T-367-sim/sim.py",
+  "command": "uv run python tests/fixtures/sim/generate_sim_fixtures.py /var/www/projectVoiceBot/tools/bench/T-367-sim/sim.py",
+  "generated": "2026-11-04"
+ },
+ "trace": "S5",
+ "seed": 2,
+ "duration_s": 86400.0,
+ "params": {
+  "price_per_h": 0.36,
+  "startup_s": 300.0,
+  "gen_tps": 47.05882352941177,
+  "prefill_tps": 0.0
+ },
+ "strategy": {
+  "key": "idle5m",
+  "name": "idle 5m",
+  "idle_s": 300.0,
+  "min_batch": 1,
+  "max_batch_wait_s": 0.0,
+  "max_queue_wait_s": null,
+  "urgent_bypass": true
+ },
+ "requests": [
+  {
+   "t": 32518.303675644933,
+   "prio": 1,
+   "in": 0,
+   "out": 2329,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 32574.804685116585,
+   "prio": 1,
+   "in": 0,
+   "out": 3650,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 32669.97492085631,
+   "prio": 1,
+   "in": 0,
+   "out": 4343,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 32915.74621562963,
+   "prio": 1,
+   "in": 0,
+   "out": 2982,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 32945.42895473609,
+   "prio": 1,
+   "in": 0,
+   "out": 3263,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 33131.54657071868,
+   "prio": 1,
+   "in": 0,
+   "out": 3752,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 33245.705251998246,
+   "prio": 1,
+   "in": 0,
+   "out": 3199,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 33338.901558861304,
+   "prio": 1,
+   "in": 0,
+   "out": 1090,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 33383.57544756944,
+   "prio": 1,
+   "in": 0,
+   "out": 1505,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 33635.734832249065,
+   "prio": 1,
+   "in": 0,
+   "out": 2770,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 33720.303968786764,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 33735.44517538225,
+   "prio": 1,
+   "in": 0,
+   "out": 5950,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 33783.97591488168,
+   "prio": 1,
+   "in": 0,
+   "out": 4557,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36213.507137384666,
+   "prio": 1,
+   "in": 0,
+   "out": 1176,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36263.64265402919,
+   "prio": 1,
+   "in": 0,
+   "out": 3696,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36322.96542288519,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 36384.03083252822,
+   "prio": 1,
+   "in": 0,
+   "out": 1011,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 39752.80340594382,
+   "prio": 1,
+   "in": 0,
+   "out": 2721,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 39910.977585122564,
+   "prio": 1,
+   "in": 0,
+   "out": 3813,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 39911.902452284216,
+   "prio": 1,
+   "in": 0,
+   "out": 4258,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 40229.190042084585,
+   "prio": 1,
+   "in": 0,
+   "out": 1208,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 40428.2183384235,
+   "prio": 1,
+   "in": 0,
+   "out": 1319,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 40473.2136085942,
+   "prio": 1,
+   "in": 0,
+   "out": 7011,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 40732.224725370754,
+   "prio": 1,
+   "in": 0,
+   "out": 3793,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 40734.69333014801,
+   "prio": 1,
+   "in": 0,
+   "out": 6449,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 43297.62362154605,
+   "prio": 1,
+   "in": 0,
+   "out": 2326,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 43339.99434005469,
+   "prio": 1,
+   "in": 0,
+   "out": 2325,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 44068.60254197512,
+   "prio": 1,
+   "in": 0,
+   "out": 3036,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 44133.12430883208,
+   "prio": 1,
+   "in": 0,
+   "out": 2880,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 44182.559710270645,
+   "prio": 1,
+   "in": 0,
+   "out": 1541,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 48984.728181772545,
+   "prio": 1,
+   "in": 0,
+   "out": 5754,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 49061.90611381824,
+   "prio": 1,
+   "in": 0,
+   "out": 546,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 49238.651194687336,
+   "prio": 1,
+   "in": 0,
+   "out": 986,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 49340.073594797395,
+   "prio": 1,
+   "in": 0,
+   "out": 4360,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 49352.91950351556,
+   "prio": 1,
+   "in": 0,
+   "out": 3072,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 49444.45203641967,
+   "prio": 1,
+   "in": 0,
+   "out": 3060,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 49478.2541962878,
+   "prio": 1,
+   "in": 0,
+   "out": 2724,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 49547.369390463085,
+   "prio": 1,
+   "in": 0,
+   "out": 4501,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 49590.311863503746,
+   "prio": 1,
+   "in": 0,
+   "out": 2224,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 49641.731020938285,
+   "prio": 1,
+   "in": 0,
+   "out": 3454,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 49722.9127998996,
+   "prio": 1,
+   "in": 0,
+   "out": 1907,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 49809.67445408708,
+   "prio": 1,
+   "in": 0,
+   "out": 3486,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 49907.49790871981,
+   "prio": 1,
+   "in": 0,
+   "out": 3940,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 50063.42208422448,
+   "prio": 1,
+   "in": 0,
+   "out": 2226,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 50086.51282392791,
+   "prio": 1,
+   "in": 0,
+   "out": 2036,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 50093.83785600091,
+   "prio": 1,
+   "in": 0,
+   "out": 1578,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 54636.44477700002,
+   "prio": 1,
+   "in": 0,
+   "out": 5048,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 55080.51440808375,
+   "prio": 1,
+   "in": 0,
+   "out": 2164,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 55163.328979341655,
+   "prio": 1,
+   "in": 0,
+   "out": 1764,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 58972.68002986378,
+   "prio": 1,
+   "in": 0,
+   "out": 1915,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 59243.90839542536,
+   "prio": 1,
+   "in": 0,
+   "out": 2878,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 59268.381051078286,
+   "prio": 1,
+   "in": 0,
+   "out": 4793,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 59431.766096974396,
+   "prio": 1,
+   "in": 0,
+   "out": 7480,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 63203.99258340335,
+   "prio": 1,
+   "in": 0,
+   "out": 2190,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 63306.6173128503,
+   "prio": 1,
+   "in": 0,
+   "out": 935,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 63947.77728138735,
+   "prio": 1,
+   "in": 0,
+   "out": 5268,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 64025.62772570628,
+   "prio": 1,
+   "in": 0,
+   "out": 5952,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 64075.873620033504,
+   "prio": 1,
+   "in": 0,
+   "out": 1181,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 64132.01243595516,
+   "prio": 1,
+   "in": 0,
+   "out": 5602,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 64178.9794402652,
+   "prio": 1,
+   "in": 0,
+   "out": 3863,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 64195.916300517194,
+   "prio": 1,
+   "in": 0,
+   "out": 1571,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 64617.02413069479,
+   "prio": 1,
+   "in": 0,
+   "out": 5997,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 64970.70841363908,
+   "prio": 1,
+   "in": 0,
+   "out": 5344,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 65046.37365806665,
+   "prio": 1,
+   "in": 0,
+   "out": 2398,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 68425.73976758448,
+   "prio": 1,
+   "in": 0,
+   "out": 4548,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 68445.87927126682,
+   "prio": 1,
+   "in": 0,
+   "out": 3441,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 69855.92498836982,
+   "prio": 1,
+   "in": 0,
+   "out": 1082,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 69861.53887796415,
+   "prio": 1,
+   "in": 0,
+   "out": 4978,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 69943.03223007043,
+   "prio": 1,
+   "in": 0,
+   "out": 3258,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 69950.52820344758,
+   "prio": 1,
+   "in": 0,
+   "out": 1070,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 70209.33741951935,
+   "prio": 1,
+   "in": 0,
+   "out": 1836,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 70235.90399736953,
+   "prio": 1,
+   "in": 0,
+   "out": 4663,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 70366.03726094605,
+   "prio": 1,
+   "in": 0,
+   "out": 3986,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 70432.25455336062,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 70707.46292675119,
+   "prio": 1,
+   "in": 0,
+   "out": 2030,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 70725.6535868163,
+   "prio": 1,
+   "in": 0,
+   "out": 4453,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 70933.77445066457,
+   "prio": 1,
+   "in": 0,
+   "out": 2068,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71069.9049358747,
+   "prio": 1,
+   "in": 0,
+   "out": 1541,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71265.1192472877,
+   "prio": 1,
+   "in": 0,
+   "out": 2586,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71349.9623136308,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71376.05144389653,
+   "prio": 1,
+   "in": 0,
+   "out": 7957,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71425.88303261113,
+   "prio": 1,
+   "in": 0,
+   "out": 1483,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71428.51415113114,
+   "prio": 1,
+   "in": 0,
+   "out": 2379,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71434.43829196031,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71544.07894856967,
+   "prio": 1,
+   "in": 0,
+   "out": 5826,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71546.87665689384,
+   "prio": 1,
+   "in": 0,
+   "out": 5791,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71600.5487527217,
+   "prio": 1,
+   "in": 0,
+   "out": 2558,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71605.55750608182,
+   "prio": 1,
+   "in": 0,
+   "out": 2875,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71716.57689357441,
+   "prio": 1,
+   "in": 0,
+   "out": 4883,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71835.98883621873,
+   "prio": 1,
+   "in": 0,
+   "out": 1243,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71856.22438249238,
+   "prio": 1,
+   "in": 0,
+   "out": 1358,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 71867.90171099613,
+   "prio": 1,
+   "in": 0,
+   "out": 3432,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 75979.63145552589,
+   "prio": 1,
+   "in": 0,
+   "out": 3976,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 76042.42885577842,
+   "prio": 1,
+   "in": 0,
+   "out": 2952,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 76216.44576277214,
+   "prio": 1,
+   "in": 0,
+   "out": 1501,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 76220.10876539917,
+   "prio": 1,
+   "in": 0,
+   "out": 1899,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 76360.18542462449,
+   "prio": 1,
+   "in": 0,
+   "out": 3397,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 77389.8029815569,
+   "prio": 1,
+   "in": 0,
+   "out": 4204,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 77405.81443067401,
+   "prio": 1,
+   "in": 0,
+   "out": 3747,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 77574.04394529626,
+   "prio": 1,
+   "in": 0,
+   "out": 3070,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 77644.71629620552,
+   "prio": 1,
+   "in": 0,
+   "out": 1950,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 77713.02429968375,
+   "prio": 1,
+   "in": 0,
+   "out": 3551,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 77807.5119202123,
+   "prio": 1,
+   "in": 0,
+   "out": 1667,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 77843.75543155205,
+   "prio": 1,
+   "in": 0,
+   "out": 3344,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 77976.72145062729,
+   "prio": 1,
+   "in": 0,
+   "out": 7286,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 77991.45645864154,
+   "prio": 1,
+   "in": 0,
+   "out": 2212,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 78050.640360693,
+   "prio": 1,
+   "in": 0,
+   "out": 4499,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 78331.36634828088,
+   "prio": 1,
+   "in": 0,
+   "out": 3376,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 78339.30731769944,
+   "prio": 1,
+   "in": 0,
+   "out": 1507,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 78346.45018095232,
+   "prio": 1,
+   "in": 0,
+   "out": 3244,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 78442.46106842792,
+   "prio": 1,
+   "in": 0,
+   "out": 1595,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 78637.4992764747,
+   "prio": 1,
+   "in": 0,
+   "out": 4455,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 78678.1259638963,
+   "prio": 1,
+   "in": 0,
+   "out": 3594,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 78755.95269518855,
+   "prio": 1,
+   "in": 0,
+   "out": 725,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 78856.23316870868,
+   "prio": 1,
+   "in": 0,
+   "out": 6694,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 78974.35432079638,
+   "prio": 1,
+   "in": 0,
+   "out": 1972,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 79119.66143463674,
+   "prio": 1,
+   "in": 0,
+   "out": 8000,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 79382.25836372585,
+   "prio": 1,
+   "in": 0,
+   "out": 5170,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 80880.99492109125,
+   "prio": 1,
+   "in": 0,
+   "out": 2356,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 80921.75664424211,
+   "prio": 1,
+   "in": 0,
+   "out": 4185,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 80952.72085332964,
+   "prio": 1,
+   "in": 0,
+   "out": 5113,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 80962.26210742805,
+   "prio": 1,
+   "in": 0,
+   "out": 3740,
+   "max_wait_s": null,
+   "agent": ""
+  },
+  {
+   "t": 81215.9159505011,
+   "prio": 1,
+   "in": 0,
+   "out": 2846,
+   "max_wait_s": null,
+   "agent": ""
+  }
+ ],
+ "expected": {
+  "launches": 15,
+  "total_usd": 1.9330729654592045
+ }
+}

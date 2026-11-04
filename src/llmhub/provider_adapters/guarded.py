@@ -14,8 +14,8 @@ import asyncio
 import contextlib
 import json
 import sqlite3
-from collections.abc import Awaitable, Callable
-from typing import Literal
+from collections.abc import Awaitable, Callable, Mapping
+from typing import Any, Literal
 
 from llmhub.clock import Clock
 from llmhub.configuration.models import RetryConfig
@@ -49,19 +49,28 @@ class CircuitBreaker:
         self.clock = clock
         self.cfg = cfg
         self._probe_inflight = False
-        with tx(conn):
-            conn.execute(
-                "INSERT OR IGNORE INTO provider_accounts(provider) VALUES (?)", (provider,)
-            )
+        self._ensure_row()
 
-    def _row(self) -> sqlite3.Row:
+    def _ensure_row(self) -> None:
+        try:
+            with tx(self.conn):
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO provider_accounts(provider) VALUES (?)",
+                    (self.provider,),
+                )
+        except Busy:
+            pass  # created on a later call; a missing row reads as "closed"
+
+    def _row(self) -> Mapping[str, Any]:
         row = self.conn.execute(
             "SELECT circuit_state, circuit_opened_at, error_ts_json FROM provider_accounts"
             " WHERE provider=?",
             (self.provider,),
         ).fetchone()
-        assert isinstance(row, sqlite3.Row)
-        return row
+        if row is None:
+            self._ensure_row()
+            return {"circuit_state": "closed", "circuit_opened_at": None, "error_ts_json": "[]"}
+        return row  # type: ignore[no-any-return]
 
     @property
     def state(self) -> str:
@@ -142,6 +151,11 @@ class GuardedAdapter:
         self.actor = actor
         self.name = inner.name
         self.capabilities: Capability = inner.capabilities
+
+    @property
+    def list_staleness_s(self) -> float:
+        """Forward the optional stale-list window of the inner adapter (teardown reads it)."""
+        return float(getattr(self.inner, "list_staleness_s", 0.0) or 0.0)
 
     # --- machinery -------------------------------------------------------
     async def _with_timeout[T](self, make: Callable[[], Awaitable[T]]) -> T:
