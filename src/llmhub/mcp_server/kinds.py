@@ -127,6 +127,7 @@ def _read_user_file(path: Path) -> str:
         if st.st_uid != os.getuid() or st.st_mode & 0o022:
             raise KindsError(
                 "LLMHUB_MCP_KINDS: must be owned by the current user and not group/other-writable"
+                " (chmod 644)"
             )
         with os.fdopen(fd, "rb", closefd=False) as fh:
             raw = fh.read(1 << 20)

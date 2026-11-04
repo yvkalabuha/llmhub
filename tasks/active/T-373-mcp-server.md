@@ -165,3 +165,96 @@
 - `uv run pytest -q -p no:cacheprovider -m "not slow and not docker"` → 2869 passed, 110 deselected (93 с)
 - `uv run pytest -q -p no:cacheprovider` (полный, slow + docker) → 2978 passed, 1 skipped (321 с)
 - 2026-11-04: implementer — раунд исправлений 1 выполнен, статус review (ждёт повторного ревью).
+
+## Ревью (цикл 3: повторное)
+> TL;DR: все находки циклов 1–2 (SEC-1..3, low, C2-F1..F7) закрыты по существу, регрессий нет; песочница в порядке (kill + reap, нет утечек fd/зомби, env чистый, `-I` устойчив к враждебному cwd/sys.path, ~50 мс на вызов). Новые: **R3-3 major** — регэксп снятия ```` ``` ````-обёртки квадратичен и выполняется в родителе (остаток SEC-1, цикл событий стоит); R3-1 minor (симлинк scratch чужого владельца), R3-2 minor (срок запроса не жёсткий при «капающем» ответе), 2 low. Вердикт: **доработка** (R3-3; R3-1, R3-2 — в том же раунде, патчи проверены).
+
+Коммит 42c8c56, ревьюер; `src/` не менялся. Тесты: `tests/test_review_t373_r3_recheck.py` (15: 12 passed, 3 `xfail(strict=True)` — R3-1, R3-2, R3-3; снять маркер при исправлении). Патчи ниже прогнаны на копии `src/` (`PYTHONPATH=<копия>`): `--runxfail` по r3 + `test_m_*` + `test_review_t373_*` → 368 passed.
+
+Проверка находок прошлых циклов:
+- SEC-1 — закрыт для `regex`/`no-regex`/`json-schema` с `pattern`/`patternProperties` (обход дерева консервативен: свойство с именем `pattern` тоже уводит в песочницу; `format` не проверяется — FormatChecker не включён). Песочница проверена: таймаут → `kill` + `wait`, внуков нет (ребёнок ничего не порождает); 30 обычных + 5 убитых вызовов — число fd не растёт, дочерних процессов не остаётся; отмена внешней задачи тоже убивает и снимает ребёнка; реальный `/proc/<pid>/environ` ребёнка — без `LLMHUB_*`/`PYTHON*`; подложенные `json.py`/`re.py`/`llmhub/…` в cwd, `sys.path` и `PYTHONPATH` не импортируются (`-I` + фильтр env); текст идёт JSON-строкой через stdin (не argv) — 3 M кириллических символов (~18 МБ после экранирования) проходят за ~0,3 с без дедлока; ребёнок только вычисляет и пишет одну строку в свой stdout (stderr → DEVNULL), внешние `$ref` отклоняются до отправки, т. е. сети/файлов у ребёнка нет; `SIGALRM` = `ceil(t)+1` > таймаута родителя (родитель убивает первым, сирота умирает сам). Стоимость ~50 мс на regex-проверку, последовательно в общем бюджете 5 с — приемлемо. **Но** см. R3-3: в родителе остался квадратичный регэксп.
+- SEC-2 — закрыт (lstat, владелец, 0700). См. R3-1 про симлинк.
+- SEC-3 — закрыт (лексическая и `realpath`-проверка, пропуск `/` и корней на псевдо-ФС).
+- low: причина json-schema (обрезка 40/200), kinds-файл (владелец, `& 0o022`, fstat по fd), `.llmhub-mcp-*.tmp` — закрыты. Очистка удаляет только свои: имя строго `^\.llmhub-mcp-[0-9a-f]{16}\.tmp$`, `lstat` (симлинк с подходящим именем не трогается, цель снаружи цела), только обычный файл, `uid` = наш, старше 1 ч, только верхний уровень scratch — тесты `test_stale_cleanup_*`. Временные файлы рядом с `output_file` вне scratch не чистятся — допустимо.
+- C2-F1 (`_after_submit` для `ask`/`result`, сброс в scratch), C2-F2 (локальные `$ref`/якоря, `schema_outcome` не бросает), C2-F3, C2-F5, C2-F6, C2-F7 — закрыты, тесты зелёные.
+- C2-F4 — арифметика верна: submit ≤ `max(wait_s,5)`; опрос до `until = start + wait_s`, срок запроса опроса `max(until, now) + 5` (при `wait_s=0` и долгом submit — `now + 5`); `/result` ≤ 10 с (бюджет и срок); проверки ≤ `check_timeout_s` ⇒ `max(wait_s,5) + 15 + check` = `+20` с при умолчаниях, docs §8 и описание инструмента согласованы. Переписанный тест обоснован: при 25 с на запрос `completed` виден лишь опросу, начатому ≥ 64 с, затем `/result` ещё 25 с ⇒ `ok` не раньше 114 с > нового предела 110 с, т. е. `ok` недостижим именно при новом пределе (формулировка в docstring «ни при каком ограниченном расписании» неточна: при старом пределе 120 с такое расписание есть, но требует знать момент готовности). Ослабление до `pending` + `task_id` + ≤ 110 с корректно; `SlowHub` теперь соблюдает `read`-таймаут, а `test_call_with_fast_requests_still_ok` держит `ok`-путь. Остаток — R3-2.
+
+Новые находки:
+- **R3-3 major** — `src/llmhub/mcp_server/sandbox.py:26,32-34` `_FENCE`/`unfence`: `^\s*```[A-Za-z0-9_-]*\s*\n(.*?)\n?```\s*$` (DOTALL) квадратичен на ```` ``` ```` + `"\n"*N` (`\s*\n` × ленивый `.*?`): N = 10 000 → 0,7 с, 20 000 → 2,9 с, 40 000 → 11,9 с. Вызывается в **родителе**: `load_json` ← `schema_outcome` (json-schema без `pattern` — в потоке, `extract_json` всегда со схемой) и `_count_items` (`item-count`, `checks.py:155`). `re` держит GIL ⇒ `wait_for` не срабатывает, stdio-сервер стоит (тот же класс, что SEC-1). Текст — ответ модели (промпт-инъекция во входе); размер ограничен `max_tokens` (верхнего предела у параметра нет, `server.py:128`). Тест `test_fence_unwrapping_does_not_freeze_the_loop` (xfail: «checks took 2.9 s with a 0.5 s budget»). Патч — линейный `unfence` без регэкспа (`test_unfence_semantics_kept` фиксирует поведение):
+  ```python
+  _TAG = re.compile(r"[A-Za-z0-9_-]*")
+
+  def unfence(text: str) -> str:
+      """Strip one ```lang ... ``` wrapper; linear (no backtracking regex on model text)."""
+      s = text.strip()
+      nl = s.find("\n")
+      if len(s) < 7 or nl < 0 or not s.startswith("```") or not s.endswith("```"):
+          return text
+      if _TAG.fullmatch(s[3:nl].strip()) is None:
+          return text
+      body = s[nl + 1 : -3]
+      return body[:-1] if body.endswith("\n") else body
+  ```
+  (и удалить `_FENCE`). Желательно также тест-страж «в родителе нет `re.*` по тексту ответа, кроме `_TAG` по первой строке» рядом с `test_checks_module_has_no_inline_regex_search`.
+- **R3-1 minor** — `src/llmhub/mcp_server/paths.py:69-76,84`: scratch разрешается `realpath` (он не соблюдает `fs.protected_symlinks`), затем `lstat`/`chmod` применяются к цели. Если `LLMHUB_MCP_SCRATCH` указывает в общий каталог (`/tmp/x`), другой пользователь заранее кладёт `x → /home/me/site` (цель наша): сервер без предупреждения делает `chmod 0700` чужой по смыслу цели и **добавляет её в разрешённые корни**. По умолчанию scratch в `~/.local/state/…` — не эксплуатируется; свой симлинк на свой каталог (тест `test_scratch_symlink_uses_checked_target`) остаётся допустимым. Тест `test_scratch_symlink_not_owned_by_user_is_refused` (xfail). Патч — все симлинки пути scratch должны принадлежать нам или root, иначе scratch отключён (warning, не корень, `scratch_unavailable`):
+  ```python
+  def _links_trusted(path: str) -> bool:
+      cur = os.sep
+      for part in Path(path).parts[1:]:
+          cur = os.path.join(cur, part)
+          try:
+              st = os.lstat(cur)
+          except FileNotFoundError:
+              return True
+          except OSError:
+              return False
+          if stat.S_ISLNK(st.st_mode):
+              if st.st_uid not in (0, os.getuid()):
+                  return False
+              cur = os.path.realpath(cur)
+      return True
+  ```
+  в `Roots.build`: `trusted = _links_trusted(str(scratch_abs))`; если нет — warning, `scratch_real = scratch_abs`, `_make_private_dir` не вызывать (или поднять `OSError(EPERM)`), и `if trusted and not forbidden_root(scratch_abs): given.append(scratch_abs)`. Желательно также warning, когда `chmod 0700` реально меняет режим существующего каталога (пользователь узнаёт, что его каталог закрыт).
+- **R3-2 minor** — `src/llmhub/mcp_server/client.py:156-163`: срок запроса передаётся как `timeout=` httpx — это предел **каждой фазы** (connect/write/каждого read), а не всего запроса; ответ, приходящий по байту раз в 0,1 с, при сроке 1 с длится ~7 с (замер). Предел вызова `max(wait_s,5)+20` из §8 не жёсткий при медленном/зависшем прокси или канале VPN. Тест `test_request_deadline_is_a_hard_wall_clock_bound` (xfail: «DID NOT RAISE»). Патч:
+  ```python
+  try:
+      async with asyncio.timeout(timeout if deadline is not None else None):
+          resp = await self._http.request(method, path, json=json_body,
+                                          headers=all_headers, timeout=timeout)
+  except (httpx.TimeoutException, TimeoutError) as exc:
+  ```
+  (остальная ветка без изменений; тесты на ручных часах не затрагиваются — все 368 зелёные).
+- low — `src/llmhub/mcp_server/kinds.py:127` + `docs/integration.md` (таблица env): при `umask 002` (здесь так и есть) YAML создаётся `664` и отклоняется — сервер не стартует (exit 2, сообщение «must be owned by the current user and not group/other-writable»). Правило приемлемо (как у ключа; тест `test_kinds_file_created_under_umask_002_is_refused_with_clear_message`: 664 — отказ, 600/640/644/444 — ок). Поправить текст: в docs вместо «напр. `644`» — «после создания `chmod 644` (при `umask 002` файл получается `664` и отклоняется)», и в сообщение ошибки добавить `(chmod 644)`.
+- low — `src/llmhub/mcp_server/checks.py:276-292`: проверки без regex идут в `to_thread`; поток по таймауту не останавливается (jsonschema `uniqueItems` на массиве неупорядочиваемых объектов — O(n²) в чистом Python). Цикл не замерзает (GIL переключается), только CPU до конца; плюс родитель всё равно шлёт ребёнку весь текст > 200 000 символов, который ребёнок сразу отклонит (`regex_outcome`) — дешёвая проверка длины в `run_checks_async` до spawn сэкономит ~50 мс и копию. Не блокирует.
+- info — `_child_env` пропускает ребёнку прочие переменные (`OPENAI_API_KEY` и т. п., если есть у сервера); ребёнок не исполняет чужой код и наружу не пишет — риск нулевой, но минимальное окружение (`{"PATH": …, "LANG": …}`) было бы строже.
+
+Команды и результаты (цикл 3):
+- `uv run ruff check src tests scripts` → All checks passed!
+- `uv run pyright` → 0 errors, 0 warnings, 0 informations
+- `uv run pytest -q -p no:cacheprovider tests/test_review_t373_r3_recheck.py -rxX` → 12 passed, 3 xfailed; `--runxfail`: R3-1 `assert 448 == 493` (цель стала 0700), R3-2 `DID NOT RAISE HubError`, R3-3 `checks took 2.9 s with a 0.5 s budget`.
+- С патчами на копии `src/`: `PYTHONPATH=<копия>/src uv run pytest --runxfail tests/test_review_t373_r3_recheck.py tests/test_m_*.py tests/test_review_t373_*.py` → 368 passed.
+- `uv run pytest -q -p no:cacheprovider -m "not slow and not docker"` → 2880 passed, 110 deselected, 2 xfailed (113 с; до добавления теста R3-3).
+- `uv run pytest -q -p no:cacheprovider` (полный, slow + docker) → **2990 passed, 1 skipped, 3 xfailed** (3 — R3-1..3 этого цикла), 337 с; регрессий нет.
+
+Вердикт цикла 3: **доработка** — R3-3 (major, остаток SEC-1) исправить; R3-1 и R3-2 (minor) — желательно в том же раунде (патчи готовы и проверены), low — по желанию. После раунда 2 — снять 3 `xfail` в `tests/test_review_t373_r3_recheck.py`. Это третий цикл ревью: по CLAUDE.md (≤ 3 раундов) после раунда исправлений 2 — короткая проверка R3-* или вынос нерешённого заказчику. Статус не менял.
+
+## Исправления (раунд 2)
+> TL;DR: закрыты R3-3 (линейный `unfence` без регэкспа), R3-1 (`_links_trusted`: каждый симлинк пути scratch — наш или root, иначе scratch отключён), R3-2 (жёсткий срок всего запроса через `asyncio.timeout`) и оба low + info. `xfail` в `tests/test_review_t373_r3_recheck.py` сняты. Патч ревьюера применён с доработками (ниже). Статус — review.
+
+Изменённые файлы:
+- `src/llmhub/mcp_server/sandbox.py` — R3-3: `_FENCE` удалён, `unfence` — линейный проход без `re` (теги из `frozenset`, `str.isspace`, `rfind`). В отличие от патча ревьюера поведение совпадает с прежним регэкспом **точно** (патч принимал ```` ``` json ```` с пробелом перед тегом и не убирал пустые строки перед телом); эквивалентность закреплена параметризованным тестом против старого регэкспа (19 случаев). low: `run_isolated` отклоняет regex-проверку текста > `MAX_REGEX_TEXT` до запуска ребёнка; info: `_child_env` — минимальное окружение `PATH` (+ `LANG`/`LC_ALL`/`LC_CTYPE`, если заданы).
+- `src/llmhub/mcp_server/paths.py` — R3-1: `_links_trusted` в отличие от патча ревьюера проходит и симлинки **внутри целей** симлинков (свой `a → shared/b`, чужой `shared/b → site` — патч проверял только `a`, а `realpath` шёл дальше), обрабатывает `..` и петли (предел 40 → недоверие). При недоверии: warning, `_make_private_dir` не вызывается, scratch не корень, `scratch_unavailable`. Плюс warning, когда `chmod 0700` реально ужесточает режим существующего каталога.
+- `src/llmhub/mcp_server/client.py` — R3-2: `asyncio.timeout(timeout)` вокруг `httpx.request` **всегда** (а не только при `deadline`, как в патче): `timeout_s` теперь предел всего запроса и без срока вызова; `TimeoutError` обрабатывается как `httpx.TimeoutException` (deadline/transport).
+- `src/llmhub/mcp_server/kinds.py` — сообщение ошибки дополнено `(chmod 644)`.
+- `docs/integration.md` — таблица env: «после создания `chmod 644` — при `umask 002` файл получается `664` и отклоняется».
+- `tests/test_review_t373_r3_recheck.py` — сняты 3 `xfail` (R3-1..3), docstring модуля.
+- `tests/test_m_fix_round2.py` (новый, 30 тестов): эквивалентность `unfence` старому регэкспу, линейность на 400 000 `\n`, страж «в sandbox нет `re` по тексту, кроме `regex_outcome`», вложенный чужой симлинк, свои симлинки с `..`, петля, лог ужесточения режима, жёсткий срок без `deadline`, длинный текст без spawn, минимальный env и рабочий ребёнок с ним, сообщение kinds.
+
+Аудит регэкспов в родителе (`grep -n "re\.\|_NAME\|_TMP_NAME" src/llmhub/mcp_server/`): по тексту ответа модели в родителе регэкспов больше нет. Остались: `kinds._NAME` `^[a-z][a-z0-9_]{0,39}$` (имена видов из YAML, линеен), `paths._SAFE_NAME` `[^A-Za-z0-9_.-]` (`sub` одного класса символов по имени файла — линеен), `paths._TMP_NAME` `^\.llmhub-mcp-[0-9a-f]{16}\.tmp$` (имена в scratch, якорный, линеен), `checks._regex` — только `re.compile` для валидации шаблона (поиск — в ребёнке). jsonschema в потоке без `pattern` регэкспов не исполняет (FormatChecker не включён).
+
+Команды и результаты:
+- `uv run ruff check src tests scripts` → All checks passed!
+- `uv run pyright` → 0 errors, 0 warnings, 0 informations
+- `uv run pytest -q -p no:cacheprovider tests/test_m_*.py tests/test_review_t373_*.py` → 398 passed
+- `uv run pytest -q -p no:cacheprovider -m "not slow and not docker"` → 2914 passed, 110 deselected (101 с)
+- `uv run pytest -q -p no:cacheprovider` (полный, slow + docker) → **3023 passed, 1 skipped** (331 с), xfail нет.

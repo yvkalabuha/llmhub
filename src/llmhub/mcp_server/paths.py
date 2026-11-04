@@ -67,8 +67,14 @@ class Roots:
     @classmethod
     def build(cls, roots: Sequence[Path], scratch: Path) -> Roots:
         scratch_abs = Path(os.path.normpath(os.path.abspath(scratch)))
-        scratch_real = Path(os.path.realpath(scratch_abs))
+        trusted = _links_trusted(str(scratch_abs))
+        # review R3-1: realpath ignores fs.protected_symlinks; a foreign symlink on the way
+        # (e.g. in a shared /tmp) must not choose which of our directories becomes a root
+        scratch_real = Path(os.path.realpath(scratch_abs)) if trusted else scratch_abs
         try:
+            if not trusted:
+                log.warning("llmhub-mcp: scratch path has a symlink owned by another user")
+                raise OSError(errno.EPERM, "untrusted symlink in scratch path")
             _make_private_dir(scratch_real)
         except OSError:
             log.warning("llmhub-mcp: scratch directory is not available or not private")
@@ -81,7 +87,7 @@ class Roots:
                 continue
             kept.append(r)
         given = [Path(os.path.normpath(os.path.abspath(r))) for r in kept]
-        if not forbidden_root(scratch_abs):
+        if trusted and not forbidden_root(scratch_abs):
             given.append(scratch_abs)
         real = [Path(os.path.realpath(r)) for r in given]
         return cls(
@@ -243,6 +249,46 @@ class Roots:
         return self.scratch / safe
 
 
+MAX_SYMLINKS = 40  # like the kernel's ELOOP limit
+
+
+def _links_trusted(path: str) -> bool:
+    """Every symlink met while resolving `path` (also inside link targets) is owned by us or
+    root, as `fs.protected_symlinks` would demand; `os.path.realpath` does not check this.
+    A missing component ends the walk (nothing more to follow); a loop or error is untrusted."""
+    pending = list(reversed(Path(path).parts[1:]))
+    cur = os.sep
+    links = 0
+    while pending:
+        part = pending.pop()
+        if part in ("", "."):
+            continue
+        if part == "..":
+            cur = os.path.dirname(cur)
+            continue
+        nxt = os.path.join(cur, part)
+        try:
+            st = os.lstat(nxt)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            return False
+        if not stat.S_ISLNK(st.st_mode):
+            cur = nxt
+            continue
+        links += 1
+        if links > MAX_SYMLINKS or st.st_uid not in (0, os.getuid()):
+            return False
+        try:
+            target = os.readlink(nxt)
+        except OSError:
+            return False
+        if os.path.isabs(target):
+            cur = os.sep
+        pending.extend(reversed(Path(target).parts[1 if os.path.isabs(target) else 0 :]))
+    return True
+
+
 def _make_private_dir(path: Path) -> None:
     """Create or adopt the scratch directory: a real directory (not a symlink) owned by us,
     mode 0700 (review SEC-2); a foreign-owned one is refused."""
@@ -251,6 +297,7 @@ def _make_private_dir(path: Path) -> None:
     if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
         raise OSError(errno.EPERM, "scratch directory is not private")
     if stat.S_IMODE(st.st_mode) & 0o077:
+        log.warning("llmhub-mcp: scratch directory mode tightened to 0700")
         os.chmod(path, 0o700)
 
 

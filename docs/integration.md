@@ -154,7 +154,7 @@ gameDev — то же с `"LLMHUB_MCP_ROOTS": "/var/www/gameDev:/tmp/claude-1000
 | `LLMHUB_KEY_FILE` | `~/.config/llmhub/key` | файл клиентского ключа (`600`) |
 | `LLMHUB_MCP_ROOTS` | — | разрешённые корни через `:` (несуществующие пропускаются) |
 | `LLMHUB_MCP_SCRATCH` | `~/.local/state/llmhub-mcp/out` | каталог больших и отклонённых ответов (`0700`, неявно корень) |
-| `LLMHUB_MCP_KINDS` | — | YAML со своими видами (обычный файл, владелец — текущий пользователь, без записи для группы и других, напр. `644`) |
+| `LLMHUB_MCP_KINDS` | — | YAML со своими видами (обычный файл, владелец — текущий пользователь, без записи для группы и других: после создания `chmod 644` — при `umask 002` файл получается `664` и отклоняется) |
 | `LLMHUB_MCP_ALLOW_CLOUD` | — | `1` — разрешить `data_class=cloud_allowed` |
 | `LLMHUB_MCP_MAX_INPUT_BYTES` | `400000` | сумма `input` + файлов |
 | `LLMHUB_MCP_MAX_INLINE_BYTES` | `16000` | больше — текст в файл |

@@ -23,15 +23,35 @@ from typing import Any, cast
 MAX_REGEX_TEXT = 200_000  # characters; longer text fails a regex check without searching
 MAX_REASON_SEGMENT = 40
 MAX_REASON_PATH = 200
-_FENCE = re.compile(r"^\s*```[A-Za-z0-9_-]*\s*\n(.*?)\n?```\s*$", re.DOTALL)
 _MODULE = "llmhub.mcp_server.sandbox"
 
 Outcome = tuple[bool, str]
 
 
+_FENCE = "```"
+_TAG_CHARS = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-")
+
+
 def unfence(text: str) -> str:
-    m = _FENCE.match(text)
-    return m.group(1) if m else text
+    """Strip one ```lang ... ``` wrapper. Linear scan, no regex: it runs in the parent on model
+    text (review R3-3). Same result as the former DOTALL regex (tests pin it): optional spaces
+    around, a tag of [A-Za-z0-9_-], blank lines before the body and one newline before the
+    closing fence are dropped."""
+    s = text.strip()
+    if len(s) < 7 or not s.startswith(_FENCE) or not s.endswith(_FENCE):
+        return text
+    end = len(s) - 3  # the closing fence; non-whitespace, so the scans below stop before it
+    i = 3
+    while i < end and s[i] in _TAG_CHARS:
+        i += 1
+    j = i
+    while j < end and s[j].isspace():
+        j += 1
+    nl = s.rfind("\n", i, j)
+    if nl < 0:
+        return text
+    body = s[nl + 1 : end]
+    return body.removesuffix("\n")
 
 
 def load_json(text: str) -> tuple[bool, Any]:
@@ -81,13 +101,20 @@ def evaluate(spec: dict[str, Any], text: str) -> Outcome:
 
 # --- parent side ---------------------------------------------------------------------------
 def _child_env() -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if not k.startswith(("LLMHUB_", "PYTHON"))}
+    """Minimal environment: the child only computes (no secrets, no PYTHON*, no LLMHUB_*)."""
+    env = {"PATH": os.environ.get("PATH", os.defpath)}
+    for k in ("LANG", "LC_ALL", "LC_CTYPE"):
+        if k in os.environ:
+            env[k] = os.environ[k]
+    return env
 
 
 async def run_isolated(spec: dict[str, Any], text: str, timeout_s: float) -> Outcome | None:
     """Evaluate `spec` in a child process; `None` = timed out (child killed)."""
     if timeout_s <= 0:
         return None
+    if spec.get("op") == "regex" and len(text) > MAX_REGEX_TEXT:
+        return False, f"text longer than {MAX_REGEX_TEXT} characters"  # no child needed
     payload = json.dumps({"spec": spec, "text": text, "alarm_s": math.ceil(timeout_s) + 1})
     proc = await asyncio.create_subprocess_exec(
         sys.executable, "-I", "-m", _MODULE,

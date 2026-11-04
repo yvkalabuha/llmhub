@@ -160,9 +160,12 @@ class HubClient:
                 timeout = min(timeout, remaining)
             all_headers = {**(headers or {}), **self._auth()}
             try:
-                resp = await self._http.request(method, path, json=json_body, headers=all_headers,
-                                                timeout=timeout)  # fmt: skip
-            except httpx.TimeoutException as exc:
+                # httpx `timeout` bounds each phase (connect/write/every read), not the whole
+                # request: a trickling response would outlive it (review R3-2).
+                async with asyncio.timeout(timeout):
+                    resp = await self._http.request(method, path, json=json_body,
+                                                    headers=all_headers, timeout=timeout)  # fmt: skip
+            except (httpx.TimeoutException, TimeoutError) as exc:
                 if timeout < self._timeout_s:
                     raise HubError("deadline", "call deadline reached", retryable=True) from None
                 error = HubError("transport", type(exc).__name__, retryable=True)
