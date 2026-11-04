@@ -66,9 +66,10 @@ def load_instance_secrets(cfg: Config, env: Mapping[str, str] = os.environ) -> I
         hf = env.get(cfg.weights.hf_token_env) or None
         if hf is None:
             raise ConfigError(f"{cfg.weights.hf_token_env} is not set (weights.hf_token_env)")
-    return InstanceSecrets(
-        instance=load_instance_secret(env), weights=load_weights_secret(env), hf_token=hf
-    )
+    instance, weights = load_instance_secret(env), load_weights_secret(env)
+    if hmac.compare_digest(instance, weights):  # R8: the validator must not hold the API/TLS key
+        raise ConfigError("LLMHUB_INSTANCE_SECRET and LLMHUB_WEIGHTS_SECRET must differ")
+    return InstanceSecrets(instance=instance, weights=weights, hf_token=hf)
 
 
 def _mac(secret: bytes, msg: str) -> bytes:

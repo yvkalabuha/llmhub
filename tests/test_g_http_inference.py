@@ -182,7 +182,10 @@ async def test_run_happy_path(env: Env) -> None:
     body = b'{"messages":[{"role":"user","content":"\\u043f\\u0440\\u0438\\u0432\\u0435\\u0442"}]}'
     res = await env.backend.run(EP, job(body))
     path, headers, raw = env.fake.seen[-1]
-    assert raw == body and path == "/v1/chat/completions"
+    # fix round 1 F1: the pod always gets stream:true; the SSE answer is assembled
+    sent = json.loads(raw)
+    assert sent == {**json.loads(body), "stream": True, "stream_options": {"include_usage": True}}
+    assert path == "/v1/chat/completions"
     assert headers["authorization"] == "Bearer " + derive_api_key(INSTANCE_SECRET, OP)
     assert (res.tokens_in, res.tokens_out, res.finish_reason) == (11, 7, "length")
     assert json.loads(res.body) == env.fake.chat
@@ -205,18 +208,21 @@ async def test_run_llama_400_is_error_result(env: Env) -> None:
     assert res.finish_reason == "error" and res.body == env.fake.chat_raw
 
 
-async def test_run_read_timeout_network_lost(env: Env) -> None:
-    env.fake.delay_s = 3.0  # read_s 0.3 (+ connect 1)
-    with pytest.raises(NetworkLost):
-        await env.backend.run(EP, job())
+async def test_run_header_wait_is_bounded_by_cap_not_read_s(env: Env) -> None:
+    """F1: the in-process fake buffers the whole answer, so a 1.5 s generation is a 1.5 s
+    header wait: > read_s + connect_s, < job cap -> a normal result (was NetworkLost)."""
+    env.fake.delay_s = 1.5  # read_s 0.3 (+ connect 1)
+    res = await env.backend.run(EP, job())
+    assert res.finish_reason == "length"
 
 
-async def test_run_job_cap_network_lost(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_run_job_cap_counts_attempt(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """F2: the job cap is not a network loss: JobRunError (the core counts the attempt)."""
     monkeypatch.setattr(hi, "JOB_CAP_BASE_S", 0.0)
     e = Env(tmp_path, read_s=10, job_cap_factor=0.001)
     add_inst(e.conn)
     e.fake.delay_s = 1.0  # within read_s, beyond the cap (~0.1 s * 0.001)
-    with pytest.raises(NetworkLost):
+    with pytest.raises(hi.JobRunError):
         await e.backend.run(EP, job())
 
 

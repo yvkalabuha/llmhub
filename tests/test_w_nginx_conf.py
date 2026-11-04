@@ -143,7 +143,7 @@ def test_log_formats_have_no_secrets() -> None:
         ):
             assert bad not in f
     assert "$weights_op $body_bytes_sent $status" in CODE
-    assert re.search(r"access_log\s+\S+weights-acct\.log acct;", CODE)
+    assert re.search(r"access_log\s+\S+weights-acct\.log acct if=\$acct_ok;", CODE)
 
 
 def test_required_directives() -> None:
@@ -158,7 +158,9 @@ def test_required_directives() -> None:
         "proxy_pass http://__AUTH__/weights/auth;",
         "proxy_set_header X-Real-IP $remote_addr;",
         "proxy_set_header X-Range $http_range;",
-        "location / { return 404; }",
+        "location / { access_log off; return 404; }",
+        "proxy_set_header X-If-Range $http_if_range;",
+        "max_ranges 1;",
         "worker_processes 1;",
         "worker_priority 10;",
         "pid __PID__;",

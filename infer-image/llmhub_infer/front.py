@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 from starlette.applications import Starlette
@@ -16,6 +17,10 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
 MAX_BODY = 8 * 1024 * 1024
+# the only llama-server paths reachable through the front (after normalization)
+ALLOWED_PATHS = frozenset(
+    {"/v1/chat/completions", "/v1/completions", "/v1/embeddings", "/v1/models", "/props"}
+)
 _HOP_BY_HOP = frozenset(
     {
         "connection",
@@ -39,12 +44,16 @@ class PodState:
 
     phase: ``loading`` (weights) -> ``llama_load`` (llama-server starting) -> ``ready``;
     ``failed`` is terminal (the process stays alive and answers 500).
+    ``restarting``: llama-server exited once and its single restart is in progress (phase is
+    ``llama_load``); cleared when llama is ready again. The proxy then answers 503
+    ``{"error": "restarting"}`` instead of ``{"error": "not ready"}``.
     """
 
     source_names: tuple[str, ...] = ()
     phase: str = "loading"
     reason: str | None = None
     progress: dict[str, Any] = field(default_factory=dict)
+    restarting: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
     def set_progress(self, p: object) -> None:
@@ -69,6 +78,18 @@ class PodState:
         with self._lock:
             if self.phase != "failed":
                 self.phase = phase
+                if phase == "ready":
+                    self.restarting = False
+
+    def set_restarting(self) -> None:
+        with self._lock:
+            if self.phase != "failed":
+                self.restarting = True
+                self.phase = "llama_load"
+
+    def is_restarting(self) -> bool:
+        with self._lock:
+            return self.restarting and self.phase != "failed"
 
     def fail(self, reason: str) -> None:
         with self._lock:
@@ -158,12 +179,19 @@ def build_app(
             return JSONResponse({"status": "ok"})
         body = _loading_body(state, progress)
         body["phase"] = "llama_load"
+        if state.is_restarting():
+            body["restarting"] = True
         return JSONResponse(body, status_code=503)
 
     async def proxy(request: Request) -> Response:
         if not authorized(request):
             return unauthorized()
+        path = _safe_path(request)
+        if path is None:
+            return JSONResponse({"error": "not found"}, status_code=404)
         if state.snapshot()[0] != "ready":
+            if state.is_restarting():
+                return JSONResponse({"error": "restarting"}, status_code=503)
             return JSONResponse({"error": "not ready"}, status_code=503)
         declared = request.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > MAX_BODY:
@@ -178,7 +206,7 @@ def build_app(
         headers = {k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP}
         req = client().build_request(
             request.method,
-            request.url.path,
+            path,
             params=request.query_params,
             headers=headers,
             content=b"".join(chunks),
@@ -214,6 +242,26 @@ def build_app(
         ],
         lifespan=lifespan,
     )
+
+
+def _safe_path(request: Request) -> str | None:
+    """The normalized request path if it is an allowed llama-server path, else None.
+
+    Works on the raw (still percent-encoded) target: encoded slashes/backslashes, a backslash,
+    `.`/`..` or empty segments are refused, so the upstream path is exactly an allow-listed one.
+    """
+    raw = request.scope.get("raw_path")
+    target = raw.decode("latin-1") if isinstance(raw, bytes) and raw else request.url.path
+    target = target.split("?", 1)[0]
+    low = target.lower()
+    if "%2f" in low or "%5c" in low or "\\" in target or "%25" in low:
+        return None
+    path = unquote(target)
+    if "\\" in path or not path.startswith("/"):
+        return None
+    if any(seg in ("", ".", "..") for seg in path[1:].split("/")):
+        return None
+    return path if path in ALLOWED_PATHS else None
 
 
 def _clean(headers: Mapping[str, str]) -> dict[str, str]:

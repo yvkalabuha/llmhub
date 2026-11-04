@@ -16,9 +16,24 @@ DEFAULT_LLAMA_ARGS: tuple[str, ...] = (
     "-ngl", "999", "-fa", "on", "-c", "65536", "-np", "1", "--jinja",
     "--spec-type", "draft-mtp", "--spec-draft-n-max", "3",
 )  # fmt: skip
-# set by the pod supervisor itself; forbidden in llama_args (also checked in the pod)
-FORBIDDEN_LLAMA_FLAGS = frozenset({"-m", "--model", "-md", "--model-draft", "--host", "--port"})
-FORBIDDEN_LLAMA_PREFIXES = ("--api-key", "--ssl-")
+# Set by the pod supervisor, or loading models/files, writing files, opening network paths or
+# exposing extra endpoints (checked against llama-server b12063 --help). Same list in the pod
+# (`llmhub_infer.supervisor`); a test keeps both in sync.
+FORBIDDEN_LLAMA_FLAGS = frozenset({
+    "-m", "--model", "-md", "--model-draft", "--spec-draft-model", "--host", "--port",
+    "--reuse-port", "--path", "--api-prefix",
+    "-mu", "--model-url", "-dr", "--docker-repo", "-hf", "-hfr", "-hff", "-hft", "-hfd", "-hfrd",
+    "-mm", "--mmproj", "-mmu", "--mmproj-url", "--rpc", "--embd-gemma-default",
+    "-lcs", "--lookup-cache-static", "-lcd", "--lookup-cache-dynamic",
+    "--grammar-file", "-jf", "--json-schema-file", "--chat-template-file",
+    "--log-file", "--slot-save-path", "--media-path", "--props", "--metrics",
+    "-ag", "--agent", "--ui-config-file", "--webui-config-file", "--ui-mcp-proxy",
+    "--webui-mcp-proxy", "--video-ffmpeg-dir",
+})  # fmt: skip
+FORBIDDEN_LLAMA_PREFIXES = (
+    "--api-key", "--ssl-", "--hf-", "--spec-draft-hf", "--lora", "--control-vector",
+    "--models-", "--log-prompts", "--tools", "--mcp-", "--connect", "--fim-",
+)  # fmt: skip
 DEFAULT_SEGMENTS = {"self_hosted": 1, "hf": 4, "r2": 1}
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -102,6 +117,18 @@ class WeightsConfig(_Model):
     volume_cap_factor: float = Field(default=1.2, ge=1.0)  # served bytes per op <= f * sum(size)
     auth_state_dir: Path = Path("/var/lib/llmhub-weights-auth")
     acct_log: Path = Path("/var/log/llmhub/weights-acct.log")
+
+    @field_validator("auth_listen")
+    @classmethod
+    def _loopback(cls, v: str) -> str:
+        """SEC-9: the validator trusts X-Real-IP from nginx, so it must never be public."""
+        host, sep, port = v.rpartition(":")
+        host = host.removeprefix("[").removesuffix("]")
+        if not sep or host not in ("127.0.0.1", "::1") or not port.isdigit():
+            raise ValueError("auth_listen must be 127.0.0.1:<port> or [::1]:<port> (loopback)")
+        if not 0 < int(port) < 65536:
+            raise ValueError("auth_listen: bad port")
+        return v
 
     @field_validator("hf_token_env")
     @classmethod

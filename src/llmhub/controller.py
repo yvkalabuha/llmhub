@@ -76,6 +76,12 @@ ORPHAN_WATCH_S = 3600.0  # review r2: keep waking for the sweep this long after 
 ACCRUE_S = 60.0  # ledger accrual granularity (keeps the ledger small; reservations cover it)
 BUDGET_CHECK_S = 30.0  # stage / warnings / 100 % actions
 MAX_FAILED_CYCLES = 3  # consecutive failed launch cycles of a pool before local fallback
+# T-370 fix round 1 (F2): a NetworkLost refunds the attempt only once per job and instance in a
+# row; from the 2nd consecutive one the attempt counts (so <= 2 x job_max_attempts runs).
+# NETWORK_LOST_INSTANCE_MAX consecutive NetworkLost on one instance without any finished job
+# -> the instance is treated as lost (ERROR, host not blacklisted: mark_lost from READY/BUSY).
+NETWORK_LOST_FREE = 1
+NETWORK_LOST_INSTANCE_MAX = 3
 INF = float("inf")
 
 
@@ -138,6 +144,9 @@ class Controller:
         self._dup_at: dict[str, float] = {}
         self._orphan_at = -INF
         self._pending_done: dict[str, tuple[str, Any, float, float, str]] = {}
+        # consecutive NetworkLost (in memory: a controller restart bumps `restarts` instead)
+        self._netlost_job: dict[tuple[str, str], int] = {}
+        self._netlost_inst: dict[str, int] = {}
         self._purge_at = -INF
         self._accrue_at = -INF
         self._budget_at = -INF
@@ -775,23 +784,21 @@ class Controller:
         try:
             result = await rt.inference.run(endpoint, spec)
         except InstanceLost:
+            self._forget_netlost(job["id"])
             now = self.clock.now()
             machine.mark_lost(self.conn, iid, now, "instance_lost", cfg=self.cfg)
             self._requeue_mine(job["id"], iid, now, count_attempt=True, reason="instance_lost")
             return
         except NetworkLost:
-            now = self.clock.now()
-            with tx(self.conn):
-                self.conn.execute(
-                    "UPDATE instances SET net_fail_since=COALESCE(net_fail_since, ?) WHERE id=?",
-                    (now, iid),
-                )
-            self._requeue_mine(job["id"], iid, now, count_attempt=False, reason="network_lost")
+            self._network_lost(job["id"], iid)
             return
         except Exception:  # noqa: BLE001 - the backend failed this job
+            self._forget_netlost(job["id"])
             self._requeue_mine(job["id"], iid, self.clock.now(), count_attempt=True,
                                reason="run_error")  # fmt: skip
             return
+        self._forget_netlost(job["id"])
+        self._netlost_inst.pop(iid, None)
         now = self.clock.now()
         path = self.bodies.write_result(job["id"], result.body)
         price = float(inst["price_usd_h"] or 0.0)
@@ -804,13 +811,45 @@ class Controller:
         except Busy:  # R1-10: the result is on disk; the next step writes the completion
             self._pending_done[job["id"]] = (iid, result, cost, now, str(path))
 
+    def _forget_netlost(self, job_id: str) -> None:
+        for k in [k for k in self._netlost_job if k[0] == job_id]:
+            del self._netlost_job[k]
+
+    def _network_lost(self, job_id: str, iid: str) -> None:
+        """NetworkLost: refund the attempt once in a row per (job, instance), then count it; an
+        instance with NETWORK_LOST_INSTANCE_MAX in a row and no finished job is lost (F2)."""
+        now = self.clock.now()
+        key = (job_id, iid)
+        n_job = self._netlost_job.get(key, 0) + 1
+        n_inst = self._netlost_inst.get(iid, 0) + 1
+        self._netlost_job[key] = n_job
+        self._netlost_inst[iid] = n_inst
+        with tx(self.conn):
+            self.conn.execute(
+                "UPDATE instances SET net_fail_since=COALESCE(net_fail_since, ?) WHERE id=?",
+                (now, iid),
+            )
+        counted = n_job > NETWORK_LOST_FREE
+        res = self._requeue_mine(job_id, iid, now, count_attempt=counted,
+                                 reason="network_lost_repeated" if counted else "network_lost")  # fmt: skip
+        if res != "queued":
+            self._forget_netlost(job_id)
+        if n_inst >= NETWORK_LOST_INSTANCE_MAX:
+            self._netlost_inst.pop(iid, None)
+            for k in [k for k in self._netlost_job if k[1] == iid]:
+                del self._netlost_job[k]
+            machine.mark_lost(self.conn, iid, now, "network_lost_repeated", cfg=self.cfg)
+
     def _requeue_mine(
         self, job_id: str, iid: str, now: float, *, count_attempt: bool, reason: str
-    ) -> None:
+    ) -> str | None:
+        res: str | None = None
         with tx(self.conn):
             if self._still_mine(job_id, iid):
-                queue.requeue(self.conn, job_id, now, count_attempt=count_attempt, reason=reason)
+                res = queue.requeue(self.conn, job_id, now, count_attempt=count_attempt,
+                                    reason=reason)  # fmt: skip
             reservations.release_ref(self.conn, "job", job_id, now, reason)
+        return res
 
     # --- loop / admin ---------------------------------------------------------
     async def run_forever(self, stop: asyncio.Event) -> None:

@@ -31,7 +31,7 @@ from llmhub.cloud_manager.offers import select_offer
 from llmhub.cloud_manager.pools import PoolRuntime
 from llmhub.configuration.models import Config
 from llmhub.lifecycle_manager import machine, timeouts
-from llmhub.lifecycle_manager.machine import transition
+from llmhub.lifecycle_manager.machine import LOAD_PROGRESS_PREFIX, LOAD_SLOW_PREFIX, transition
 from llmhub.lifecycle_manager.recovery import destroy_duplicates, split_duplicates
 from llmhub.lifecycle_manager.safety import (
     blacklist_host,
@@ -348,18 +348,21 @@ async def _provisioning(
 
 LLAMA_LOAD_S = 60.0  # model load after the download (ETA margin, plan 2a item 6)
 SLOW_MIN_S = 60.0  # no early E7 during the first minute of LOADING_MODEL
-# "two consecutive polls": the first slow poll is remembered; E7 when the pod is still too slow
-# at least one poll interval later (extra steps at the same time do not count twice)
-SLOW_CONFIRM_S = 5.0  # = controller POLL_INTERVAL_S
+# F3 (fix round 1): "too slow" must hold for SLOW_CONFIRM_S (longer than the pod's 10 s speed
+# window), and the ETA is taken from the AVERAGE speed since LOADING_MODEL started whenever the
+# pod reports byte counts, so a short dip (chunk retry, CDN pause) cannot kill a pod that fits.
+SLOW_CONFIRM_S = 30.0
 _DOWNLOAD_PHASES = frozenset({"downloading", "verifying", "loading"})
+# F6: pod failure reasons that point at our config/sources, not at the host -> no blacklist
+_CONFIG_REASONS = frozenset({"exhausted", "sha_mismatch", "size_mismatch"})
 
 
 def _progress_key(iid: str) -> str:
-    return f"load_progress:{iid}"
+    return f"{LOAD_PROGRESS_PREFIX}{iid}"
 
 
 def _slow_key(iid: str) -> str:
-    return f"load_slow_since:{iid}"
+    return f"{LOAD_SLOW_PREFIX}{iid}"
 
 
 def _clear_load_keys(conn: sqlite3.Connection, iid: str) -> None:
@@ -368,14 +371,35 @@ def _clear_load_keys(conn: sqlite3.Connection, iid: str) -> None:
 
 
 def _weights_error(conn: sqlite3.Connection, inst: sqlite3.Row, now: float, cfg: Config,
-                   cause: str) -> None:  # fmt: skip
-    """Early E7 (LOADING_MODEL -> ERROR) without waiting for `loading_model_s`."""
+                   cause: str, *, host_fault: bool = True) -> None:  # fmt: skip
+    """Early E7 (LOADING_MODEL -> ERROR) without waiting for `loading_model_s`.
+
+    `host_fault=False` (config/source errors, F6): no host blacklist, a high incident instead.
+    """
     with tx(conn):
         if transition(conn, inst["id"], State.LOADING_MODEL, State.ERROR, "E7", now,
                       "controller", last_error=cause, reason=cause):  # fmt: skip
-            blacklist_host(conn, inst["provider"], inst["host_id"], now,
-                           cfg.retry.host_blacklist_s, cause)  # fmt: skip
+            if host_fault:
+                blacklist_host(conn, inst["provider"], inst["host_id"], now,
+                               cfg.retry.host_blacklist_s, cause)  # fmt: skip
+            else:
+                record_incident(
+                    conn, now, "weights_config", "high", ref=inst["id"],
+                    dedup_key=f"weights_config:{inst['pool']}:{int(now // 3600)}",
+                    details={"cause": cause},
+                )  # fmt: skip
             _clear_load_keys(conn, inst["id"])
+
+
+def _eta(st: LoadStatus, inst: sqlite3.Row, now: float) -> float | None:
+    """Remaining download time: average speed since LOADING_MODEL started (byte counts known),
+    else the pod's own ETA. None = unknown."""
+    elapsed = now - float(inst["state_since"])
+    if st.total > 0:
+        if st.done <= 0 or elapsed <= 0:
+            return None  # nothing measured yet
+        return max(0, st.total - st.done) / (st.done / elapsed)
+    return st.eta_s
 
 
 def _too_slow(st: LoadStatus, inst: sqlite3.Row, now: float, cfg: Config) -> bool:
@@ -383,9 +407,12 @@ def _too_slow(st: LoadStatus, inst: sqlite3.Row, now: float, cfg: Config) -> boo
     since = float(inst["state_since"])
     if now - since < SLOW_MIN_S or st.status != "loading" or st.phase not in _DOWNLOAD_PHASES:
         return False
-    if st.sources_left != 0 or st.eta_s is None:  # a fallback exists, or ETA unknown
+    if st.sources_left != 0:  # a fallback exists
         return False
-    return now + st.eta_s + LLAMA_LOAD_S > since + cfg.timeouts.loading_model_s
+    eta = _eta(st, inst, now)
+    if eta is None:
+        return False
+    return now + eta + LLAMA_LOAD_S > since + cfg.timeouts.loading_model_s
 
 
 async def _load_progress(
@@ -393,8 +420,8 @@ async def _load_progress(
 ) -> bool:
     """Read the pod's load status (optional `LoadStatusSource`). True = this step is done.
 
-    `failed` -> E7 `weights_failed:<reason>` at once; still downloading and too slow on two
-    polls `SLOW_CONFIRM_S` apart -> E7 `weights_too_slow`; `None` (unknown/not ours) or a
+    `failed` -> E7 `weights_failed:<reason>` at once; still downloading and too slow for
+    `SLOW_CONFIRM_S` without a break -> E7 `weights_too_slow`; `None` (unknown/not ours) or a
     backend without `load_status` -> the old health/test path.
     """
     backend = rt.inference
@@ -408,7 +435,9 @@ async def _load_progress(
     if st is None:
         return False
     if st.status == "failed":
-        _weights_error(conn, inst, now, cfg, f"weights_failed:{st.reason or 'unknown'}"[:80])
+        reason = st.reason or "unknown"
+        _weights_error(conn, inst, now, cfg, f"weights_failed:{reason}"[:80],
+                       host_fault=reason not in _CONFIG_REASONS)  # fmt: skip
         return True
     slow = _too_slow(st, inst, now, cfg)
     raw = get_key(conn, _slow_key(iid))

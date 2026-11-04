@@ -227,7 +227,9 @@ async def test_weights_then_llama_then_ready_and_sigterm_path(tmp_path: Path) ->
             assert argv[argv.index("--host") + 1] == "127.0.0.1"
             assert "-md" in argv and "--api-key" not in argv
             r = await c.post(
-                pod.url("/v1/echo"), headers={"Authorization": f"Bearer {KEY}"}, content=b"hi"
+                pod.url("/v1/chat/completions"),
+                headers={"Authorization": f"Bearer {KEY}"},
+                content=b"hi",
             )
             assert r.json()["echo"] == "hi" and r.json()["auth"] is None
             pid = (await c.get(f"{llama}/pid")).json()

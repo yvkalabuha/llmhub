@@ -95,6 +95,11 @@ def set_provider_ref(
     return State(row["state"])
 
 
+# controller_state keys the provisioner keeps while an instance is LOADING_MODEL (T-370)
+LOAD_PROGRESS_PREFIX = "load_progress:"
+LOAD_SLOW_PREFIX = "load_slow_since:"
+
+
 def transition(
     conn: sqlite3.Connection,
     instance_id: str,
@@ -130,6 +135,11 @@ def transition(
             return False
         if src == dst:
             return True
+        if src == State.LOADING_MODEL:  # F4: every exit drops the provisioner's progress keys
+            conn.execute(
+                "DELETE FROM controller_state WHERE key IN (?, ?)",
+                (f"{LOAD_PROGRESS_PREFIX}{instance_id}", f"{LOAD_SLOW_PREFIX}{instance_id}"),
+            )
         conn.execute(
             "INSERT INTO transitions(instance_id, ts, from_state, to_state, reason, actor)"
             " VALUES (?,?,?,?,?,?)",

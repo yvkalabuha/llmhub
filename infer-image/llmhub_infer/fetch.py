@@ -220,12 +220,11 @@ class Fetcher:
             return False
 
     def _fetch_file(self, spec: FileSpec) -> Path:
-        final, _, part, _ = self._paths(spec)
+        final = self._paths(spec)[0]
         if self._complete(spec):
             self._cur_done = 0
             return final
-        have = part.stat().st_size if part.exists() else 0
-        need = max(0, spec.size - min(have, spec.size)) + self._margin
+        need = self._missing_bytes(spec) + self._margin
         if shutil.disk_usage(self._dest).free < need:
             raise FetchError("disk")
         self._emit(force=True)
@@ -252,6 +251,20 @@ class Fetcher:
             self._bps = 0.0
             self._emit(force=True)
         raise FetchError("exhausted")
+
+    def _missing_bytes(self, spec: FileSpec) -> int:
+        """Bytes still to download. A segmented `.part` is sparse at full size, so the done
+        chunks come from the sidecar; otherwise `.part` is a contiguous prefix."""
+        _, _, part, side = self._paths(spec)
+        if side.exists():
+            done = self._read_sidecar(spec, side)
+            if done is not None:
+                n_chunks = -(-spec.size // self._chunk)
+                have = sum(self._chunk_len(spec, i) for i in done if 0 <= i < n_chunks)
+                return max(0, spec.size - have)
+            return spec.size  # unusable sidecar: the attempt keeps at most a prefix
+        have = part.stat().st_size if part.exists() else 0
+        return max(0, spec.size - min(have, spec.size))
 
     def _finish(self, spec: FileSpec, h: hashlib._Hash) -> None:
         final, marker, part, side = self._paths(spec)
@@ -297,13 +310,18 @@ class Fetcher:
         for _ in range(MAX_REDIRECTS + 1):
             if not url.startswith("https://"):
                 raise _Fail("network", False)
-            headers = {**extra, **self._headers(source, url)}
+            # identity: Range offsets and sha256 refer to the stored bytes, never to a
+            # content-coded representation (the body is read with iter_raw)
+            headers = {**extra, "Accept-Encoding": "identity", **self._headers(source, url)}
             resp = client.send(client.build_request("GET", url, headers=headers), stream=True)
             if resp.status_code in _REDIRECTS and resp.headers.get("location"):
                 loc = resp.headers["location"]
                 resp.close()
                 url = urljoin(url, loc)
                 continue
+            if resp.headers.get("content-encoding", "identity").strip().lower() != "identity":
+                resp.close()
+                raise _Fail("network", False)  # the source ignored identity: next source
             return resp, url
         raise _Fail("network", False)
 
@@ -330,6 +348,8 @@ class Fetcher:
                 if final != base and resp.status_code < 300:
                     target.url = final
             yield resp
+        except httpx.DecodingError as e:  # a content-coded body: next source
+            raise _Fail("network", False) from e
         except httpx.TransportError as e:
             raise _Fail("network", True) from e
         finally:
@@ -433,7 +453,7 @@ class Fetcher:
                         mode = "wb"
                     with part.open(mode) as out:
                         try:
-                            for data in resp.iter_bytes():
+                            for data in resp.iter_raw():
                                 if pos + len(data) > spec.size:
                                     out.close()
                                     part.unlink(missing_ok=True)
@@ -448,6 +468,8 @@ class Fetcher:
                                 if self._can_drop_slow() and monitor.too_slow():
                                     raise _Fail("slow", False)
                                 self._emit()
+                        except httpx.DecodingError as e:  # a content-coded body: next source
+                            raise _Fail("network", False) from e
                         except httpx.TransportError as e:
                             raise _Fail("network", True) from e
                         except OSError as e:
@@ -561,7 +583,7 @@ class Fetcher:
                         if not m or int(m.group(1)) != a + got or int(m.group(2)) != b:
                             raise _Fail("network", True)
                         try:
-                            for data in resp.iter_bytes():
+                            for data in resp.iter_raw():
                                 if got + len(data) > length:
                                     raise _Fail("size_mismatch", False)
                                 os.pwrite(fd, data, a + got)
@@ -577,6 +599,8 @@ class Fetcher:
                                 if st.stop.is_set():
                                     raise _Stopped
                                 self._emit()
+                        except httpx.DecodingError as e:  # a content-coded body: next source
+                            raise _Fail("network", False) from e
                         except httpx.TransportError as e:
                             raise _Fail("network", True) from e
                     if got < length:

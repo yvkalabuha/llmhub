@@ -1,6 +1,7 @@
 """`auth_request` validator for the weights nginx (T-370 stream D, plan 2a).
 
-GET /weights/auth  -> 204 | 401 (no credentials) | 403 | 503 (DB busy: the pod fails over to HF)
+GET /weights/auth  -> 204 | 401 (no credentials) | 403 | 503 (controller DB or validator state
+                      busy/broken: fail closed, the pod fails over to HF)
 GET /metrics       -> Prometheus text with refusal counters, 127.0.0.1 only.
 The controller DB is opened read-only (mode=ro); the validator never writes to it. Logs carry
 op_id and verdict only - never the token, the URI query or the client address.
@@ -95,14 +96,23 @@ def build_auth_app(
             return finish(verdict, op, 401)
         if verdict is not Verdict.OK or op is None:
             return finish(verdict, op, 403)
-        if not acct.bind_ip(op, h.get("x-real-ip", "")):
-            return finish(Verdict.IP_MISMATCH, op, 403)
         parts = split_uri(uri)
         size, total = sizes.get(parts[1], (0, 0)) if parts else (0, 0)
-        if size <= 0:
-            return finish(Verdict.PATH, op, 403)
-        need = requested_bytes(h.get("x-range"), size)
-        if acct.served(op) + need > volume_cap_factor * total:
+        try:
+            if not acct.bind_ip(op, h.get("x-real-ip", "")):
+                return finish(Verdict.IP_MISMATCH, op, 403)
+            if size <= 0:
+                return finish(Verdict.PATH, op, 403)
+            # If-Range (SEC-1): on a validator mismatch nginx ignores Range and sends 200 with
+            # the whole file, so any If-Range is charged as the whole file.
+            if h.get("x-if-range", "").strip():
+                need = size
+            else:
+                need = requested_bytes(h.get("x-range"), size)
+            over = acct.served(op) + need > volume_cap_factor * total
+        except sqlite3.Error:  # validator state unavailable: fail closed (SEC-8)
+            return finish(Verdict.DB_BUSY, op, 503)
+        if over:
             return finish(Verdict.VOLUME_CAP, op, 403)
         return finish(Verdict.OK, op, 204)
 
@@ -146,6 +156,9 @@ def main(
     ap.add_argument("--config", required=True)
     args = ap.parse_args(argv)
     environ = os.environ if env is None else env
+    # SEC-12: op/verdict lines go to stderr (journald under systemd); never token or IP
+    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
+                        format="%(asctime)s %(levelname)s %(name)s %(message)s")  # fmt: skip
     try:
         cfg = load_config(Path(args.config), environ)
         secret = load_weights_secret(environ)
@@ -154,6 +167,7 @@ def main(
         return 2
     allowed, sizes = tables_from_config(cfg)
     host, _, port = cfg.weights.auth_listen.rpartition(":")
+    host = host.removeprefix("[").removesuffix("]")  # loopback only (config validator, SEC-9)
     app = build_auth_app(
         cfg.data_dir / "state.db",
         secret,

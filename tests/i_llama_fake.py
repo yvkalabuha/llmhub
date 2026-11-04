@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
-"""Fake llama-server for supervisor tests: /health 503 -> 200 after 0.5 s, /env, /argv, /v1/echo.
+"""Fake llama-server for supervisor tests: /health 503 -> 200 after 0.5 s, /env, /argv,
+POST echo (any path).
 
-Behaviour switch (non-secret env var): FAKE_LLAMA_MODE=exit exits immediately with code 1.
+Behaviour switch (non-secret env var): FAKE_LLAMA_MODE=exit exits immediately with code 1;
+FAKE_LLAMA_MODE=crash_once (+ FAKE_LLAMA_MARK=<file>): the first run is ready at once and exits
+after 1 s, the restarted run reports /health 503 for 1.5 s, then serves normally.
 """
 
 from __future__ import annotations
@@ -23,6 +26,15 @@ def main() -> int:
     if os.environ.get("FAKE_LLAMA_MODE") == "exit":
         return 1
     t0 = time.monotonic()
+    ready_after = 0.5
+    if os.environ.get("FAKE_LLAMA_MODE") == "crash_once":
+        mark = os.environ["FAKE_LLAMA_MARK"]
+        if not os.path.exists(mark):
+            open(mark, "w").close()
+            ready_after = 0.0
+            threading.Timer(1.0, lambda: os._exit(3)).start()
+        else:
+            ready_after = 1.5
 
     class H(BaseHTTPRequestHandler):
         def _send(self, code: int, body: object) -> None:
@@ -34,7 +46,7 @@ def main() -> int:
 
         def do_GET(self) -> None:
             if self.path == "/health":
-                ok = time.monotonic() - t0 >= 0.5
+                ok = time.monotonic() - t0 >= ready_after
                 self._send(200 if ok else 503, {"status": "ok" if ok else "loading"})
             elif self.path == "/env":
                 self._send(200, sorted(os.environ))

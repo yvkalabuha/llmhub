@@ -10,14 +10,23 @@ Implements the FROZEN `InferenceBackend` protocol and the optional `LoadStatusSo
   `instances.tls_fingerprint`. A mismatch (or a certificate the pin rejects) -> False /
   `NetworkLost` and `on_pin_mismatch(endpoint)` (the composition root writes a high incident).
   `proxy`: system CAs, `https://` only, the per-instance key.
-- `run` error mapping (plan 5.3, checked against `Controller._run_job` in G1):
-  `NetworkLost`  - connect/read timeouts, transport errors, TLS errors, the job cap, 502/503/504
-                   without our front's JSON (a RunPod proxy without a pod);
+- `run` (fix round 1, F1/F2): the request always goes to the pod with `stream: true`
+  (+ `stream_options.include_usage`) and the SSE answer is assembled into one
+  `chat.completion` JSON. Bytes flow during generation, so the pause between bytes
+  (`read_s`) is meaningful and a proxy's ~100 s limit (Cloudflare/RunPod 524) is not hit.
+- `run` error mapping (checked against `Controller._run_job`):
+  `NetworkLost`  - connect/TLS errors and drops BEFORE the response headers, 502/503/504/52x
+                   without our front's JSON (a proxy without a pod), our front's 503
+                   {"error":"restarting"} (llama-server's single restart, F9); the core bounds
+                   repeated `NetworkLost` of one job on one instance;
+  `JobRunError`  - (counts an attempt) the job cap, a pause > `read_s` after the headers, a drop
+                   after the headers, a truncated SSE stream;
   `InstanceLost` - our front says failed (500 {"status":"failed"}), loading / not ready (503:
                    the container restarted), llama unreachable (502 {"error":"upstream
                    unavailable"}), 401 (not our pod behind this endpoint, logged high);
   `JobRunResult(finish_reason="error", body=...)` - 4xx and llama-server's own JSON errors.
   No retries inside (the core requeues); `CancelledError` propagates.
+- Clients of instances that left TALK_STATES are closed on the next call (F8).
 """
 
 from __future__ import annotations
@@ -63,6 +72,15 @@ class _PinMismatch(Exception):
 
 class _Unusable(Exception):
     """No (or no unique) instance row for the endpoint, or a non-https endpoint."""
+
+
+class JobRunError(Exception):
+    """The job failed on a reachable pod after the request was accepted (cap, stall, drop,
+    truncated stream). A plain exception for the core: requeue WITH the attempt counted."""
+
+
+class _BeforeHeaders(Exception):
+    """Transport failure before the response headers (-> NetworkLost)."""
 
 
 # --- timings -------------------------------------------------------------------------------
@@ -123,6 +141,123 @@ def parse_timings(body: Mapping[str, Any] | object) -> Timings | None:
         )  # fmt: skip
     except Exception:  # noqa: BLE001 - tolerant by contract
         return None
+
+
+# --- streaming ---------------------------------------------------------------------------
+_STREAM_OPTS = {"include_usage": True}
+
+
+def force_stream(body: bytes) -> bytes:
+    """The job body with `stream: true` (the pod streams; we assemble). Not JSON -> unchanged."""
+    try:
+        data = json.loads(body)
+    except (ValueError, UnicodeDecodeError):
+        return body
+    if not isinstance(data, dict):
+        return body
+    data["stream"] = True
+    opts = data.get("stream_options")
+    data["stream_options"] = {**opts, **_STREAM_OPTS} if isinstance(opts, dict) else _STREAM_OPTS
+    return json.dumps(data, ensure_ascii=False).encode()
+
+
+def _merge_tool_calls(acc: list[dict[str, Any]], deltas: object) -> None:
+    if not isinstance(deltas, list):
+        return
+    for d in deltas:
+        if not isinstance(d, dict):
+            continue
+        idx = d.get("index", len(acc))
+        if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < 1024:
+            continue
+        while len(acc) <= idx:
+            acc.append({"function": {"name": "", "arguments": ""}})
+        cur = acc[idx]
+        for k in ("id", "type"):
+            if isinstance(d.get(k), str):
+                cur[k] = d[k]
+        fn = d.get("function")
+        if isinstance(fn, dict):
+            for k in ("name", "arguments"):
+                if isinstance(fn.get(k), str):
+                    cur["function"][k] += fn[k]
+
+
+def assemble_sse(content: bytes) -> tuple[dict[str, Any] | None, bool]:
+    """llama-server SSE (`data: {...}` ... `data: [DONE]`) -> (chat.completion dict, complete).
+
+    `complete` is False when the stream ended without `[DONE]` and without a finish_reason
+    (a drop). An `error` event -> ({"error": ...}, True). Never raises.
+    """
+    try:
+        text = content.decode("utf-8", errors="replace")
+    except Exception:  # noqa: BLE001 - tolerant by contract
+        return None, False
+    out: dict[str, Any] = {"object": "chat.completion"}
+    choices: dict[int, dict[str, Any]] = {}
+    done = False
+    finished = False
+    seen = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("error:"):
+            err = _json(line[6:].strip().encode())
+            return {"error": err if err is not None else line[6:].strip()}, True
+        if not line.startswith("data:"):
+            continue
+        payload = line[5:].strip()
+        if payload == "[DONE]":
+            done = True
+            break
+        ev = _json(payload.encode())
+        if not isinstance(ev, dict):
+            continue
+        seen = True
+        if "error" in ev and "choices" not in ev:
+            return {"error": ev["error"]}, True
+        for k in ("id", "created", "model", "system_fingerprint"):
+            if k in ev:
+                out[k] = ev[k]
+        for k in ("usage", "timings"):
+            if isinstance(ev.get(k), dict):
+                out[k] = ev[k]
+        evc = ev.get("choices")
+        if not isinstance(evc, list):
+            continue
+        for ch in evc:
+            if not isinstance(ch, dict):
+                continue
+            idx = ch.get("index", 0)
+            if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < 64:
+                continue
+            cur = choices.setdefault(
+                idx, {"index": idx, "message": {"role": "assistant", "content": ""},
+                      "finish_reason": None, "_tools": []},
+            )  # fmt: skip
+            delta = ch.get("delta")
+            if isinstance(delta, dict):
+                msg = cur["message"]
+                if isinstance(delta.get("role"), str):
+                    msg["role"] = delta["role"]
+                for k in ("content", "reasoning_content"):
+                    if isinstance(delta.get(k), str):
+                        msg[k] = msg.get(k, "") + delta[k]
+                _merge_tool_calls(cur["_tools"], delta.get("tool_calls"))
+            fr = ch.get("finish_reason")
+            if isinstance(fr, str) and fr:
+                cur["finish_reason"] = fr
+                finished = True
+    if not seen:
+        return None, False
+    out_choices = []
+    for idx in sorted(choices):
+        cur = choices[idx]
+        tools = cur.pop("_tools")
+        if tools:
+            cur["message"]["tool_calls"] = tools
+        out_choices.append(cur)
+    out["choices"] = out_choices
+    return out, done or finished
 
 
 # --- backend -------------------------------------------------------------------------------
@@ -214,6 +349,25 @@ class HttpInferenceBackend:
             direct=pool.infer.transport == "direct", fingerprint=row["tls_fingerprint"],
         )  # fmt: skip
 
+    async def _prune(self) -> None:
+        """F8: close clients of instances that left TALK_STATES (or vanished)."""
+        if not self._clients:
+            return
+        ids = sorted({iid for _, iid in self._clients})
+        marks = ",".join("?" for _ in ids)
+        states = ",".join("?" for _ in TALK_STATES)
+        live = {
+            r["id"]
+            for r in self.conn.execute(
+                f"SELECT id FROM instances WHERE id IN ({marks}) AND state IN ({states})",
+                (*ids, *TALK_STATES),
+            )
+        }
+        dead = [k for k in self._clients if k[1] not in live]
+        for k in dead:
+            _, client = self._clients.pop(k)
+            await client.aclose()
+
     def _ssl_context(self, t: _Target) -> ssl.SSLContext:
         if not t.direct:
             return self._proxy_ctx or ssl.create_default_context()
@@ -302,7 +456,8 @@ class HttpInferenceBackend:
         except Exception:  # noqa: BLE001 - every failure of a probe is just "no"
             return None
 
-    def _timeouts(self, endpoint: str) -> Any:
+    async def _timeouts(self, endpoint: str) -> Any:
+        await self._prune()
         try:
             return self._target(endpoint).pool.infer.client
         except _Unusable:
@@ -310,14 +465,14 @@ class HttpInferenceBackend:
 
     # --- InferenceBackend ------------------------------------------------------------------
     async def ping(self, endpoint: str) -> bool:
-        c = self._timeouts(endpoint)
+        c = await self._timeouts(endpoint)
         if c is None:
             return False
         resp = await self._safe(endpoint, "GET", "/ping", c.ping_s, auth=False)
         return resp is not None and resp.status_code == 204
 
     async def health(self, endpoint: str) -> bool:
-        c = self._timeouts(endpoint)
+        c = await self._timeouts(endpoint)
         if c is None:
             return False
         resp = await self._safe(endpoint, "GET", "/health", c.health_s)
@@ -327,7 +482,7 @@ class HttpInferenceBackend:
         return isinstance(body, dict) and body.get("status") == "ok"
 
     async def test_request(self, endpoint: str) -> bool:
-        c = self._timeouts(endpoint)
+        c = await self._timeouts(endpoint)
         if c is None:
             return False
         body = json.dumps(TEST_BODY).encode()
@@ -339,7 +494,7 @@ class HttpInferenceBackend:
         return isinstance(choices, list) and len(choices) > 0
 
     async def load_status(self, endpoint: str) -> LoadStatus | None:
-        c = self._timeouts(endpoint)
+        c = await self._timeouts(endpoint)
         if c is None:
             return None
         resp = await self._safe(endpoint, "GET", "/health", c.health_s)
@@ -348,33 +503,46 @@ class HttpInferenceBackend:
         return parse_load_status(_json(resp.content))
 
     async def run(self, endpoint: str, job: JobRunSpec) -> JobRunResult:
+        await self._prune()
         try:
             t = self._target(endpoint)
         except _Unusable:
             raise NetworkLost("no unique live instance for the endpoint") from None
         c = t.pool.infer.client
-        cap = (
-            job.tokens_in / t.pool.pp_tps + job.max_tokens / t.pool.tg_tps
-        ) * c.job_cap_factor + JOB_CAP_BASE_S
+        prompt_s = job.tokens_in / t.pool.pp_tps
+        cap = (prompt_s + job.max_tokens / t.pool.tg_tps) * c.job_cap_factor + JOB_CAP_BASE_S
+        # the first byte may wait for prompt processing; later bytes only for one token
+        first_byte_s = c.read_s + prompt_s * c.job_cap_factor
         client = await self._client(endpoint, t)
         headers = {"Authorization": f"Bearer {t.api_key}", "Content-Type": "application/json"}
         req = client.build_request(
-            "POST", t.base_url + "/v1/chat/completions", headers=headers, content=job.body
-        )
+            "POST", t.base_url + "/v1/chat/completions", headers=headers,
+            content=force_stream(job.body),
+            # read=None: the header wait is bounded by the cap, pauses by our own timers
+            timeout=httpx.Timeout(None, connect=c.connect_s),
+        )  # fmt: skip
         try:
             async with asyncio.timeout(cap):
-                status, content = await self._send(client, req, t, c.read_s, c.connect_s)
+                status, ctype, content = await self._send(client, req, t, first_byte_s, c.read_s)
         except _PinMismatch:
             self._pin_failed(endpoint)
             raise NetworkLost("tls pin mismatch") from None
-        except TimeoutError:
-            raise NetworkLost("timeout") from None
-        except httpx.HTTPError as exc:
-            if t.direct and _is_cert_error(exc):
+        except _BeforeHeaders as exc:
+            cause = exc.__cause__
+            if t.direct and cause is not None and _is_cert_error(cause):
                 self._pin_failed(endpoint)
-            raise NetworkLost(type(exc).__name__) from None
-        except OSError as exc:  # raw socket / TLS errors (ssl.SSLError is an OSError)
-            raise NetworkLost(type(exc).__name__) from None
+            raise NetworkLost(str(exc)) from None
+        except TimeoutError:  # the job cap, or a pause after the headers: counts an attempt
+            raise JobRunError("timeout") from None
+        except (httpx.HTTPError, OSError) as exc:  # a drop after the headers
+            raise JobRunError(type(exc).__name__) from None
+        if status == 200 and "text/event-stream" in ctype:
+            data, complete = assemble_sse(content)
+            if data is None or not complete:
+                raise JobRunError("truncated stream")
+            if "error" in data and "choices" not in data:
+                return JobRunResult(job.tokens_in, 0, "error", json.dumps(data).encode())
+            content = json.dumps(data, ensure_ascii=False).encode()
         return self._result(job, status, content)
 
     async def _send(
@@ -382,23 +550,27 @@ class HttpInferenceBackend:
         client: httpx.AsyncClient,
         req: httpx.Request,
         t: _Target,
+        first_byte_s: float,
         read_s: float,
-        connect_s: float,
-    ) -> tuple[int, bytes]:
-        async with asyncio.timeout(read_s + connect_s):  # until the response headers
-            resp = await client.send(req, stream=True)
+    ) -> tuple[int, str, bytes]:
+        try:
+            resp = await client.send(req, stream=True)  # header wait: bounded by the job cap
+        except (httpx.HTTPError, OSError) as exc:
+            raise _BeforeHeaders(type(exc).__name__) from exc
         try:
             self._check_pin(t, resp)
             chunks: list[bytes] = []
             it = resp.aiter_raw().__aiter__()
+            pause = first_byte_s
             while True:
                 try:
-                    async with asyncio.timeout(read_s):  # pause between bytes
+                    async with asyncio.timeout(pause):  # pause between bytes
                         chunk = await it.__anext__()
                 except StopAsyncIteration:
                     break
                 chunks.append(chunk)
-            return resp.status_code, b"".join(chunks)
+                pause = read_s
+            return resp.status_code, resp.headers.get("content-type", ""), b"".join(chunks)
         finally:
             await resp.aclose()
 
@@ -410,6 +582,8 @@ class HttpInferenceBackend:
             raise InstanceLost("unauthorized")
         if ours and status == 500 and data.get("status") == "failed":
             raise InstanceLost("pod failed")
+        if ours and status == 503 and data.get("error") == "restarting":
+            raise NetworkLost("pod restarting llama-server")  # F9: bounded by the core
         if (
             ours
             and status == 503
@@ -418,7 +592,7 @@ class HttpInferenceBackend:
             raise InstanceLost("pod restarted")
         if ours and status == 502 and data.get("error") == "upstream unavailable":
             raise InstanceLost("llama-server unreachable")
-        if status in (502, 503, 504):  # not our front's JSON: a proxy without a pod
+        if status in (502, 503, 504, 520, 521, 522, 523, 524):  # a proxy without a pod
             raise NetworkLost(f"http {status}")
         if status != 200 or not ours:
             return JobRunResult(job.tokens_in, 0, "error", content)

@@ -213,6 +213,8 @@ async def test_unknown_eta_no_early_e7(tmp_path: Path) -> None:
 
 
 async def test_slow_needs_two_polls_apart(tmp_path: Path) -> None:
+    """Slowness must hold for SLOW_CONFIRM_S (30 s, fix round 1 F3); one fast poll resets it."""
+    c = SLOW_CONFIRM_S
     knobs = MockInferenceKnobs(hang_load=True, load_eta_s=5000, load_sources_left=0)
     h = make_h(tmp_path, knobs=knobs)
     h.submit(make_job(0))
@@ -228,13 +230,15 @@ async def test_slow_needs_two_polls_apart(tmp_path: Path) -> None:
     await h.step()  # an extra step at the same time is not a second poll
     await h.step()
     assert slow_since() == loading_at + 60 and h.state_of() == "LOADING_MODEL"
+    await h.run_until(loading_at + 60 + c - 6)  # still slow, but not long enough
+    assert h.state_of() == "LOADING_MODEL"
     knobs.load_eta_s = 10  # one fast poll resets the streak
-    await h.run_until(loading_at + 65)
+    await h.run_until(loading_at + 60 + c - 1)
     assert slow_since() is None and h.state_of() == "LOADING_MODEL"
     knobs.load_eta_s = 5000
-    await h.run_until(loading_at + 69)  # the harness steps again at +65 first
-    assert slow_since() == loading_at + 65 and h.state_of() == "LOADING_MODEL"
-    await h.run_until(loading_at + 71)
+    await h.run_until(loading_at + 60 + 2 * c - 2)
+    assert slow_since() is not None and h.state_of() == "LOADING_MODEL"
+    await h.run_until(loading_at + 60 + 2 * c + 10)
     assert "weights_too_slow" in reasons(h)
 
 

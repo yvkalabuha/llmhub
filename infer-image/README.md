@@ -23,7 +23,8 @@
 ## Семантика фронта
 - `GET /ping` → 204 без ключа (BOOTING → LOADING_MODEL).
 - `GET /health` (ключ): 503 `{"status":"loading", phase, file, source, done, total, mb_s, failovers, eta_s, sources_left}`; 503 `phase=llama_load`; 200 `{"status":"ok"}` только когда llama-server ответил 200; 500 `{"status":"failed","reason"}` (`weights`, `deadline`, `llama_exited`, `internal`) — процесс жив, перезапусков нет.
-- `/v1/*`, `/props` (ключ) → потоковый прокси на `127.0.0.1:8081`; до READY — 503 `{"error":"not ready"}`; llama недоступна — 502 `{"error":"upstream unavailable"}`.
+- `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/props` (ключ; путь проверяется до нормализации — `.`/`..`, `%2f`, `%5c`, пустые сегменты → 404, SEC-7) → потоковый прокси на `127.0.0.1:8081`; до READY — 503 `{"error":"not ready"}`; во время единственного перезапуска llama — 503 `{"error":"restarting"}` (контроллер: `NetworkLost` с ограничением, F9); llama недоступна — 502 `{"error":"upstream unavailable"}`.
+- Контроллер всегда шлёт поду `stream: true` и сам собирает SSE в один `chat.completion` (F1): байты идут всё время генерации, пауза `read_s` осмысленна, лимит прокси ~100 с (524) не срабатывает.
 
 Контроллер (`HttpInferenceBackend`): `failed` → ранний E7 `weights_failed:<reason>`; нет запасного источника и прогноз ETA не укладывается в `loading_model_s` на двух опросах (не раньше 60 с) → E7 `weights_too_slow`; `eta_s = null` — «неизвестно», раннего E7 нет.
 

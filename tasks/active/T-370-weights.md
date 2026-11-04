@@ -26,6 +26,114 @@
 - [x] infer-image
 ## Ревью
 <заполняет reviewer: находки, команды, результаты, вердикт>
+## Ревью (цикл 2: функции и сбои)
+> TL;DR: независимый цикл 2 (функции, сбои, деньги) по коммиту 124c718. Загрузчик, фронт и супервизор пода в основном корректны. Найдены 2 blocker в отображении ошибок `HttpInferenceBackend` → ядро: долгий не-stream запрос превращается в `NetworkLost`, а `NetworkLost` при живом `/ping` бесконечно перезапускает задачу, и GPU оплачивается до `max_lifetime`. Вердикт: **in-progress**.
+
+Ревьюер — функции и сбои (security проверяет параллельный ревьюер). `src/` и `infer-image/` не менял. Добавил тесты `tests/test_review_t370_fn_{requeue,fetch,loading}.py`: 7 проходят, 4 помечены `xfail(strict=True)` и описывают дефекты. Когда дефект исправят, тест станет красным — тогда маркер снять.
+
+**Находки**
+| # | Где | Сев. | Суть | Исправление |
+|---|---|---|---|---|
+| F1 | `http_inference.py:388` (`_send`, `asyncio.timeout(read_s + connect_s)` до заголовков) | **blocker (деньги)** | При `stream:false` llama-server отдаёт заголовки только после всей генерации. Поэтому любой не-stream запрос дольше `read_s + connect_s` (по умолчанию 130 с, например `max_tokens` ≈ 8000 при 78 ток/с) даёт `TimeoutError` → `NetworkLost`, хотя `job_cap` ещё не исчерпан. Фейк `FakeInfer.delay_s` такую ситуацию моделирует, но `test_g_http_inference.py::test_run_read_timeout_network_lost` закрепляет её как ожидаемую (после исправления этот тест придётся обновить). Режим `proxy` получает то же от Cloudflare/RunPod (524 примерно через 100 с): сейчас 524 → `finish_reason="error"`, а llama продолжает занимать GPU. | До заголовков ждать `job_cap`, а не `read_s`. Лучше — принудительно `stream:true` к поду и собирать ответ (байты идут постоянно, `read_s` осмыслен, прокси-лимит 100 с не срабатывает). Проверить 524 в T-372. Тест: `test_long_nonstream_job_within_cap_is_not_network_lost` (xfail). |
+| F2 | `http_inference.py:370` (`job_cap` → `NetworkLost`) + ядро `controller._run_job` / `timeouts.check_alive` | **blocker (деньги)** | `NetworkLost` возвращает попытку. `check_alive` проверяет только `/ping` (это фронт, llama он не трогает) и сбрасывает `net_fail_since`, после чего та же задача снова уходит на под. Счётчик `restarts` растёт только при перезапуске контроллера. Итог: «ядовитая» задача (таймаут, зависание llama, F1) крутится без ограничения. Харнесс за 2 ч: **45 запусков**, задача всё ещё `running`; GPU оплачивается до `max_lifetime` (3 ч). Ответ на вопрос «есть ли ограничение» — нет. | `job_cap` и паузу `read_s` после полученных заголовков отображать в исключение с учётом попытки (обычное `Exception` → `run_error`, count_attempt). `NetworkLost` оставить только для connect/TLS/обрыва до заголовков. Дополнительно (ядро, на решение координатора): ограничить подряд идущие `NetworkLost` одной задачи на одном инстансе. Тест: `test_repeated_network_lost_with_live_front_is_bounded` (xfail). |
+| F3 | `provisioner._too_slow` + `fetch._emit` (`eta = остаток / bps` по окну 10 с) | medium (деньги) | Ранний E7 `weights_too_slow` срабатывает по двум опросам с интервалом 5 с, а ETA пода считается по скорости за последние 10 с. Одна короткая просадка (повтор куска с `sleep`, пауза CDN) даёт огромный ETA на обоих опросах и убивает под, который успел бы. | Подтверждать «медленно» дольше окна скорости (≥ `speed_window_s`, лучше 30 с) или считать ETA по средней скорости с начала LOADING_MODEL. Решение — по выбору координатора, не блокирует. |
+| F4 | `provisioner._clear_load_keys` вызывается только на READY и раннем E7 | low | `load_progress:<iid>` и `load_slow_since:<iid>` остаются после E7 по таймауту, `mark_lost`, kill и max_lifetime. Строки копятся в `controller_state`. (Implementer сам отметил это в журнале.) | Чистить ключи при любом выходе из LOADING_MODEL (или чистить сиротские ключи по префиксу в sweep). Тест: `test_progress_keys_cleared_after_timeout_e7` (xfail). |
+| F5 | `fetch.py` (`_client`, `iter_bytes`) | low/medium | Загрузчик отправляет стандартный для httpx `Accept-Encoding: gzip, deflate` и читает `iter_bytes` (декодированное тело). Если источник или CDN сожмёт ответ, смещения Range и `pos` разойдутся с файлом. Тогда будет sha/size mismatch, файл придётся качать заново, а `httpx.DecodingError` не входит в `TransportError` и превратится в `internal` без перехода на другой источник. | Отправлять `Accept-Encoding: identity`, читать `iter_raw`. Тест: `test_requests_identity_encoding` (xfail). |
+| F6 | `provisioner._weights_error` | low | `weights_failed:<reason>` всегда заносит хост в чёрный список, в том числе при `exhausted`, `sha_mismatch` и `size_mismatch` — это ошибки конфига или наших источников, а не хоста. Деньги ограничены `MAX_FAILED_CYCLES=3`, но три хоста теряются на 24 ч. | Чёрный список — только для `disk`, `deadline` и сетевых причин; для конфигурационных — инцидент high. |
+| F7 | `fetch._fetch_file` (проверка диска) | low | После сегментной попытки `.part` предразмечен до полного размера (sparse), поэтому при рестарте `need` = только запас: проверка свободного места фактически пропускается, и нехватка диска всплывёт позже как `disk`. | Считать `need` по недостающим кускам из sidecar. |
+| F8 | `http_inference._clients` | low | Клиенты не удаляются для инстансов, которые ушли из TALK_STATES (небольшая утечка соединений). `aclose()` и `on_timings` ещё нужно подключить в composition root. | Удалять клиента, когда строка не найдена. Подключение — в T-369/T-371. |
+| F9 | `supervisor._llama_loop` | low | Отмена во время `create_subprocess_exec` может оставить llama-server без родителя (узкое окно). После первого выхода llama фронт отвечает `/v1` 503 «not ready» → `InstanceLost` → под уничтожается, поэтому «один перезапуск» на практике почти не помогает (для денег это безопасно). | Принять как есть или повторять запрос, пока идёт `llama_load`. |
+
+**Проверено и в порядке (с доказательствами в тестах задачи и моих):**
+- Сегменты: сборка куски → файл; sidecar при рестарте игнорирует устаревший размер куска; при переходе сегменты → один поток сохраняется только непрерывный префикс (мой тест).
+- Докачка через Range между источниками; sha-проход; `size_mismatch` больше/меньше.
+- Переход на другой источник при 5xx, 4xx, медленной скорости и плохом `Location` (мой тест: сбой источника, а не падение пода).
+- Дедлайн проверяется во время backoff (мой тест) и равен `exp` токена = `created_at` + сумма таймаутов, т. е. не раньше E7 контроллера.
+- Учётные данные выбираются по хосту на каждом редиректе; редирект на `http` отклоняется.
+- Фазы `/health`; `failed` живёт и отвечает 500; один перезапуск llama; SIGTERM.
+- `eta None` и `sources_left > 0` не дают раннего E7; фаза `llama_load` не считается медленной; ETA в пределах бюджета не убивает под (мои тесты).
+- `InstanceLost` считает попытку, `NetworkLost` нет — как в ядре.
+- `parse_timings` и `parse_load_status` устойчивы к мусору (огромный int в `usage` даёт `OverflowError` → `run_error` с попыткой, ограничено).
+- `need_public_ip` только для `direct` (фильтр в `offers.py:20`).
+- Фабрики `make_material_fns` / `make_cloud_inference` пригодны для подключения в T-369/T-371 (нужно ещё `aclose`, `on_timings`, `load_weights_ca`).
+
+**Команды и результаты**
+- Полный прогон `uv run pytest -q -p no:cacheprovider` (slow + docker), 3 раза подряд: 953 passed (4:53) · 957 passed, 4 xfailed (4:31) · 992 passed, 18 xfailed (5:22; в 3-м прогоне уже есть тесты параллельного security-ревьюера). Ни одного FAILED/ERROR — нестабильных тестов нет.
+- `uv run pytest tests/test_review_t370_fn_*.py` → 7 passed, 4 xfailed (с `--runxfail` все 4 падают: 45 запусков за 2 ч; `NetworkLost: timeout`; `gzip, deflate`; 2 ключа `load_%`).
+- `uv run ruff check src tests` — чисто; `uv run pyright` — 0 errors.
+
+**Вердикт: in-progress.** Для implementer: F1 и F2 (blocker, деньги) — исправить и снять xfail с соответствующих тестов. F3 — решение координатора. F4–F9 — по возможности в этом же раунде.
+## Ревью (цикл 1: безопасность)
+> TL;DR: независимое ревью безопасности, коммит 124c718. Blocker и high нет. В сервере весов два medium: лимит объёма обходится через `If-Range`; acct-лог неограниченно растёт от неаутентифицированных запросов. Правки малые: `deploy/nginx-weights.conf`, `weights/auth_app.py`, `weights/acct.py`. Вердикт: **changes required** (SEC-1, SEC-2); low — в этом раунде или в T-371.
+
+**Объём.** Проверены:
+- сервер весов: nginx-конфиг, `auth_app`, `acct`, `tokens`;
+- секреты и KDF (`instance_env`), `secret_env` / C11;
+- `HttpInferenceBackend`: pin и режим proxy;
+- фронт и супервизор пода;
+- Dockerfile и локальный образ `llmhub-infer:dev` (`docker inspect` / `history`, содержимое).
+
+src/ и infer-image/ не менялись. Добавлены только тесты `tests/test_review_t370_sec_unit.py` и `tests/test_review_t370_sec_nginx.py`. Тесты открытых находок помечены `xfail(strict=True)` с id: после исправления они станут XPASS — маркер снимается вместе с фиксом.
+
+**Находки**
+| id | серьёзность | где | суть | исправление |
+|---|---|---|---|---|
+| SEC-1 | medium | `src/llmhub/weights/auth_app.py:104`, `deploy/nginx-weights.conf:42-55,71` | Лимит объёма обходится через `If-Range`. Запрос `Range: bytes=0-9` + `If-Range: "bogus"`: валидатор списывает 10 байт, а nginx игнорирует Range и отдаёт весь файл (200). Подтверждено на настоящем nginx (`test_if_range_does_not_bypass_volume_cap`, xfail). Лимит становится «мягким на один файл»: до ≈ cap + размер файла (≈ 2,2× вместо 1,2×). Нужны валидный токен и привязанный IP. | передать `proxy_set_header X-If-Range $http_if_range;` и при непустом значении считать `need = size` (или в location `if ($http_if_range) { return 400; }`); заодно `max_ranges 1;` |
+| SEC-2 | medium | `deploy/nginx-weights.conf:20-21,74`; `src/llmhub/weights/acct.py:238-245` | `access_log … acct` и `access_log … weights` стоят на уровне `http`, поэтому пишется каждый запрос, включая `location /` (404) без `limit_req`. Любой клиент из интернета растит `weights-acct.log` / `weights-access.log` без предела → заполнение диска хоста контроллера (65.109.95.35). `_refresh` читает весь хвост лога одним `f.read()` → после долгого простоя скачок памяти валидатора. | acct-лог писать только внутри gguf-location и только для 200/206 (`map $status $acct_ok` + `access_log … if=$acct_ok`); `location / { access_log off; return 404; }` или `limit_req` на уровне server; `_refresh` читать кусками (≤ 1 МиБ за вызов, смещение — до последнего `\n`); в T-371 — logrotate с `maxsize` |
+| SEC-3 | low | `src/llmhub/cloud_manager/instance_env.py:62-71` | `LLMHUB_INSTANCE_SECRET == LLMHUB_WEIGHTS_SECRET` принимается: разделение R8 держится только на дисциплине установки. Домены HMAC разведены (`api:`, `tls:`, `llmhub-weights\|v1\|`), коллизий нет (тест). | `ConfigError` при совпадении секретов (xfail `test_instance_and_weights_secret_must_differ`) |
+| SEC-4 | low | `deploy/nginx-weights.conf:19-21`, `acct.py:256` | Байты страниц ошибок (401/403/404/503) засчитываются в объём op. Неаутентифицированный клиент, знающий op_id, «тратит» объём жертвы (~170 байт на запрос; практически безвредно). Подтверждено, xfail. | закрывается фиксом SEC-2 (учитывать только 200/206) |
+| SEC-5 | low | `infer-image/llmhub_infer/supervisor.py:128-132` | Базовый образ задаёт `LLAMA_ARG_HOST=0.0.0.0` и `LLAMA_ARG_PORT=8080` (видно в `docker inspect`), а `child_env` пропускает `LLAMA_ARG_*`. Сейчас аргументы CLI `--host 127.0.0.1 --port 8081` главнее env — уязвимости нет, но и запаса тоже. | убирать все `LLAMA_ARG_*` в `child_env` (xfail) |
+| SEC-6 | low | `supervisor.py:31-32`, `src/llmhub/configuration/weights_models.py:145-151` | Deny-list флагов не ловит `-hf/--hf-repo/-hft/-mu/--model-url/--path/--slot-save-path/--props`. Это скачивание модели в обход sha, раздача файлов, изменяемые props. Флаги приходят из доверенного конфига контроллера, поэтому low. | добавить в оба списка или перейти на allow-list (xfail) |
+| SEC-7 | low | `infer-image/llmhub_infer/front.py:178-185` | `/v1/%2e%2e/slots`: httpx нормализует точки, и апстрим получает `/slots`. Значит, с ключом API достижим любой путь llama-server (`/slots`, `/metrics`, …), а не только `/v1/*` и `/props`. Только для владельца ключа. | отклонять декодированный путь с сегментами `.`/`..` или не начинающийся с `/v1/` (xfail) |
+| SEC-8 | low | `src/llmhub/weights/auth_app.py:98,105` | Ошибки SQLite в `acct.bind_ip` / `acct.served` не перехвачены → 500 с трассой в журнале uvicorn. Токена в трассе нет; отказ закрытый (под уходит на HF). | тот же `except sqlite3.Error` → 503 `db_busy` |
+| SEC-9 | low | `weights_models.py:98` | `auth_listen` не проверяется на loopback. При `0.0.0.0:8096` валидатор становится публичным: подделав `X-Real-IP`, владелец токена может привязать op к чужому IP. | валидатор поля: только `127.0.0.1` / `::1` |
+| SEC-10 | low | `supervisor.py:135-148` | В docstring сказано «tmpfs», но `/run/llmhub` в образе — слой контейнера, не tmpfs: приватный TLS-ключ лежит на диске арендованного хоста весь срок пода. Провайдер и так видит env, поэтому low. | писать в `/dev/shm/llmhub` или удалять файлы после старта uvicorn |
+| SEC-11 | info | `acct.py:242` | Ротация через `copytruncate`, а также повторное использование inode при росте файла выше старого смещения → пропуск строк (недоучёт объёма). | T-371: logrotate `create` + `USR1`, без `copytruncate` |
+| SEC-12 | info | `auth_app.py:82`, `main()` | `log.info("op=… verdict=…")` не попадает в журнал: logging не настроен, uvicorn запущен с `log_level=warning`. Наблюдаемость сейчас только через `/metrics`. | T-371: `logging.basicConfig(level=INFO)` в `main` |
+| SEC-13 | info | `tokens.py:100,159` | `exp` с ведущими нулями проходит (подпись считается по `int`) — те же op и exp, вреда нет. Объём ответа в полёте не учитывается до его конца; превышение ограничено `segments × size`. | — |
+
+**Проверено, проблем нет** (подтверждено тестами)
+- *Валидатор:*
+  - порядок проверок и `compare_digest`; отзыв по состоянию инстанса;
+  - отказ при чужом op, чужом секрете, чужой роли (API-ключ вместо токена → `malformed`);
+  - точное совпадение `rel` закрывает `%2e%2e`, `//`, `%2F`, `/./`;
+  - плохие токены не трогают ни БД, ни `auth-state.db`.
+- *nginx (настоящий):*
+  - поддельные `X-Real-IP` / `X-Original-URI` / `X-Range` перезаписываются;
+  - query → 403 и не попадает в лог; HEAD без токена → 401;
+  - multi-range (50×`0-`) не усиливает отдачу; дешёвые Range не отдают больше списанного;
+  - токена нет ни в одном логе, включая `weights-error.log` при отказе `limit_conn`;
+  - `/metrics` отвечает только 127.0.0.1 и без op и токенов.
+- *KDF и секреты:*
+  - KDF разведены по доменам; Ed25519 из 32 байт HMAC;
+  - `repr` у `InstanceSpec`, `InstanceMaterial`, `InstanceSecrets`, `PodEnv` не показывает значения; `EnvError` тоже без значений; C11 выполняется.
+- *Pin в режиме `direct`:*
+  - единственный якорь — производный сертификат, системные CA не грузятся;
+  - `CERT_REQUIRED`, sha256(DER) сверяется с БД;
+  - нет отпечатка → отказ.
+- *Режим `proxy`:* только `https://`, без редиректов.
+- *Фронт пода:*
+  - без ключа открыт только `/ping`;
+  - `Authorization` апстриму не уходит;
+  - тело ≤ 8 МиБ.
+- *Загрузчик:*
+  - токен весов уходит только на netloc источника, `HF_TOKEN` — только на `huggingface.co`;
+  - редирект на `http://` отвергается;
+  - self_hosted: pin и проверка IP SAN.
+- *Образ:*
+  - FROM по digest, пины apt для python3.12, `pip --require-hashes`;
+  - в ENV, слоях и файлах секретов нет;
+  - `HEALTHCHECK NONE`; работает от root (принято в журнале).
+
+**Команды и результаты**
+- `uv run pytest tests/test_review_t370_sec_unit.py` — 24 passed, 12 xfailed; с `--runxfail` все 12 падают по заявленной причине.
+- `uv run pytest tests/test_review_t370_sec_nginx.py` (docker, nginx 1.25-alpine) — 9 passed, 2 xfailed. С `--runxfail` падают с `200 == 200 and 3072 == 3072` (SEC-1) и `860 == 0` (SEC-4).
+- Полный `uv run pytest` (slow + docker): до ревью — 953 passed; с новыми тестами обоих ревьюеров — 992 passed, 18 xfailed.
+- `uv run ruff check src tests` — чисто; `uv run pyright` — 0 errors.
+- Образ проверен через `docker image inspect` / `docker history --no-trunc` и `docker run --rm --entrypoint /bin/sh` (pip list, find). Образы не публиковались.
+
+**Вердикт:** changes required. Исправить SEC-1 и SEC-2 (SEC-4 закрывается той же правкой) и снять их `xfail`. SEC-3, SEC-5…SEC-10 желательно закрыть в этом же раунде (по 1–5 строк); иначе — во «Входящие» T-371. Статус задачи не меняю: параллельно идёт функциональный цикл ревью.
+
 ## Журнал
 - 2026-11-04: задача создана координатором при создании репозитория.
 - 2026-11-04: analyst — план `tasks/plans/T-370-plan.md`: 8 потоков (0 → A/B/C/D → E, G → F); по решению координатора (Q6 из T-369) облачный `HttpInferenceBackend` — поток G, протокол `InferenceBackend` заморожен (прогресс — отдельный `LoadStatusSource`). Загрузка весов в поде (entrypoint на Python), прогресс через `/health` пода, отдельный nginx с `auth_request`, токен HMAC с отзывом по состоянию инстанса, TLS сервера весов — self-signed + pin. Образ FROM `server-cuda12-b12063@sha256:d5ffba7d…` (CUDA 12.8.1, проверено), публикация — GHCR public (push — с разрешения). Блокирующих вопросов нет; Q1–Q5 в §10. Статус planned.
@@ -64,3 +172,22 @@
   - **G6**: composition root в коде пока нет (появится в T-369/T-371) — оставлены фабрики `make_material_fns` и `make_cloud_inference`; строка во «Входящие» T-371.
   - **F**: `tests/test_w_e2e_fetch.py` (docker, перенос D5): материал контроллера → `read_env` пода → `Fetcher` через настоящий nginx 1.25 + валидатор — загрузка с токеном (hf не тронут, подписи токена нет в логах nginx), докачка Range с `.part` (206 в access-логе), после READY → 403 → failover на фейковый hf без токена. `deploy/nginx-weights.conf`: таймауты `/_auth` (connect 2 с, send/read 5 с), `send_timeout 60s`, `keepalive_timeout 15s`. Контракт адаптера: пункт C11 (`secret_env` принимается и не возвращается в `create/get/list_owned`). Документы: `infer-image/README.md`, `deploy/README.md` (права, группа `weights-acct.log`, таймауты, порядок установки, толкование ADR-0138 п. 4), `README.md`, `docs/integration.md` (`finish_reason="error"`).
   - Проверки: `uv run pytest` (с slow и docker) — **953 passed**, 3 мин 50 с; `ruff check` чисто; `pyright` 0 errors. Не коммитилось, образы не публиковались, сервер и сеть провайдеров не трогались.
+- 2026-11-04: implementer, **раунд исправлений 1** (из ≤ 3) по ревью циклов 1 и 2, решения координатора. Находка → исправление → тест:
+  - **F1** → `HttpInferenceBackend.run` всегда шлёт поду `stream:true` + `stream_options.include_usage` (`force_stream`) и собирает SSE в один `chat.completion` (`assemble_sse`: content, reasoning_content, tool_calls, finish_reason, usage, timings; `error:`-событие → `finish_reason="error"`). Ожидание заголовков ограничено только `job_cap`, пауза до первого байта `read_s + prompt_s × factor`, затем `read_s`. 520–524 прокси → `NetworkLost` → `test_long_nonstream_job_within_cap_is_not_network_lost` (без xfail), `test_long_streamed_job_beyond_read_s_is_ok`, `test_assemble_sse_*`, `test_force_stream_*`, `test_proxy_52x_is_network_lost`; `test_run_read_timeout_network_lost` заменён на `test_run_header_wait_is_bounded_by_cap_not_read_s`; фейки `i_infer_fake.FakeInfer` и `Llama` (live) отвечают SSE на `stream:true`.
+  - **F2** → новое `JobRunError` (попытка считается): job_cap, пауза после заголовков, обрыв после заголовков, обрезанный SSE. `NetworkLost` — только connect/TLS/обрыв до заголовков, 502/503/504/52x без нашего JSON, 503 `restarting`. Ядро (`Controller._network_lost`): первый `NetworkLost` задачи на инстансе подряд бесплатен, со второго попытка считается (`NETWORK_LOST_FREE=1`, т. е. ≤ 2 подряд на пару job/instance — внутри «≤ 3» координатора; при 3 бесплатных тест ревьюера «≤ 2 × job_max_attempts» не выполним); 3 подряд `NetworkLost` на инстансе без завершённой задачи → `mark_lost("network_lost_repeated")`. Счётчики в памяти (рестарт контроллера ограничен `restarts`/`MAX_RESTARTS`) → `test_repeated_network_lost_with_live_front_is_bounded` (без xfail; 3 запуска вместо 45), `test_network_lost_bound_runs_and_instance_lost`, `test_single_network_lost_is_free`, `test_run_job_cap_counts_attempt`, `test_pause_after_headers_counts_attempt`, `test_drop_after_headers_counts_attempt`, `test_truncated_stream_counts_attempt`, `test_connect_error_before_headers_is_network_lost`; live: drop/stall → `JobRunError`.
+  - **F3** → `SLOW_CONFIRM_S = 30`; ETA = остаток / (done / время с начала LOADING_MODEL), если под сообщает байты (иначе ETA пода) → `test_dip_with_good_average_is_not_killed`, `test_slow_average_is_killed_after_confirm`; `test_slow_needs_two_polls_apart` переписан под 30 с.
+  - **F4** → `machine.transition` при выходе из LOADING_MODEL по любому ребру удаляет `load_progress:`/`load_slow_since:` (одна точка для E7 таймаута, mark_lost, kill, max_lifetime) → `test_progress_keys_cleared_after_timeout_e7` (без xfail; запрос теста уточнён: после E7 уже грузится НОВЫЙ инстанс, его ключ законен), `test_mark_lost_from_loading_clears_progress_keys`.
+  - **F5** (поток B) → `Accept-Encoding: identity`, `iter_raw`; не-identity `Content-Encoding` и `DecodingError` → сбой источника, следующий источник → `test_requests_identity_encoding` (без xfail), `test_f5_*`.
+  - **F6** → `exhausted`/`sha_mismatch`/`size_mismatch` → E7 без чёрного списка, инцидент high `weights_config` → `test_config_failures_do_not_blacklist_host[*]`.
+  - **F7** (B) → `Fetcher._missing_bytes` по sidecar (недостающие куски + запас) → `test_f7_*`.
+  - **F8** → `_prune()` перед каждым вызовом закрывает клиентов инстансов вне TALK_STATES → `test_clients_of_finished_instances_are_closed`. `aclose()` при остановке — за composition root (T-371).
+  - **F9** (B + бэкенд) → спавн llama под `shield`, при отмене ребёнок останавливается (`test_f9_cancel_during_spawn_leaves_no_orphan`); после первого выхода llama фронт отвечает 503 `{"error":"restarting"}`, `/health` — `restarting: true`; бэкенд → `NetworkLost` с ограничением ядра (а не `InstanceLost`) → `test_f9_front_reports_restarting_only_after_a_llama_exit`, `test_f9_supervisor_restart_is_reported`, `test_front_restarting_is_network_lost`. Ограничение: если перезапуск длится дольше ~3 попыток диспетчеризации, инстанс всё равно уйдёт в lost — деньги в безопасности.
+  - **SEC-1** (A) → `X-If-Range` к валидатору, при непустом — списывается весь файл; `max_ranges 1` → `test_if_range_does_not_bypass_volume_cap` (без xfail), `test_if_range_charges_the_whole_file`.
+  - **SEC-2/SEC-4** (A) → acct-лог только в gguf-location и только 200/206 (`map $status $acct_ok`), `location /` без лога → 404, `limit_req` на уровне server; `acct._refresh` читает кусками по 1 МиБ до последнего `\n` → `test_unauthenticated_requests_do_not_consume_victim_volume` (без xfail), `test_acct_*`, `test_catch_all_not_logged_and_server_rate_limited`.
+  - **SEC-3** (A) → `ConfigError` при совпадении секретов → `test_instance_and_weights_secret_must_differ` (без xfail).
+  - **SEC-5/6/7/10** (B) → `child_env` убирает `LLAMA_ARG_*`; deny-list сверен с `llama-server --help` из `llmhub-infer:dev`, одинаков в `supervisor` и `weights_models` (тест синхронности); фронт: allow-list путей после проверки сырого пути; TLS-файлы в `/dev/shm/llmhub` (tmpfs) → review-тесты без xfail, `test_sec6_*`, `test_sec7_*`, `test_sec10_*`.
+  - **SEC-8** (A) → `sqlite3.Error` в acct → 503 `db_busy` → `test_acct_sqlite_error_is_503_fail_closed`.
+  - **SEC-9** → валидатор `auth_listen`: только `127.0.0.1:<port>` / `[::1]:<port>` → `test_auth_listen_*`.
+  - **SEC-11/12/13** → `deploy/README.md` (logrotate `create` + USR1, без `copytruncate`, `maxsize`; `logging.basicConfig(INFO)` в `auth_app.main` — сделано; SEC-13 принято); SEC-10 — заметка про tmpfs/RunPod.
+  - Файлы: `src/llmhub/cloud_manager/{http_inference,provisioner,instance_env}.py`, `src/llmhub/controller.py`, `src/llmhub/lifecycle_manager/machine.py`, `src/llmhub/configuration/weights_models.py`, `src/llmhub/weights/{auth_app,acct}.py`, `infer-image/llmhub_infer/{fetch,front,supervisor}.py`, `infer-image/README.md`, `deploy/{nginx-weights.conf,README.md}`; тесты: новые `tests/test_fix1_t370_{core,weights_unit,pod_fixes}.py`, изменены `tests/{i_infer_fake,i_llama_fake,test_g_http_inference,test_g_http_inference_live,test_w_provisioner_loading,test_w_nginx_conf,test_i_supervisor}.py`, с review-тестов сняты все xfail.
+  - Проверки: полный `uv run pytest -q -p no:cacheprovider` (slow + docker) 3 раза подряд — 1126 passed (3:22) · 1126 passed (3:25) · 1126 passed (3:59), 0 xfailed / FAILED / ERROR; `ruff check src tests infer-image` чисто; `pyright` 0 errors. Не коммитилось, образы не публиковались. Статус: review (повторное ревью).

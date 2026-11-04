@@ -24,8 +24,8 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Route
 
-from i_infer_fake import chat_body
-from llmhub.cloud_manager.http_inference import HttpInferenceBackend
+from i_infer_fake import chat_body, sse_from_chat
+from llmhub.cloud_manager.http_inference import HttpInferenceBackend, JobRunError
 from llmhub.cloud_manager.inference import JobRunSpec, NetworkLost
 from llmhub.cloud_manager.instance_env import InstanceSecrets, derive_api_key, derive_tls
 from llmhub.persistence.db import connect, migrate
@@ -48,8 +48,11 @@ class Llama:
             return JSONResponse({"status": "ok"})
 
         async def chat(request: Request) -> Response:
-            await request.body()
-            payload = json.dumps(chat_body()).encode()
+            raw = await request.body()
+            wants_stream = json.loads(raw).get("stream") is True
+            # fix round 1 F1: the backend always asks for stream:true -> SSE like llama-server
+            payload = sse_from_chat(chat_body()) if wants_stream else json.dumps(chat_body()).encode()
+            media = "text/event-stream" if wants_stream else "application/json"
             mode = self.mode
 
             async def gen() -> AsyncIterator[bytes]:
@@ -61,7 +64,7 @@ class Llama:
                     await asyncio.sleep(30)
                 raise RuntimeError("llama died mid-body")
 
-            return StreamingResponse(gen(), media_type="application/json")
+            return StreamingResponse(gen(), media_type=media)
 
         return Starlette(
             routes=[Route("/health", health), Route("/v1/chat/completions", chat, methods=["POST"])]
@@ -149,11 +152,12 @@ async def test_direct_derived_tls_full_cycle(tmp_path: Path) -> None:
         assert await lv.backend.test_request(ep)
         res = await lv.backend.run(ep, job())
         assert (res.tokens_in, res.tokens_out, res.finish_reason) == (11, 7, "length")
+        # fix round 1 F2: a drop / stall AFTER the response headers counts an attempt
         llama.mode = "drop"
-        with pytest.raises(NetworkLost):
+        with pytest.raises(JobRunError):
             await lv.backend.run(ep, job())
         llama.mode = "stall"
-        with pytest.raises(NetworkLost):
+        with pytest.raises(JobRunError):
             await lv.backend.run(ep, job())
         await lv.backend.aclose()
     assert lv.pins == []

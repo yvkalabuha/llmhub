@@ -38,6 +38,34 @@ def chat_body(*, usage: bool = True, timings: bool = True, choices: int = 1) -> 
     return body
 
 
+def sse_from_chat(chat: dict[str, Any], *, done: bool = True) -> bytes:
+    """llama-server-like SSE for a chat.completion: role, content pieces, finish, usage."""
+    base = {k: chat[k] for k in ("id",) if k in chat}
+    base["object"] = "chat.completion.chunk"
+    events: list[dict[str, Any]] = []
+    for ch in chat.get("choices", []):
+        idx = ch.get("index", 0)
+        msg = ch.get("message", {})
+        events.append({**base, "choices": [{"index": idx, "delta": {"role": "assistant"},
+                                             "finish_reason": None}]})  # fmt: skip
+        text = msg.get("content") or ""
+        for i in range(0, len(text), 2):
+            events.append({**base, "choices": [{"index": idx, "delta": {"content": text[i:i+2]},
+                                                 "finish_reason": None}]})  # fmt: skip
+        for tc_i, tc in enumerate(msg.get("tool_calls", [])):
+            events.append({**base, "choices": [{"index": idx, "delta": {"tool_calls": [
+                {"index": tc_i, **tc}]}, "finish_reason": None}]})  # fmt: skip
+        events.append({**base, "choices": [{"index": idx, "delta": {},
+                                             "finish_reason": ch.get("finish_reason")}]})  # fmt: skip
+    tail: dict[str, Any] = {**base, "choices": []}
+    for k in ("usage", "timings"):
+        if k in chat:
+            tail[k] = chat[k]
+    events.append(tail)
+    out = b"".join(b"data: " + json.dumps(e).encode() + b"\n\n" for e in events)
+    return out + (b"data: [DONE]\n\n" if done else b"")
+
+
 @dataclass
 class FakeInfer:
     key: str
@@ -65,6 +93,9 @@ class FakeInfer:
     drop_after: int | None = None  # send N bytes then break the connection
     proxy_no_pod: bool = False  # RunPod proxy page instead of our front (502 HTML)
     health_html: bool = False  # /health answered by a proxy page
+    restarting: bool = False  # llama-server's single restart in progress (front F9 contract)
+    sse: bool = True  # answer `stream: true` requests with SSE built from `chat` (as llama)
+    sse_done: bool = True  # end the SSE stream with `data: [DONE]`
     seen: list[tuple[str, dict[str, str], bytes]] = field(default_factory=list)
 
     def app(self) -> Starlette:
@@ -102,9 +133,19 @@ class FakeInfer:
                 return JSONResponse({"error": "unauthorized"}, 401)
             if self.phase == "failed":
                 return JSONResponse({"status": "failed", "reason": self.reason}, 500)
+            if self.restarting:
+                return JSONResponse({"error": "restarting"}, 503)
             if self.phase != "ok":
                 return JSONResponse({"error": "not ready"}, 503)
             payload = self.chat_raw if self.chat_raw is not None else json.dumps(self.chat).encode()
+            media = self.chat_content_type
+            try:
+                wants_stream = json.loads(raw).get("stream") is True
+            except (ValueError, AttributeError):
+                wants_stream = False
+            if wants_stream and self.sse and self.chat_raw is None and self.chat_status == 200:
+                payload = sse_from_chat(self.chat, done=self.sse_done)
+                media = "text/event-stream"
 
             async def gen() -> AsyncIterator[bytes]:
                 if self.delay_s:
@@ -118,9 +159,7 @@ class FakeInfer:
                     await asyncio.sleep(3600)
                 raise ConnectionResetError("dropped")
 
-            return StreamingResponse(
-                gen(), status_code=self.chat_status, media_type=self.chat_content_type
-            )
+            return StreamingResponse(gen(), status_code=self.chat_status, media_type=media)
 
         return Starlette(
             routes=[
