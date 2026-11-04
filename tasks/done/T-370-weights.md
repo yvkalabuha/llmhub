@@ -5,7 +5,7 @@
 - Проект: llmhub
 - Тип: impl
 - Агент: analyst → implementer → reviewer
-- Статус: review
+- Статус: done
 - План: tasks/plans/T-370-plan.md
 - Приоритет: P1
 - Зависит от: T-368
@@ -177,6 +177,41 @@ src/ и infer-image/ не менялись. Добавлены только те
 
 **Вердикт: changes required** (раунд 2 из 3). Для implementer: исправить R2-1 и снять xfail с `test_repeated_weights_failures_are_braked`. R2-5 — желательно. Раунд 3 — последний; если R2-1 не закроется, список нерешённого уходит заказчику.
 
+## Ревью (раунд 3, финал)
+> TL;DR: финальное ревью коммита 816a60b (раунд 3 из 3). R2-1 закрыт: под отдаёт `causes`, классификация конфиг/хост верна, удержание `weights_hold:<pool>` не обходится ни prewarm, ни срочными задачами, переживает перезапуск, снимается админом или сменой конфига. R2-5, R2-7 и правка координатора 408/429 → `rate_limited` проверены. Blocker/major нет. Вердикт: **accept → done**. Три low-замечания переданы дальше (T-371/T-372).
+
+**Проверка R2-1**
+- Под. `Fetcher` при `exhausted` отдаёт `causes` — отсортированное множество причин из `failovers`. Цепочка `FetchError.causes` → `PodState.fail` → `failed_body()` (500). `parse_load_status` обрезает список до 16 элементов по 32 символа и отбрасывает не-строки.
+- Классификация (`provisioner.is_config_failure`). Сбой считается ошибкой конфига, если `reason` ∈ {sha, size, http_4xx}, или если это `exhausted` и все `causes` из этого же множества. Пустые `causes` (старый под), смесь причин, `network`/`slow`/`http_5xx`/`rate_limited`/`disk` → хост в чёрный список, как раньше. Деньги в безопасности: при ошибке классификации в любую сторону срабатывает либо удержание пула, либо чёрный список с `MAX_FAILED_CYCLES`.
+- Удержание. `weights_hold:<pool>` пишется в той же транзакции, что E7 (после CAS), значение `{until, fp, cause}`; инцидент `weights_config` critical с `causes`/`hold_until`/`pool`. Побочных эффектов у critical нет (никакого HALT), это только сигнал.
+- Возможные обходы:
+  - prewarm-lease: без задач возвращается `held`, запуска нет (тест implementer);
+  - срочные задачи: проверка удержания стоит до `launch_trigger`, `MAX_FAILED_CYCLES` и срочной ветки. Новый тест `test_urgent_job_while_held_goes_local_without_launch` подтверждает: 0 запусков, `fallback_reason=deployment_error`;
+  - других путей запуска нет: `insert_provisioning` вызывается только из `_maybe_launch`, а тот — только при отсутствии живого инстанса;
+  - смена отпечатка: `fp` = sha256(набор весов пула + цепочка источников). Перезапуск с тем же конфигом удержание сохраняет. Смена конфига снимает удержание: это задумано, худший случай — один запуск и новое удержание.
+- Fallback. `_fallback_pool` ставит `pool=NULL`, `route=local:fallback`, `fallback_reason=deployment_error` (значение из закрытого `UnavailableReason`), снимает резерв задачи и закрывает неявный lease. После `return now` очередь пула пуста, холостого цикла нет.
+
+**Проверка R2-5, R2-7 и правки координатора**
+- R2-5. `_prune_netlost` вызывается каждый шаг после `_check_alive`: запросы порциями по 500, удаляются записи инстансов вне READY/BUSY/IDLE и задач не в queued/running с пулом, жёсткий предел 4096. Корректно.
+- R2-7. Оценка ceil(символы/4) (content + reasoning + tool_calls), не больше `max_tokens`. Применяется только без `usage` и без `timings`, при этом пишется warning. Корректно.
+- 408/429 → `_Fail("rate_limited", retry=True)`. Повторы ограничены `retries_per_source`, ошибкой конфига не считается никогда. Собственный nginx при `limit_req`/`limit_conn` отвечает 503 (`http_5xx`), не 429.
+
+**Находки раунда 3** (все low, не блокируют)
+| # | Где | Сев. | Суть | Решение |
+|---|---|---|---|---|
+| R3-1 | `provisioner.is_config_failure` + `fetch._status_fail` | low (деньги, ограничено) | `rate_limited` (например, HF 429) ведёт по пути «вина хоста»: в чёрный список попадает ни в чём не виноватый хост Runpod, а каждая волна задач даёт до `MAX_FAILED_CYCLES`=3 платных запусков (тесты `test_rate_limited_*`). Тот же предел, что для `network`, принятый в раунде 2. Сбой происходит в начале загрузки, поэтому каждый запуск короткий. | принять. На T-372 проверить, бывает ли 429 у HF на практике; если да — короткое удержание пула (~1 ч) после N подряд `exhausted` только с `rate_limited`. |
+| R3-2 | `Controller.clear_weights_hold` | low | Снять удержание можно только через Python-метод: HTTP- или CLI-ручки нет. При этом исправление на стороне сервера весов (битый файл, HF-токен в env) не меняет `fp`, и без ручного снятия удержание держится до `host_blacklist_s` (24 ч). | Входящее в T-371: admin-ручка или CLI `clear-weights-hold <pool>` и строка в runbook рядом с инцидентом `weights_config`. |
+| R3-3 | `RetryConfig.host_blacklist_s` | info | Нижней границы нет: при 0 удержание и чёрный список отключаются молча. | По желанию: `Field(ge=3600)` или предупреждение загрузчика конфига (T-371). |
+
+**Добавлено ревьюером:** `tests/test_review_r3_t370.py`, 3 теста: срочная задача при удержании; `rate_limited` → чёрный список без удержания; предел запусков по волнам. Продуктовый код не менялся.
+
+**Команды и результаты**
+- `uv run pytest tests/test_review_r3_t370.py tests/test_fix2_t370.py tests/test_coord_t370_ratelimit.py` → 38 passed.
+- Полный `uv run pytest -q -p no:cacheprovider` (slow + docker), 3 раза подряд: 1175 passed (3:35; новый файл ревью ещё не был собран целиком) · 1178 passed (3:26) · 1178 passed (3:27). Ни FAILED, ни ERROR, ни xfail; 1 предупреждение (было и раньше).
+- `uv run ruff check src tests infer-image` — чисто; `uv run pyright` — 0 errors.
+
+**Критерии приёмки** выполнены (см. раунды 1–2 и проверку выше). **Вердикт: accept → done.**
+
 ## Журнал
 - 2026-11-04: задача создана координатором при создании репозитория.
 - 2026-11-04: analyst — план `tasks/plans/T-370-plan.md`: 8 потоков (0 → A/B/C/D → E, G → F); по решению координатора (Q6 из T-369) облачный `HttpInferenceBackend` — поток G, протокол `InferenceBackend` заморожен (прогресс — отдельный `LoadStatusSource`). Загрузка весов в поде (entrypoint на Python), прогресс через `/health` пода, отдельный nginx с `auth_request`, токен HMAC с отзывом по состоянию инстанса, TLS сервера весов — self-signed + pin. Образ FROM `server-cuda12-b12063@sha256:d5ffba7d…` (CUDA 12.8.1, проверено), публикация — GHCR public (push — с разрешения). Блокирующих вопросов нет; Q1–Q5 в §10. Статус planned.
@@ -246,3 +281,4 @@ src/ и infer-image/ не менялись. Добавлены только те
   - Файлы: `infer-image/llmhub_infer/{fetch,front,supervisor}.py`, `infer-image/README.md`, `src/llmhub/cloud_manager/{load_status,provisioner,http_inference}.py`, `src/llmhub/controller.py`, `src/llmhub/provider_adapters/mock_inference.py` (`load_causes`). Тесты: новый `tests/test_fix2_t370.py` (33: классификация, `causes` от Fetcher и front, разбор с ограничениями, удержание (без запусков на 4 волнах, истечение, снятие админом, перезапуск, prewarm, смена конфига, нечитаемый ключ), чёрный список при смешанных причинах, R2-5 очистка и ограничение размера, R2-7). Изменены `tests/test_fix1_t370_core.py` (F6 с `causes`), `tests/test_review_r2_t370_unit.py` (снят xfail, `test_repeated_weights_failures_are_braked` проходит), `tests/test_i_supervisor.py` (`causes == ["http_4xx"]`), `tests/test_g_http_inference.py` (R2-7).
   - Мутационная проверка: если отключить удержание в `_maybe_launch`, падают 5 тестов удержания.
   - Проверки: полный `uv run pytest -q -p no:cacheprovider` (slow + docker) 3 раза подряд — 1173 passed (3:29) · 1173 passed (3:27) · 1173 passed (3:27); xfailed, FAILED и ERROR нет. `ruff check` чисто, `pyright` 0 errors. Не коммитилось. Статус: review (раунд 3).
+- 2026-11-04: reviewer, раунд 3 (финал): R2-1, R2-5, R2-7, 408/429 подтверждены; +3 теста ревью; R3-1…3 low → T-371/T-372. Статус done.
