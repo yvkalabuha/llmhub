@@ -30,6 +30,9 @@ GRAPHQL_URL = "https://api.runpod.io/graphql"
 MAX_PAGES = 50
 _BODY_SCAN = 4096
 
+OUR_PREFIX = "llmhub-"  # pods with this name prefix are parsed strictly (R3-6)
+_log = logging.getLogger("llmhub.runpod")
+
 # httpx logs request URLs at INFO; keep it quiet (no ids or hosts in the service log)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 
@@ -90,8 +93,9 @@ class GpuTypeInfo:
     id: str
     display_name: str
     memory_gb: int
+    # `communityPrice` when `communityCloud` is true (R3-3), else None: the Community offer
     community_price: float | None
-    stock_status: str | None
+    stock_status: str | None  # `lowestPrice(input: {gpuCount: 1}).stockStatus`: a hint only
 
 
 @dataclass(frozen=True)
@@ -281,10 +285,19 @@ def _named(raw: Any, p: _Parser) -> NamedRef:
     return NamedRef(id=p.req_str(d, "id"), name=p.req_str(d, "name"))
 
 
+# R3-3: the real API answers `lowestPrice(input: {gpuCount: 1, secureCloud: false})` with nulls
+# for every type (L1, 2026-11-04); the Community price is `communityPrice` + `communityCloud` of
+# the type itself. `lowestPrice(input: {gpuCount: 1})` may quote a Secure price, so only its
+# `stockStatus` is read (a hint: a null never drops the offer; no capacity -> POST refused).
 _GPU_FIELDS = (
-    "id displayName memoryInGb lowestPrice(input: {gpuCount: 1, secureCloud: false})"
-    " { uninterruptablePrice stockStatus }"
+    "id displayName memoryInGb communityPrice communityCloud"
+    " lowestPrice(input: {gpuCount: 1}) { stockStatus }"
 )
+
+
+class UnlistedPodError(RunpodHttpError):
+    """GET/DELETE /pods/{id} -> 400 and the pod is not in `GET /pods`, but the caller asked
+    not to trust an unlisted pod as gone (it is too young for the list, R3-5)."""
 
 
 class RunpodApi:
@@ -407,12 +420,31 @@ class RunpodApi:
 
     # --- pods ----------------------------------------------------------------
     async def list_pods(self) -> list[PodInfo]:
+        """Every pod. An item named `llmhub-*` is parsed strictly (it may be ours: a bad shape
+        raises). Any other item that does not parse (openapi `Pod` has no `required`: no
+        string `name`, an odd `costPerHr`...) is skipped as foreign: a malformed foreign pod
+        must not blind the reaper or `max_live_pods` (R3-6)."""
         p = _Parser("GET", "/pods")
-        return [parse_pod(x, p) for x in await self._list("/pods", "/pods")]
+        out: list[PodInfo] = []
+        skipped = 0
+        for x in await self._list("/pods", "/pods"):
+            name = x.get("name") if isinstance(x, dict) else None
+            if isinstance(name, str) and name.startswith(OUR_PREFIX):
+                out.append(parse_pod(x, p))
+                continue
+            try:
+                out.append(parse_pod(x, p))
+            except RunpodParseError:
+                skipped += 1
+        if skipped:
+            _log.warning("runpod: %d malformed foreign pod(s) skipped in GET /pods", skipped)
+        return out
 
-    async def get_pod(self, pod_id: str) -> PodInfo | None:
+    async def get_pod(self, pod_id: str, *, trust_unlisted: bool = True) -> PodInfo | None:
         """None = no such pod. The openapi documents 400 and 404 for GET /pods/{id}: a 400 is
-        checked against the full list (R2-7): not listed -> None, else the 400 is raised."""
+        checked against the full list (R2-7): not listed -> None (or `UnlistedPodError` when
+        `trust_unlisted` is False: the list may lag behind a young pod, R3-5), else the 400
+        is raised."""
         try:
             raw = await self._rest("GET", f"/pods/{_seg(pod_id, 'GET')}", "/pods/{id}",
                                    allow_404=True)  # fmt: skip
@@ -421,7 +453,11 @@ class RunpodApi:
                 raise
             listed = next((x for x in await self.list_pods() if x.id == pod_id), None)
             if listed is None:
-                return None
+                if trust_unlisted:
+                    return None
+                raise UnlistedPodError(method=exc.method, path=exc.path, status=400,
+                                       code="unlisted", retry_after_s=None,
+                                       sent=True) from None  # fmt: skip
             raise
         return None if raw is None else parse_pod(raw, _Parser("GET", "/pods/{id}"))
 
@@ -429,16 +465,17 @@ class RunpodApi:
         raw = await self._rest("POST", "/pods", "/pods", body=body)
         return parse_pod(raw, _Parser("POST", "/pods"))
 
-    async def delete_pod(self, pod_id: str) -> bool:
+    async def delete_pod(self, pod_id: str, *, trust_unlisted: bool = True) -> bool:
         """True = accepted, False = already gone. The openapi documents DELETE /pods/{id} ->
         204/400/401 (no 404): a 400 (or 404) is checked with `get_pod` (REV-S4/R2-7); gone
-        or TERMINATED -> False, otherwise the original error is raised."""
+        or TERMINATED -> False, otherwise the original error is raised. `trust_unlisted`
+        is passed to `get_pod` (R3-5)."""
         try:
             await self._rest("DELETE", f"/pods/{_seg(pod_id, 'DELETE')}", "/pods/{id}")
         except RunpodHttpError as exc:
             if exc.status not in (400, 404) or isinstance(exc, RunpodParseError):
                 raise
-            pod = await self.get_pod(pod_id)
+            pod = await self.get_pod(pod_id, trust_unlisted=trust_unlisted)
             if pod is None or pod.desired_status.upper() == "TERMINATED":
                 return False
             raise
@@ -464,13 +501,16 @@ class RunpodApi:
             data = await self._graphql(query, "graphql:gpuTypes")
             for raw in p.arr(data.get("gpuTypes"), "gpuTypes"):
                 d = p.obj(raw, "gpuType")
+                community = d.get("communityCloud")
+                if community is not None and not isinstance(community, bool):
+                    raise p.fail("communityCloud")
+                price = p.money(d, "communityPrice")  # number or numeric string
+                if community is not True or price is None or price <= 0:
+                    price = None  # no Community offer for this type
                 low = d.get("lowestPrice")
-                price: float | None = None
                 stock: str | None = None
                 if low is not None:
-                    lp = p.obj(low, "lowestPrice")
-                    price = p.number(lp, "uninterruptablePrice", optional=True)
-                    stock = p.string(lp, "stockStatus", optional=True)
+                    stock = p.string(p.obj(low, "lowestPrice"), "stockStatus", optional=True)
                 out.append(GpuTypeInfo(
                     id=p.req_str(d, "id"), display_name=p.req_str(d, "displayName"),
                     memory_gb=int(p.req_num(d, "memoryInGb")), community_price=price,

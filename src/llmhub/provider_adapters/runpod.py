@@ -3,7 +3,8 @@
 Safety rules (each one has a test in tests/test_t372_runpod_adapter.py):
 1. `create` sends at most ONE `POST /pods`, never retried. Before it: the image is pinned by
    digest, the transport is `proxy`, the offer is an allowed GPU type whose current Community
-   price is <= min(spec.max_price_usd_h, price_ceiling_usd_h), and fewer than `max_live_pods`
+   price (`communityPrice` with `communityCloud` true, R3-3) is
+   <= min(spec.max_price_usd_h, price_ceiling_usd_h), and fewer than `max_live_pods`
    `llmhub-*` pods exist in ANY status except TERMINATED (EXITED/CREATED/RESTARTING count,
    critic F6). A failed pre-check (including a failed listing) is a definite refusal
    (`outcome_unknown=False`). After a 2xx the answer is checked (REV-S10): name == label,
@@ -13,8 +14,10 @@ Safety rules (each one has a test in tests/test_t372_runpod_adapter.py):
 2. `list_owned` = pods + network volumes (`vol:`) + templates (`tpl:`) with the prefix; any
    failed list or page raises: never a partial list, never `[]` on failure.
 3. `destroy` deletes pods only (2xx -> ACCEPTED; 400/404 and `GET` says gone or TERMINATED ->
-   ALREADY_GONE, REV-S4); `vol:`/`tpl:` refs are refused without an HTTP call (F4: we never
-   create them, so they are a stop condition).
+   ALREADY_GONE, REV-S4); `GET` 400 + "not in the list" counts as gone only when the pod was
+   first known >= `list_staleness_s` ago (R3-5; else a retryable unknown error);
+   `vol:`/`tpl:` refs are refused without an HTTP call (F4: we never create them, so they
+   are a stop condition).
 4. The pod `env` is never parsed or kept (C11); errors carry no body and no key.
 """
 
@@ -49,6 +52,7 @@ from llmhub.provider_adapters.runpod_api import (
     RunpodApi,
     RunpodHttpError,
     RunpodParseError,
+    UnlistedPodError,
 )
 
 log = logging.getLogger("llmhub.runpod")
@@ -159,6 +163,9 @@ def normalize_runpod_error(exc: BaseException) -> NormalizedError:
         return exc.err
     if isinstance(exc, RunpodParseError):
         return _err(UnavailableReason.PROVIDER_API_ERROR, str(exc), unknown=True)
+    if isinstance(exc, UnlistedPodError):  # R3-5: gone or not listed yet: ask again later
+        return _err(UnavailableReason.PROVIDER_API_ERROR, str(exc), retryable=True,
+                    unknown=True, status=exc.status)  # fmt: skip
     if isinstance(exc, RunpodHttpError):
         st, code, msg = exc.status, exc.code, str(exc)
         if st in (401, 403):
@@ -208,6 +215,9 @@ class RunpodAdapter:
         self.clock = clock
         self.disk_gb_hint = disk_gb_hint
         self.port = port
+        # R3-5: pod id -> first time this process knew it (create answer, first get/destroy).
+        # "400 and not in the list" means gone only once the list had time to show the pod.
+        self._first_known: dict[str, float] = {}
 
     def __repr__(self) -> str:
         return f"RunpodAdapter(cloud_type={self.cfg.cloud_type!r})"
@@ -215,6 +225,16 @@ class RunpodAdapter:
     @property
     def list_staleness_s(self) -> float:
         return float(self.cfg.list_staleness_s)
+
+    def _trust_unlisted(self, ref: str) -> bool:
+        """True when `ref` was first known at least `list_staleness_s` ago (R3-5)."""
+        now = self.clock.now()
+        horizon = max(self.list_staleness_s * 10, 86400.0)
+        if len(self._first_known) > 1024:  # forget very old ids (bounded memory)
+            self._first_known = {k: t for k, t in self._first_known.items()
+                                 if now - t < horizon}  # fmt: skip
+        first = self._first_known.setdefault(ref, now)
+        return now - first >= self.list_staleness_s
 
     def _disk_usd_h(self, disk_gb: int) -> float:
         return disk_gb * self.cfg.container_disk_usd_gb_month / HOURS_PER_MONTH
@@ -251,8 +271,8 @@ class RunpodAdapter:
         infos = await self._call(self.api.gpu_types([gid]))
         out: list[Offer] = []
         for g in infos:
-            if g.id != gid or g.stock_status is None or g.community_price is None:
-                continue  # out of stock / no Community price: no offer
+            if g.id != gid or g.community_price is None:
+                continue  # no Community price (communityCloud false/null): no offer (R3-3)
             out.append(Offer(
                 provider=self.name, offer_id=g.id, gpu=q.gpu, gpu_count=1, vram_gb=g.memory_gb,
                 price_usd_h=g.community_price, disk_usd_h=self._disk_usd_h(self.disk_gb_hint),
@@ -282,7 +302,8 @@ class RunpodAdapter:
             raise _refuse(UnavailableReason.PROVIDER_API_ERROR, f"price check: {exc}",
                           retryable=True) from None  # fmt: skip
         info = next((g for g in infos if g.id == spec.offer_id), None)
-        if info is None or info.stock_status is None or info.community_price is None:
+        # R3-3: stockStatus is a hint only; no capacity -> POST `no_capacity` (a definite refusal)
+        if info is None or info.community_price is None:
             raise _refuse(UnavailableReason.GPU_UNAVAILABLE, "no community offer", retryable=True)
         if info.community_price > ceiling:
             raise _refuse(UnavailableReason.DEPLOYMENT_ERROR,
@@ -301,6 +322,7 @@ class RunpodAdapter:
             pod = await self.api.create_pod(body)
         except RunpodHttpError as exc:
             raise ProviderError(normalize_runpod_error(exc)) from None
+        self._first_known.setdefault(pod.id, self.clock.now())
         what = created_mismatch(pod, label, ceiling)
         if what is not None:
             log.error("runpod: created pod %s has unexpected %s; the caller destroys it",
@@ -317,7 +339,8 @@ class RunpodAdapter:
                 if r.ref == ref:
                     return r
             return None
-        pod = await self._call(self.api.get_pod(ref))
+        trust = self._trust_unlisted(ref)
+        pod = await self._call(self.api.get_pod(ref, trust_unlisted=trust))
         return None if pod is None else self._pod(pod)
 
     async def _extras(self) -> list[RemoteResource]:
@@ -339,7 +362,8 @@ class RunpodAdapter:
                 UnavailableReason.DEPLOYMENT_ERROR,
                 "refused: llmhub deletes pods only; remove volumes/templates by hand (F4)",
             ))  # fmt: skip
-        deleted = await self._call(self.api.delete_pod(ref))
+        trust = self._trust_unlisted(ref)
+        deleted = await self._call(self.api.delete_pod(ref, trust_unlisted=trust))
         return DestroyResult.ACCEPTED if deleted else DestroyResult.ALREADY_GONE
 
     async def balance(self) -> Balance | None:

@@ -138,6 +138,63 @@ def parse_pods(raw):            # minimal: extra fields never block a deletion
 
 ### Вердикт
 Корректность против настоящего API: **не принято**. До P0/L0 исправить blocker R2-0 и R2-1. До L2b исправить major R2-2 и R2-6, а R2-8 закрыть в чек-листе. R2-7 и R2-10 проверяются в L1/L2b по шагам выше. Minor R2-3, R2-4, R2-5 и R2-9 — желательно в том же раунде. После исправлений снять `xfail` с тестов в `tests/test_review_t372_fn_runpod_real.py`.
+## Ревью (цикл 3: повторное)
+> TL;DR: Ревьюер, 2026-11-04, код 0828b3d (dist/0.3.1). Исправления раунда 1 по REV-S1..S10, REV-A1 и R2-0..R2-10 на месте и закрыты тестами, регрессий нет. Но к живому тесту **не готово**, 2 blocker: сторож падает под интерпретатором юнита (`/usr/bin/python3` 3.10 на рабочей станции, `dt.UTC` появился только в 3.11), а запрос офферов GraphQL на настоящем API даёт null (результат L1 координатора), поэтому create невозможен. Деньги при этом не теряются: без оффера нет ни одного POST. Статус не менялся.
+
+Сеть RunPod и GitHub не трогал, ssh и push не делал, `src/` и `scripts/` не менял. Данные L1 (GraphQL, `GET /pods`) получены от координатора, сырые ответы — в scratchpad, в git их нет. Новые тесты: `tests/test_review_t372_r3_guard.py` (10 passed, 2 xfail) и `tests/test_review_t372_r3_adapter.py` (2 passed, 2 xfail). Все `xfail(strict=True)` проверены через `--runxfail`: каждый падает по своей заявленной причине.
+
+### Находки
+| ID | Серьёзность | Где | Суть → исправление |
+|---|---|---|---|
+| R3-1 | **blocker** | `scripts/runpod_guard.py:177,344,475,476,524`; `deploy/workstation/llmhub-runpod-guard.service:10` | В юните `ExecStart=/usr/bin/python3`, а на рабочей станции это Python 3.10.12. `dt.UTC` есть только с 3.11. Поэтому `watch_pass` падает на строке 524 (AttributeError, код 1) **до** проверки порогов, и автоудаление D3 не срабатывает ни разу. `record` (L1 п. 8, L2b) падает так же. Код 1 не входит в условия остановки. В L0 этого не видно: без rw-ключа юнит выходит с кодом 2 ещё до прохода. Впервые падение проявится в L2b, когда под уже жив. Тесты гоняют сторож под 3.12 из venv, поэтому дефект прошёл (xfail `test_guard_watch_pass_runs_under_the_unit_interpreter`). Проверено: с заменой `dt.UTC` → `dt.timezone.utc` тот же проход под 3.10 удаляет под и даёт код 6. → (1) заменить `dt.UTC` на `dt.timezone.utc` (4 места); (2) в `_time` дополнять дробную часть до 6 цифр: `fromisoformat` в 3.10 не принимает `…:00.12Z`, сейчас это мягкий STOP (код 4); (3) тест сторожа под `/usr/bin/python3` (тот, что выше, без xfail); (4) в docstring/README — «stdlib, Python ≥ 3.10» |
+| R3-3 | **blocker** (тест не запустить; деньги не теряются) | `src/llmhub/provider_adapters/runpod_api.py:284-287` (`_GPU_FIELDS`), `:459-479`; `runpod.py:254,285`; `tests/runpod_fake.py:315-330`; `docs/t372-live-test.md` L1 п. 6 | Результат L1 координатора: `lowestPrice(input:{gpuCount:1, secureCloud:false})` отдаёт null **для всех** типов GPU. Адаптер шлёт именно этот запрос. Значит `list_offers` → `[]`, предпроверка create → `refused: no community offer`, `lifecycle-probe` и L3–L6 невозможны. POST при этом не уходит (`test_no_offer_means_no_post_today`). Фейк отвечает ценой на любой запрос и дефект скрыл (xfail `test_offer_found_on_real_graphql_answer`, `test_create_precheck_passes_on_real_graphql_answer`). → Поля: `id displayName memoryInGb communityPrice communityCloud lowestPrice(input: {gpuCount: 1}) { stockStatus }`. Оффер есть, если `communityCloud is True` и `communityPrice` — число. `stockStatus` — только подсказка: при null оффер не отбрасывать, отсутствие мощности даст отказ POST (`no_capacity` → GPU_UNAVAILABLE, определённый отказ). `uninterruptablePrice` у `lowestPrice` без `secureCloud` может оказаться ценой Secure — для потолка его не брать. Потолок по-прежнему проверяется дважды: `communityPrice` ≤ ceiling до POST и `costPerHr` после 2xx (`created_mismatch` → `CreatedResourceRejected`). Фейк перевести на эту форму (null при `secureCloud`). В L1 п. 6 исправить команду и ожидание: `communityPrice` ≈ 0,22, `communityCloud: true` |
+| R3-2 | major | `scripts/runpod_guard.py:129-130` + `:349-363` | `http_json` возвращает DELETE 404 как успех (`None`), поэтому `delete_pod` проверяет через GET только 400, а ветка 404 в `delete_pod` мертва. Если 404 пришёл на живой под (неверный путь, сбой API), сторож печатает `destroyed … deleted`, и под живёт дальше. Потом каждую минуту будет код 6, то есть тихой потери нет, но «удалён» — ложь (xfail `test_guard_delete_404_with_live_pod_is_a_failure`). Адаптер этот случай обрабатывает правильно (404 → `get_pod`). → Убрать особый случай DELETE 404 из `http_json`: 404 пусть идёт по тому же пути, что 400, через GET |
+| R3-4 | minor (чек-лист) | `docs/t372-live-test.md` L0, «Условия остановки» п. 1 | (а) В L0 сказано: «journalctl … одна строка llmhub_pods=0». Без rw-ключа это невозможно: юнит выходит с кодом 2 до прохода. Значит, в L0 работоспособность юнита не проверяется вообще (так и скрылся R3-1). → В L0 запустить тем же интерпретатором, что и юнит: `/usr/bin/python3 -I ~/.local/lib/llmhub-guard/runpod_guard.py watch --once --key-file … --before $ST/before.json --state-dir $ST/dry` → код 0 и строка `llmhub_pods=0`. В L2 после установки rw-ключа и **до** пробы: `systemctl --user start llmhub-runpod-guard.service; journalctl … -n 3` → код 0 и `llmhub_pods=0`. (б) Условие остановки: «любой ненулевой код юнита после L2 (включая 1 и 2)», а также строка `guard expired` до L8 |
+| R3-5 | minor | `runpod_api.py:413-426` (`get_pod` 400 → список) + `provisioner.reject_created` | Цепочка «DELETE 400 → GET 400 → пода ещё нет в списке (`visible_after_s`, задержка списка)» даёт `ALREADY_GONE` для только что созданного пода. В `reject_created` тогда нет `created_resource_destroy_failed`. Если имя пода чужое, ни метка, ни сторож его не увидят. Вероятность низкая (нужны три сбоя подряд), но последствие — утечка. → В чек-листе, п. 5 условий: при **любом** `created_resource_rejected` проверить ref из `details_json` через `GET /pods/<ref>` (RO-ключ) или консоль. Не полагаться на отсутствие `…_destroy_failed`. В коде (по желанию): 400 на GET в `get_pod` при `clock.now() - created < list_staleness_s` считать неизвестным исходом |
+| R3-6 | minor | `runpod_guard.py:204`, `runpod_api.py:239,266` | В openapi у `Pod` нет `required`. Чужой под без `name`/`desiredStatus` (или с нечисловым `costPerHr` — так в адаптере) ослепляет и сторож (код 4, без удалений), и `list_pods` адаптера (reaper). Сейчас `GET /pods` → `[]`, так что риск только от чужого пода, созданного во время теста. → Элементы без строкового `name` пропускать как чужие (сторож и адаптер), в адаптере `costPerHr` чужого пода — мягко |
+| R3-7 | info | GraphQL `myself` (L1 координатора) | `spendLimit` есть (80), `clientBalance` 19,84 (≤ $25), `currentSpendPerHr` 0, `GET /v1/pods` → `[]`. Запасная ветка `myself` без `spendLimit` не нужна, но и не мешает (`test_myself_real_answer_with_spend_limit`). Наблюдение: `spendLimit` 80 $/ч — предохранитель уровня аккаунта; можно попросить заказчика снизить его на время теста (например, до 1), это дешёвая дополнительная защита |
+| R3-8 | info | `docs/t372-live-test.md` L2b, L7 | Не сказано, откуда взять `<digest>` для `nvidia/cuda:12.8.1-base-ubuntu24.04` (например, `docker buildx imagetools inspect` или страница Docker Hub). В L7 нет команды для `get(<старые ref>)`: проще `curl GET /v1/pods/<ref>` RO-ключом → 404 |
+
+### Повторная проверка находок циклов 1–2 (все исправлены)
+- **REV-S1/R2-1**: `parse_pods_min` — только `id`/`name`/`desiredStatus`. `destroy-leftovers` читает только `GET /pods`. Порча `costPerHr`/`lastStartedAt` даёт мягкий STOP после удалений (`test_watch_pass_spend_trigger_deletes_only_new_labelled`: EXITED-под с `costPerHr: "bad"` удаляется).
+- **REV-S2**: `first_seen.json` хранит время первого обнаружения; без `lastStartedAt` порог 75 мин срабатывает (`test_age_from_first_seen_without_last_started`). `--state-dir` обязателен (код 2). Сброс состояния → код 4 после удалений.
+- **REV-A1/R2-0**: `schema_check` на настоящем openapi → `schema: ok`, rc=0.
+- **REV-S4/R2-7**: адаптер DELETE 400/404 → `get_pod` (404 → None; 400 → список). Сторож: 400 → GET, 404 → gone, 200/400/401/500 → ошибка (тесты `test_guard_delete_400_*`). Пробел — R3-2 (DELETE 404 в стороже).
+- **REV-S5/R2-9**: `costPerHr` строкой принимают и адаптер, и сторож; nan/inf → ошибка.
+- **REV-S6**: allowlist — точный путь, правило, digest слоя (blob или diff_id) с пересчётом sha256. В `infer.scan.txt` ровно одна строка `allowed: layer 0 c84c1db6f4113040: usr/lib/x86_64-linux-gnu/libgnutls.so.30.37.1: private_key (…)` и `verdict: clean`. `infer.local-id` = `sha256:8679ece3…e2b6` = id `llmhub-infer:0.3.1` (и 0.3.0) в локальном docker. `publish-infer.sh push` отказывает, если id тега ≠ `infer.local-id` или скан не clean (`:54-56`). Точное число строк `allowed:` скрипт не проверяет, это делает координатор в P0 п. 2 (по чек-листу).
+- **REV-S7**: `_NoRedirect` + `ProxyHandler({})`. **REV-S8**: цикл удаления не обрывается, код 7. **REV-S9**: нет `before.json` → код 8 (`test_missing_before_is_exit_8`); `--until` по умолчанию `taken_at + 24 h`; после срока — только отчёт и код 6 (`test_watch_pass_expired_guard_reports_only`). Сбой `GET /pods` → код 7 (`test_list_failure_is_a_loud_exit`). Таймер `OnUnitActiveSec=60` перезапускает oneshot-юнит и после неуспешного выхода; `StartLimit` при 60 с не достигается.
+- **REV-S10**: `reject_created` — сначала ref в строку и инцидент critical (одна транзакция), затем destroy ×2, при неудаче `created_resource_destroy_failed`. Строка уходит в ERROR. Проба делает то же (`_store_rejected`), teardown удаляет ref.
+- **Чужие и старые поды**: сторож удаляет только поды, которых нет в «до», со строгой меткой и не TERMINATED. Повторная проверка метки — в `destroy`. Чужие имена, `llmhub-manual` и под из «до» не тронуты даже при сработавшем пороге.
+- **R2-2/R2-6**: в teardown пробы известный ref удаляется до листинга; `--hold-s 150` считается от ответа create; `desired_running_s`, `held_s`.
+- **R2-3/R2-4/R2-5/R2-8/R2-10**: `created_at` = `lastStartedAt`; CUDA 13.0; фейк по форме openapi (кроме GraphQL — R3-3); `weights-token-check` печатает `checked_at`/`expected_verdict`/`proof`; запасная ветка `myself`.
+- **Ключи в чек-листе**: RO/rw передаются через `-H @<(printf …)` (builtin) или stdin `ssh … install /dev/stdin`, в argv их нет. Сторож в выводе ключ не печатает.
+
+### Патчи (implementer'у)
+```python
+# scripts/runpod_guard.py (R3-1, R3-2)
+UTC = dt.timezone.utc            # Python 3.10: no dt.UTC
+# _time(): before fromisoformat, pad/truncate the fraction to 6 digits:
+s = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], s, count=1)
+# http_json(): drop `if method == "DELETE" and exc.code == 404: return None` (delete_pod GETs)
+```
+```python
+# src/llmhub/provider_adapters/runpod_api.py (R3-3)
+_GPU_FIELDS = ("id displayName memoryInGb communityPrice communityCloud"
+               " lowestPrice(input: {gpuCount: 1}) { stockStatus }")
+# price = communityPrice if communityCloud is True else None; stock = lowestPrice.stockStatus (hint)
+# runpod.py list_offers/create: require community_price only; stock None is not "no offer"
+```
+
+### Команды и результаты
+- `uv run ruff check src tests scripts deploy` → All checks passed; `uv run pyright` → 0 errors.
+- `uv run python scripts/runpod_schema_check.py tests/fixtures/runpod/openapi.json` → `schema: ok`, rc=0.
+- `uv run pytest tests/test_review_t372_r3_*.py -q -rxX` → 12 passed, 4 xfailed (R3-1, R3-2, R3-3 ×2). С `--runxfail`: `AttributeError: module 'datetime' has no attribute 'UTC'`; `DID NOT RAISE GuardError`; `assert [] == [0.22]`; `'no community offer'`.
+- `/usr/bin/python3 -I` (3.10.12): проход `watch_pass` со стабом API → `CRASH AttributeError`. Копия скрипта с `dt.timezone.utc` → `destroyed pod p1 … (spend>0.3)`, `code 6`.
+- Быстрый набор `nice -n 10 uv run pytest -q -p no:cacheprovider -m "not slow and not docker"` → 3490 passed, 3 skipped, 118 deselected, 4 xfailed (только новые), 124 с.
+- Полный `nice -n 10 uv run pytest -q -p no:cacheprovider -m "" -rs` (slow + docker + F5) → **3607 passed, 4 skipped** (dotnet; `infer.digest` до P0; два пустых `recorded/`), 4 xfailed, 12:57. Контейнеров `llmhub-test-*` после прогона нет.
+
+### Вердикт
+**Требуются изменения** (раунд 2). Все находки циклов 1–2 закрыты корректно, регрессий нет. До L0/L2 исправить blocker R3-1 (сторож под 3.10) и R3-3 (GraphQL-оффер; без него ни L2b, ни L3 не начать). Major R3-2 — в том же раунде, тест уже готов. R3-4 (проверка юнита в L0/L2 и «любой ненулевой код = стоп») — в чек-лист. R3-5 и R3-6 — желательно. После исправлений снять `xfail` в `tests/test_review_t372_r3_*.py`. Это третий цикл ревью задачи (лимит CLAUDE.md — ≤ 3), поэтому после раунда 2 нужна только узкая проверка исправлений R3-1..R3-4, а решение о L0 — за координатором и заказчиком.
 ## Журнал
 - 2026-11-04: задача создана координатором при создании репозитория.
 - 2026-11-04: analyst — план `tasks/plans/T-372-plan.md` (spike dstack «за столом» → RunpodAdapter по умолчанию; потоки S, A–F + I, 25 шагов; живой тест L0–L9 ≈ $0,3–0,75, потолок llmhub $4,00; ворота critic+advocate P1 обязательны; блокируют живой тест Q1 (реестр образа) и Q5 (очистка Mock-ledger)). Статус planned.
@@ -152,6 +209,7 @@ def parse_pods(raw):            # minimal: extra fields never block a deletion
   - Известные ограничения: схема RunPod (поля, пагинация `GET /pods`, `desiredStatus`, имена параметров billing/templates) сверена только с синтетическим openapi — нужен P0 (`scripts/runpod_schema_check.py`). Неизвестно, входит ли диск в `costPerHr` (ledger может завысить на ≈ 2,4 %, в безопасную сторону) — выяснится в L2b. HF repo и revision в шаблоне — плейсхолдеры (`LLMHUB_HF_BASE_URL`). Поиск по `vol:`/`tpl:` в `get` — по списку. В `reconcile` строки mock-провайдера с `instance_id NULL` при повторном включении mock могут вставиться снова (после теста mock включается обратно; суммы Mock — тест-данные).
 - 2026-11-04: решение заказчика (передано координатором): allowlist libgnutls (тестовые векторы FIPS self-test) в скане образа **принят** при условии исправления REV-S6 — совпадение по точному пути файла и digest слоя, сработавшие записи пишутся в отчёт скана. Условие выполнено в раунде 1 (ниже).
 - 2026-11-04: implementer — исправления раунда 1 (все находки циклов 1 и 2), релиз `dist/0.3.1`. Статус review. Подробно — «Исправления (раунд 1)».
+- 2026-11-04: implementer — исправления раунда 2 (R3-1..R3-6, R3-8; R3-7 — в чек-листе), релиз `dist/0.3.2`. Статус review. Подробно — «Исправления (раунд 2)».
 
 ## Исправления (раунд 1)
 > TL;DR: Закрыты REV-S1–S10 и R2-0–R2-10 (кроме info). Сторож работает на настоящей форме `Pod` (без `createdAt`), возраст — от первого обнаружения в `--state-dir`, у сторожа есть срок `--until`. Адаптер принимает `costPerHr` строкой, DELETE 400/404 проверяет через GET, проверяет ответ create и отдаёт отказ с ref ядру. Все `xfail` ревью сняты. Релиз `dist/0.3.1`, образ infer тот же (`8679ece3…`), скан чистый со строкой `allowed:`. Живых шагов не было: ни RunPod, ни GitHub, ни ssh, ни push, ни `systemctl --user`.
@@ -203,3 +261,42 @@ def parse_pods(raw):            # minimal: extra fields never block a deletion
 - GraphQL (`gpuTypes`, `myself`) по-прежнему не сверен со схемой — только командой L1 п. 6. Код 400 от RunPod на DELETE/GET удалённого пода — по openapi; фактические коды записать в L2b.
 - Под с чужим именем после двух неудачных DELETE в `reject_created` удаляется вручную (ref в инциденте critical).
 - `GUARD_UNTIL` в примере — фиксированная дата: в L0 её обязательно заменить (в прошлом — сторож только сообщает, это безопасная сторона).
+
+## Исправления (раунд 2)
+> TL;DR: Закрыты оба blocker (R3-1 сторож под Python 3.10, R3-3 оффер по `communityPrice`/`communityCloud`), major R3-2 и minor R3-4/R3-5/R3-6, info R3-8; R3-7 (снизить `spendLimit`) — по желанию заказчика в P0. Все `xfail` в `tests/test_review_t372_r3_*.py` сняты. Релиз `dist/0.3.2`, образ infer тот же (`8679ece3…`), скан чистый. Живых шагов не было: ни RunPod, ни GitHub, ни ssh, ни push, ни `systemctl --user`.
+
+### Что сделано
+| Находка | Исправление |
+|---|---|
+| R3-1 | `runpod_guard.py`: `UTC = dt.timezone.utc` (все 4 места); `_time` принимает `Z`/`z` и дополняет/обрезает дробную часть до 6 цифр (в 3.10 `fromisoformat` иначе падает). Docstring, юнит, `deploy/README.md`: «stdlib, Python ≥ 3.10». Тесты запускают сторож под `/usr/bin/python3` (3.10.12): форматы времени, весь `main watch --once --auto-destroy` и `record` (skip только если интерпретатора нет) |
+| R3-3 | `_GPU_FIELDS` = `id displayName memoryInGb communityPrice communityCloud lowestPrice(input: {gpuCount: 1}) { stockStatus }`. Оффер есть, если `communityCloud is True` и `communityPrice` — число или числовая строка > 0; плохое `communityPrice`/`communityCloud` → `RunpodParseError`. `stockStatus` — только подсказка (null оффер не убирает); `uninterruptablePrice` не запрашивается. Потолок: `communityPrice` до POST, `costPerHr` после 2xx (`CreatedResourceRejected`). `no_capacity` на POST → GPU_UNAVAILABLE, определённый отказ (тест). Фейк: настоящая форма, отдаёт только запрошенные поля, `lowestPrice` с `secureCloud` → null, без него — цена Secure (`secure_price`) — и тест, что потолок её не использует. Чистые фикстуры L1 — `tests/fixtures/runpod/graphql/` (из `gql1.json`/`gql2.json`; `clientBalance` заменён на 20.0; значение 3090 без `secureCloud` (0,22, `Low`) помечено `_source: reported`). Тесты по ним: 3090 0,22, 3090 Ti 0,27, 4090 0,34, A5000 0,16, A6000 0,33, A40 (`communityCloud: false`) — нет оффера. L1 п. 6 — новая команда и ожидание |
+| R3-2 | `http_json` больше не считает DELETE 404 успехом; `delete_pod` проверяет 400/404 через GET, «gone» только при GET 404 |
+| R3-4 | Чек-лист: L0 — ручной `/usr/bin/python3 -I …/runpod_guard.py watch --once` (код 0, `llmhub_pods=0`) до включения таймера; L2 п. 2 — `systemctl --user start` юнита + `journalctl` + `ExecMainStatus=0` до пробы; условие остановки п. 1 — любой ненулевой код юнита после L2 (в т. ч. 1 и 2) и строка `guard expired` до L8 |
+| R3-5 | Адаптер помнит время первого знакомства с подом (`_first_known`: ответ create, первый `get`/`destroy`). Цепочка «400 → GET 400 → нет в списке» даёт `ALREADY_GONE`/None только если под известен ≥ `list_staleness_s`; иначе `UnlistedPodError` → retryable, `outcome_unknown` (teardown повторит позже). Условие остановки п. 5 и runbook §8: при любом `created_resource_rejected` — ручная проверка ref `GET /v1/pods/<ref>` RO-ключом |
+| R3-6 | Сторож: элемент без строкового `name`/`id`/`desiredStatus` и не с нашей меткой пропускается, проход продолжается (удаления наших идут), затем `STOP: parse error: foreign pod …`, код 4. Под с меткой — строго (ошибка). `destroy-leftovers` пропускает чужие кривые элементы. Адаптер `list_pods`: `llmhub-*` — строго, чужой непарсящийся под (без `name`, кривой `costPerHr`) пропускается с предупреждением в журнале |
+| R3-7 | P0 п. 4: предложить заказчику снизить `spendLimit` (80 $/ч) на время теста, например до 1 $/ч; отказ не блокирует |
+| R3-8 | L2b: `<digest>` через `docker buildx imagetools inspect` или анонимный Registry API (`auth.docker.io` → `docker-content-digest`); L7: цикл `curl GET /v1/pods/<ref>` RO-ключом → 404 |
+
+### Изменённые файлы
+- Код: `scripts/runpod_guard.py`, `src/llmhub/provider_adapters/{runpod,runpod_api}.py`, `src/llmhub/__init__.py` (0.3.2).
+- Деплой и документы: `deploy/workstation/llmhub-runpod-guard.service` (комментарии), `deploy/README.md`, `docs/t372-live-test.md`, `docs/runbook.md` §8, `docs/openapi.yaml` (версия).
+- Тесты: новый `tests/test_t372_fix2.py` (26), новые `tests/fixtures/runpod/graphql/*.json` (3); `tests/runpod_fake.py`; сняты `xfail` в `tests/test_review_t372_r3_{guard,adapter}.py` (4); `test_no_offer_means_no_post_today` → `test_no_community_offer_means_no_post` (с исправлением POST уходит, поэтому проверяется `communityCloud: false`); `test_t372_runpod_{api,adapter}.py` (`stock=None` больше не «нет оффера» → `community=False`); `test_review_t372_sec_adapter.py` (заглушка GraphQL в настоящей форме); `test_smoke.py` (0.3.2).
+
+### Отклонения и решения
+1. R3-6: чужой кривой под в стороже — не тихий пропуск, а стоп (код 4) **после** проверок и удалений: так он не ослепляет сторож, но тест останавливается для разбора. В адаптере — только предупреждение (reaper и `max_live_pods` считают только `llmhub-*`).
+2. R3-5: время первого знакомства хранится в памяти процесса; после перезапуска первый `destroy` по ref с ответом «400 и нет в списке» даёт retryable-ошибку, а через `list_staleness_s` — `ALREADY_GONE` (ограниченная задержка, без утечки). Словарь ограничен (чистка записей старше max(10×staleness, 24 ч) при > 1024).
+3. R3-3: `communityPrice` ≤ 0 считается отсутствием оффера.
+4. Фейк в форме `shape` для `GET /pods` теперь отдаёт кривой под с нашей меткой (чужой кривой по R3-6 пропускается).
+
+### Проверки
+- `uv run ruff check src tests scripts deploy` → All checks passed; `uv run pyright` → 0 errors.
+- `tests/test_t372_fix2.py` → 26 passed (в т. ч. 2 теста под `/usr/bin/python3` 3.10.12); `tests/test_review_t372_r3_*.py` → 0 xfail.
+- Быстрый набор `nice -n 10 uv run pytest -q -p no:cacheprovider -m "not slow and not docker"` → 3522 passed, 4 skipped, 118 deselected, 124 с.
+- Полный `nice -n 10 uv run pytest -q -p no:cacheprovider -m "" -rs` (slow + docker + F5, после сборки 0.3.2) → **3640 passed, 4 skipped** (dotnet; `infer.digest` до P0; два пустых `recorded/`), 12:54. Контейнеров `llmhub-test-*` после прогона нет.
+- Релиз `dist/0.3.2` (`nice -n 10 deploy/docker/build.sh`): image `sha256:17e093374e0f62a608ce8748a1971753a92e253c9a75742cd0fde234aa25df34` (config `sha256:8cf3fa3925e6d375d1253c04f769622c6257cbe809079a734f09ced69484fcf1`), nginx `sha256:65645c7b…2a10` (тот же). Образ infer не менялся: `llmhub-infer:0.3.2` — тег проверенного `sha256:8679ece3…e2b6`; `publish-infer.sh scan` → одна строка `allowed:` (libgnutls) + `verdict: clean`, `infer.local-id` = `sha256:8679ece3…e2b6`; `SHA256SUMS` пересчитан с этими файлами (20 строк, `sha256sum -c` — все OK). `dist/0.3.0`, `dist/0.3.1` не трогались.
+
+### Известные ограничения
+- GraphQL `gpuTypes` сверен только по ответам L1 (фикстуры); значение `lowestPrice` без `secureCloud` для типов кроме 3090 неизвестно (в коде только подсказка).
+- Фактические коды RunPod на DELETE/GET удалённого пода — записать в L2b.
+- Без пуша: коммит локальный, push делает координатор.
+

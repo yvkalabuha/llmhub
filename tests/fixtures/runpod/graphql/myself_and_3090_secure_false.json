@@ -1,0 +1,27 @@
+{
+ "_kind": "graphql",
+ "_note": "sanitized: clientBalance replaced by 20.0; no ids of the account",
+ "_query": "query { myself { clientBalance currentSpendPerHr spendLimit } gpuTypes(input: {id: \"NVIDIA GeForce RTX 3090\"}) { id displayName memoryInGb lowestPrice(input: {gpuCount: 1, secureCloud: false}) { uninterruptablePrice stockStatus } } }",
+ "_recorded": "2026-11-04, L1 read-only (coordinator)",
+ "_source": "recorded",
+ "answer": {
+  "data": {
+   "gpuTypes": [
+    {
+     "displayName": "RTX 3090",
+     "id": "NVIDIA GeForce RTX 3090",
+     "lowestPrice": {
+      "stockStatus": null,
+      "uninterruptablePrice": null
+     },
+     "memoryInGb": 24
+    }
+   ],
+   "myself": {
+    "clientBalance": 20.0,
+    "currentSpendPerHr": 0,
+    "spendLimit": 80
+   }
+  }
+ }
+}

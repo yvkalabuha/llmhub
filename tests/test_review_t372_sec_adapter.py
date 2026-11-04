@@ -104,7 +104,8 @@ async def test_create_single_post_on_read_timeout_no_hidden_retry() -> None:
         if req.url.host == "api.runpod.io":
             return httpx.Response(200, json={"data": {"gpuTypes": [{
                 "id": GPU_ID, "displayName": "RTX 3090", "memoryInGb": 24,
-                "lowestPrice": {"uninterruptablePrice": 0.22, "stockStatus": "High"}}]}})
+                "communityPrice": 0.22, "communityCloud": True,  # real shape (R3-3)
+                "lowestPrice": {"stockStatus": "High"}}]}})
         if req.method == "GET":
             return httpx.Response(200, json=[])
         posts.append(1)

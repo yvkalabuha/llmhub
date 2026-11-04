@@ -12,6 +12,8 @@ A small state machine on an injected clock:
 - foreign pods, network volumes and templates can be added;
 - faults per request (`inject`): HTTP status with a body, timeouts before/after the effect,
   bad JSON shapes, a broken second page;
+- GraphQL `gpuTypes` in the real shape (R3-3): `communityPrice`/`communityCloud`, a null
+  `lowestPrice` for `secureCloud: false`;
 - billing: hourly buckets per pod from its lifetime.
 The fake answers with the pod `env` (like RunPod), so tests can prove the adapter drops it.
 """
@@ -79,6 +81,9 @@ class FakeRunpod:
         price: float = 0.22,
         disk_usd_h: float = 0.005,
         stock: str | None = "High",
+        community: bool | None = True,
+        secure_price: float = 0.44,
+        price_as_string: bool = False,
         balance: float = 25.0,
         boot_s: float = 0.0,
         visible_after_s: float = 0.0,
@@ -94,7 +99,10 @@ class FakeRunpod:
         self.clock = clock
         self.price = price
         self.disk_usd_h = disk_usd_h
-        self.stock = stock
+        self.stock = stock  # lowestPrice(gpuCount: 1).stockStatus: a hint only (R3-3)
+        self.community = community  # gpuType.communityCloud
+        self.secure_price = secure_price  # lowestPrice.uninterruptablePrice may be Secure
+        self.price_as_string = price_as_string  # gpuType.communityPrice as "0.22"
         self.balance0 = balance
         self.boot_s = boot_s
         self.visible_after_s = visible_after_s
@@ -221,7 +229,8 @@ class FakeRunpod:
                 raise httpx.ConnectError("fake", request=request)
             if fault.kind == "shape":
                 return httpx.Response(200, json={"unexpected": True} if path != "/pods"
-                                      else [{"id": 5}])  # fmt: skip
+                                      # our label: strict (a foreign item is skipped, R3-6)
+                                      else [{"id": 5, "name": "llmhub-000000000000-00000000"}])  # fmt: skip
         resp = self._route(request, path, fault)
         if fault is not None and fault.kind == "timeout_after":
             raise httpx.ReadTimeout("fake", request=request)
@@ -323,12 +332,27 @@ class FakeRunpod:
             assert gid is not None
             if gid.group(1) != GPU_ID:
                 return httpx.Response(200, json={"data": {"gpuTypes": []}})
-            low = None if self.stock is None else {"uninterruptablePrice": self.price,
-                                                   "stockStatus": self.stock}  # fmt: skip
-            return httpx.Response(200, json={"data": {"gpuTypes": [{
-                "id": GPU_ID, "displayName": "RTX 3090", "memoryInGb": 24,
-                "lowestPrice": low}]}})  # fmt: skip
+            return httpx.Response(200, json={"data": {"gpuTypes": [self._gpu_type(query)]}})
         return httpx.Response(400, json={"errors": [{"message": "unknown query"}]})
+
+    def _gpu_type(self, query: str) -> dict[str, Any]:
+        """The real answer shape (L1, 2026-11-04): `communityPrice`/`communityCloud` on the
+        type; `lowestPrice(input: {gpuCount: 1, secureCloud: false})` -> every field null;
+        without `secureCloud` -> a price (possibly Secure) and `stockStatus`. Only the
+        selected fields are returned, like GraphQL."""
+        price: Any = str(self.price) if self.price_as_string else self.price
+        full: dict[str, Any] = {"id": GPU_ID, "displayName": "RTX 3090", "memoryInGb": 24,
+                                "communityPrice": price, "communityCloud": self.community,
+                                "secureCloud": True, "securePrice": self.secure_price}  # fmt: skip
+        item = {k: v for k, v in full.items() if re.search(rf"\b{k}\b", query)}
+        m = re.search(r"lowestPrice\(input: *\{([^}]*)\}\)\s*\{([^}]*)\}", query)
+        if m is not None:
+            null = "secureCloud" in m.group(1)
+            low = {"uninterruptablePrice": None if null else self.secure_price,
+                   "minimumBidPrice": None,
+                   "stockStatus": None if null else self.stock}  # fmt: skip
+            item["lowestPrice"] = {k: v for k, v in low.items() if k in m.group(2).split()}
+        return item
 
 
 def runpod_cfg(**over: Any) -> RunpodConfig:

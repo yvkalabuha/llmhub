@@ -125,8 +125,8 @@ async def test_price_above_ceiling_refused() -> None:
     assert fake2.posts() == 0
 
 
-async def test_out_of_stock_refused() -> None:
-    fake, _ = _setup(stock=None)
+async def test_no_community_offer_refused() -> None:
+    fake, _ = _setup(community=False)
     with pytest.raises(ProviderError) as ei:
         await make_adapter(fake).create(make_spec(), _label())
     assert ei.value.err.reason == UnavailableReason.GPU_UNAVAILABLE and fake.posts() == 0
@@ -257,9 +257,9 @@ async def test_offers_balance_billing() -> None:
     assert (o.offer_id, o.price_usd_h, o.vram_gb, o.host_id) == (GPU_ID, 0.22, 24, "")
     assert o.disk_usd_h == pytest.approx(40 * 0.10 / 730)
     assert await a.list_offers(OfferQuery("H100", 80, 1.0, frozenset())) == []
-    fake.stock = None
+    fake.community = False
     assert await a.list_offers(q) == []
-    fake.stock = "Low"
+    fake.community = True
     res = await a.create(make_spec(), _label())
     clock.advance_to(clock.now() + 3600)
     bal = await a.balance()

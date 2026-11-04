@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Independent RunPod guard for the T-372 live test (plan 3.6; critic F2b/F3, advocate F3, D3).
 
-Runs on the WORKSTATION, not on the server; stdlib only (no `llmhub` import, its own raw-JSON
-parsing), so a bug in the adapter cannot blind it. Keys come from files (0600/0400) and are
-sent only as `Authorization: Bearer`; they never reach stdout, stderr or any file.
+Runs on the WORKSTATION, not on the server; stdlib only, Python >= 3.10 (the unit runs
+/usr/bin/python3, 3.10 on the workstation; R3-1); no `llmhub` import, its own raw-JSON parsing,
+so a bug in the adapter cannot blind it. Keys come from files (0600/0400) and are sent only as
+`Authorization: Bearer`; they never reach stdout, stderr or any file.
 
     runpod_guard.py snapshot --key-file RO --out before.json
     runpod_guard.py diff before.json after.json
@@ -58,6 +59,7 @@ MAX_PODS = 1
 TIMEOUT_S = 20
 DEFAULT_TTL_S = 24 * 3600  # --until default: before.taken_at + 24 h (REV-S9)
 FIRST_SEEN = "first_seen.json"
+UTC = dt.timezone.utc  # noqa: UP017 -- Python 3.10 (unit: /usr/bin/python3) has no dt.UTC (R3-1)
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -126,8 +128,6 @@ def http_json(method: str, url: str, key: str, body: Any = None) -> Any:
         with OPENER.open(req, timeout=TIMEOUT_S) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
-        if method == "DELETE" and exc.code == 404:
-            return None
         raise GuardError(7, f"{method} {_path(url)} -> HTTP {exc.code}", exc.code) from None
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         raise GuardError(7, f"{method} {_path(url)} -> {type(exc).__name__}") from None
@@ -166,7 +166,9 @@ def _time(v: Any, where: str) -> float:
     if not isinstance(v, str):
         raise parse_error(where)
     s = v.strip().removesuffix(" UTC").strip()
-    s = s[:-1] + "+00:00" if s.endswith("Z") else s
+    s = s[:-1] + "+00:00" if s.endswith(("Z", "z")) else s
+    # Python 3.10 fromisoformat takes exactly 3 or 6 fraction digits: pad/cut to 6 (R3-1)
+    s = re.sub(r"\.(\d+)", lambda m: "." + (m.group(1) + "000000")[:6], s, count=1)
     for parse in (dt.datetime.fromisoformat,
                   lambda x: dt.datetime.strptime(x, "%Y-%m-%d %H:%M:%S.%f %z"),
                   lambda x: dt.datetime.strptime(x, "%Y-%m-%d %H:%M:%S %z")):  # fmt: skip
@@ -174,7 +176,7 @@ def _time(v: Any, where: str) -> float:
             t = parse(s)
         except ValueError:
             continue
-        return (t if t.tzinfo else t.replace(tzinfo=dt.UTC)).timestamp()
+        return (t if t.tzinfo else t.replace(tzinfo=UTC)).timestamp()
     raise parse_error(where)
 
 
@@ -192,26 +194,51 @@ def _cost(v: Any) -> float | None:
     return float(v)
 
 
-def parse_pods_min(raw: Any) -> list[dict[str, Any]]:
-    """Only what a deletion needs: `id`, `name`, `desiredStatus` (REV-S1). Extra fields of
-    any shape never block it."""
+def _split_pods(raw: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[str]]:
+    """-> (pods, their raw items, skipped notes). Only `id`, `name`, `desiredStatus` matter
+    (REV-S1). A pod named with our label must have all three (strict: it may be ours to
+    delete). Any other item (no string `name`, a foreign name) with a missing field is skipped
+    with a note: openapi `Pod` has no `required`, and a malformed FOREIGN pod must not blind
+    the guard to ours (R3-6)."""
     if not isinstance(raw, list):
         raise parse_error("pods: not a list")
-    out = []
+    pods: list[dict[str, Any]] = []
+    items: list[dict[str, Any]] = []
+    notes: list[str] = []
     for item in raw:
         if not isinstance(item, dict):
-            raise parse_error("pods[]")
-        out.append({"id": _str(item, "id", "pod"), "name": _str(item, "name", "pod"),
-                     "status": _str(item, "desiredStatus", "pod")})  # fmt: skip
-    return out
+            notes.append("parse error: pods[]: not an object (skipped as foreign)")
+            continue
+        name = item.get("name")
+        if isinstance(name, str) and LABEL.match(name):
+            pods.append({"id": _str(item, "id", "pod"), "name": name,
+                         "status": _str(item, "desiredStatus", "pod")})  # fmt: skip
+            items.append(item)
+            continue
+        pid, status = item.get("id"), item.get("desiredStatus")
+        if isinstance(name, str) and isinstance(pid, str) and isinstance(status, str):
+            pods.append({"id": pid, "name": name, "status": status})
+            items.append(item)
+            continue
+        notes.append(f"parse error: foreign pod {pid if isinstance(pid, str) else '?'}: "
+                     "no string name/id/desiredStatus (skipped)")  # fmt: skip
+    return pods, items, notes
+
+
+def parse_pods_min(raw: Any) -> list[dict[str, Any]]:
+    """Only what a deletion needs: `id`, `name`, `desiredStatus` (REV-S1). Extra fields of
+    any shape never block it; malformed foreign items are skipped (R3-6, see `_split_pods`)."""
+    pods, _, notes = _split_pods(raw)
+    for n in notes:
+        print(f"note: {n}", file=sys.stderr)
+    return pods
 
 
 def parse_pods_soft(raw: Any) -> tuple[list[dict[str, Any]], list[str]]:
     """`parse_pods_min` + optional `cost` and `started_at`; a bad optional value becomes None
     and an error line (the caller STOPs after its checks), never an exception."""
-    pods = parse_pods_min(raw)
-    errors: list[str] = []
-    for pod, item in zip(pods, raw, strict=True):
+    pods, items, errors = _split_pods(raw)  # skipped foreign items: STOP after the checks
+    for pod, item in zip(pods, items, strict=True):
         try:
             pod["cost"] = _cost(item.get("costPerHr"))
         except GuardError as exc:
@@ -341,14 +368,15 @@ def _log_action(state_dir: Path | None, text: str) -> None:
     if state_dir is None:
         return
     state_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    stamp = dt.datetime.fromtimestamp(NOW(), dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    stamp = dt.datetime.fromtimestamp(NOW(), UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     with open(state_dir / "actions.log", "a", encoding="utf-8") as f:
         f.write(f"{stamp} {text}\n")
 
 
 def delete_pod(pod_id: str, rw_key: str) -> str:
     """"deleted" or "gone". RunPod documents DELETE /pods/{id} -> 204/400/401 (no 404): a 400
-    or 404 is checked with GET /pods/{id}, whose 404 means gone (REV-S4/R2-7)."""
+    or 404 is checked with GET /pods/{id}, whose 404 alone means gone (REV-S4/R2-7). A DELETE
+    404 is never taken as success by itself (R3-2): a wrong path on a live pod would lie."""
     try:
         http_json("DELETE", f"{REST}/pods/{pod_id}", rw_key)
         return "deleted"
@@ -472,8 +500,8 @@ def cmd_record(a: argparse.Namespace) -> int:
     key = read_key(a.key_file)
     out = Path(a.dir)
     now = NOW()
-    start = dt.datetime.fromtimestamp(now - 86400, dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
-    end = dt.datetime.fromtimestamp(now, dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    start = dt.datetime.fromtimestamp(now - 86400, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    end = dt.datetime.fromtimestamp(now, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
     sources = {
         "pods": "/pods", "networkvolumes": "/networkvolumes",
         "templates": EXTRA_KINDS["templates"],
@@ -521,7 +549,7 @@ def watch_pass(key: str, rw: str | None, before: dict[str, Any], state: Path | N
         seen = update_first_seen(seen, snap["pods"], now)
         _write_json(state / FIRST_SEEN, seen)
     ours = [p for p in snap["pods"] if LABEL.match(p["name"])]
-    stamp = dt.datetime.fromtimestamp(now, dt.UTC).strftime("%H:%M:%SZ")
+    stamp = dt.datetime.fromtimestamp(now, UTC).strftime("%H:%M:%SZ")
     extra = sum(len(d["new"][k]) for k in EXTRA_KINDS)
     print(f"{stamp} llmhub_pods={len(ours)} spend/h={_fmt(snap['spend_per_hr'], '.3f')} "
           f"balance_delta_cents={d['balance_delta_cents']} new_other={extra}", flush=True)  # fmt: skip

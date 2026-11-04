@@ -197,9 +197,12 @@ async def test_billing_and_myself_and_gpu_types() -> None:
     assert all(b.end - b.start == 3600 for b in buckets)
     (g,) = await api.gpu_types([GPU_ID])
     assert (g.community_price, g.stock_status, g.memory_gb) == (0.22, "High", 24)
-    fake.stock = None
+    fake.stock = None  # a hint only (R3-3): the Community price stays
     (g2,) = await api.gpu_types([GPU_ID])
-    assert g2.community_price is None and g2.stock_status is None
+    assert g2.community_price == 0.22 and g2.stock_status is None
+    fake.community = False
+    (g3,) = await api.gpu_types([GPU_ID])
+    assert g3.community_price is None
 
 
 async def test_lists_of_volumes_and_templates() -> None:

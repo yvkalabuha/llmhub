@@ -1,0 +1,19 @@
+{
+ "_kind": "graphql",
+ "_query": "query { gpuTypes(input: {id: \"NVIDIA GeForce RTX 3090\"}) { id lowestPrice(input: {gpuCount: 1}) { uninterruptablePrice stockStatus } } }",
+ "_recorded": "2026-11-04, L1 read-only (coordinator; values reported, raw answer not kept)",
+ "_source": "reported",
+ "answer": {
+  "data": {
+   "gpuTypes": [
+    {
+     "id": "NVIDIA GeForce RTX 3090",
+     "lowestPrice": {
+      "stockStatus": "Low",
+      "uninterruptablePrice": 0.22
+     }
+    }
+   ]
+  }
+ }
+}
