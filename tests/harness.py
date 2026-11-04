@@ -15,7 +15,7 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Awaitable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -65,21 +65,23 @@ def _ready_count() -> int:
 
 class TrackingExecutor(ThreadPoolExecutor):
     """Default executor that counts in-flight `asyncio.to_thread` work: a loop with an empty
-    ready queue is not quiet while a worker thread (JSON parse, secret scan) still runs."""
+    ready queue is not quiet while a worker thread (JSON parse, secret scan) still runs.
+
+    `pending` drops in the asyncio future's done callback (R3-5), i.e. on the loop after the
+    result is delivered: the awaiting task's wakeup is then already in the ready queue. The
+    concurrent future's callback would fire earlier, before asyncio schedules the result."""
 
     def __init__(self) -> None:
         super().__init__(max_workers=4, thread_name_prefix="test-exec")
         self.pending = 0
         self._lock = threading.Lock()
 
-    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
+    def track(self, fut: asyncio.Future[Any]) -> None:
         with self._lock:
             self.pending += 1
-        fut = super().submit(fn, *args, **kwargs)
         fut.add_done_callback(self._done)
-        return fut
 
-    def _done(self, _fut: Future[Any]) -> None:
+    def _done(self, _fut: asyncio.Future[Any]) -> None:
         with self._lock:
             self.pending -= 1
 
@@ -87,8 +89,19 @@ class TrackingExecutor(ThreadPoolExecutor):
 def install_tracking_executor() -> None:
     """Call from a running loop (async fixture/test) before driving a FakeClock."""
     loop = asyncio.get_running_loop()
-    if not isinstance(getattr(loop, "_default_executor", None), TrackingExecutor):
-        loop.set_default_executor(TrackingExecutor())
+    if isinstance(getattr(loop, "_default_executor", None), TrackingExecutor):
+        return
+    ex = TrackingExecutor()
+    loop.set_default_executor(ex)
+    orig = loop.run_in_executor
+
+    def run_in_executor(executor: Any, func: Any, *args: Any) -> asyncio.Future[Any]:
+        fut = orig(executor, func, *args)
+        if executor is None or executor is ex:
+            ex.track(fut)
+        return fut
+
+    loop.run_in_executor = run_in_executor  # type: ignore[method-assign]
 
 
 def threads_busy() -> bool:
@@ -128,7 +141,8 @@ class Harness:
 
     def add_client(self, client_id: str) -> None:
         self.conn.execute(
-            "INSERT OR IGNORE INTO clients(id, name, key_hash, created_at) VALUES (?,?,?,?)",
+            "INSERT OR IGNORE INTO clients(id, name, key_hash, created_at, data_class)"
+            " VALUES (?,?,?,?,'cloud_allowed')",
             (client_id, client_id, "x", self.clock.now() if hasattr(self, "clock") else 0.0),
         )
 

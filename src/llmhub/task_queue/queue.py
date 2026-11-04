@@ -240,6 +240,11 @@ def requeue(
         if row["cancel_requested"]:
             _finish_cancel(conn, job_id, now)
             return "failed"
+        if row["pool"] is not None and not cloud_allowed(conn, job_id):
+            # R3-2: the client lost the cloud while this job ran; it never re-enters the
+            # cloud queue (a running job may finish, a re-run would be new cloud work)
+            _finish_cancel(conn, job_id, now, error_code=CLOUD_NOT_ALLOWED)
+            return "failed"
         if int(row["restarts"]) > MAX_RESTARTS:
             record_incident(
                 conn, now, "job_max_restarts", "high", ref=job_id,
@@ -279,24 +284,42 @@ def fallback_local(
         _close_lease(conn, job_id, now, "fallback_local")
 
 
-def _finish_cancel(conn: sqlite3.Connection, job_id: str, now: float) -> None:
+CLOUD_NOT_ALLOWED = "cloud_not_allowed"  # error_code of a job cancelled by revocation
+
+
+def cloud_allowed(conn: sqlite3.Connection, job_id: str) -> bool:
+    """The job's client exists, is enabled and still has `data_class='cloud_allowed'`."""
+    row = conn.execute(
+        "SELECT 1 FROM jobs j JOIN clients c ON c.id=j.client_id WHERE j.id=?"
+        " AND c.disabled_at IS NULL AND c.data_class='cloud_allowed'",
+        (job_id,),
+    ).fetchone()
+    return row is not None
+
+
+def _finish_cancel(
+    conn: sqlite3.Connection, job_id: str, now: float, *, error_code: str | None = None
+) -> None:
     conn.execute(
-        f"UPDATE jobs SET status='cancelled', finished_at=?, {_CLEAR_RUN} WHERE id=?",
-        (now, job_id),
+        f"UPDATE jobs SET status='cancelled', finished_at=?, {_CLEAR_RUN},"
+        " error_code=COALESCE(?, error_code) WHERE id=?",
+        (now, error_code, job_id),
     )
     _close_lease(conn, job_id, now, "cancelled")
 
 
-def cancel(conn: sqlite3.Connection, job_id: str, now: float) -> JobStatus:
+def cancel(
+    conn: sqlite3.Connection, job_id: str, now: float, *, error_code: str | None = None
+) -> JobStatus:
     """Queued -> cancelled at once; running -> `cancel_requested` (worker stops it);
-    terminal jobs are returned unchanged."""
+    terminal jobs are returned unchanged. `error_code` tags an immediate cancel (revocation)."""
     with _join_or_open(conn):
         row = conn.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
         if row is None:
             raise KeyError(job_id)
         status = JobStatus(row["status"])
         if status in (JobStatus.QUEUED, JobStatus.SUBMITTED):
-            _finish_cancel(conn, job_id, now)
+            _finish_cancel(conn, job_id, now, error_code=error_code)
             return JobStatus.CANCELLED
         if status is JobStatus.RUNNING:
             conn.execute("UPDATE jobs SET cancel_requested=1 WHERE id=?", (job_id,))

@@ -39,9 +39,23 @@ class SecretMaskFilter(logging.Filter):
     raw exception text later."""
 
     def filter(self, record: logging.LogRecord) -> bool:
+        """Never raises (R3-4): a logging call must not crash a supervised loop. A record
+        that cannot be masked is replaced by a placeholder rather than logged raw."""
+        try:
+            self._mask(record)
+        except Exception:  # noqa: BLE001 - the filter must never propagate
+            record.msg = "<log record dropped by mask filter>"
+            record.args = None
+            record.exc_info = None
+            record.exc_text = None
+            record.stack_info = None
+        return True
+
+    @staticmethod
+    def _mask(record: logging.LogRecord) -> None:
         try:
             message = record.getMessage()
-        except (TypeError, ValueError):
+        except Exception:  # noqa: BLE001 - bad format/args (KeyError, TypeError, ...)
             message = str(record.msg)
         record.msg = mask(message)
         record.args = None
@@ -53,7 +67,6 @@ class SecretMaskFilter(logging.Filter):
             record.exc_text = mask(record.exc_text)
         if record.stack_info:
             record.stack_info = mask(record.stack_info)
-        return True
 
 
 def configure_logging(level: str = "INFO") -> None:

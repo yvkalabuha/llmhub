@@ -36,7 +36,9 @@ def make_conn(path: Path | str = ":memory:") -> sqlite3.Connection:
     migrate(conn)
     if conn.execute("SELECT count(*) FROM clients").fetchone()[0] == 0:
         conn.execute(
-            "INSERT INTO clients(id, name, key_hash, created_at) VALUES ('c1','c1','x',?)", (T0,)
+            "INSERT INTO clients(id, name, key_hash, created_at, data_class)"
+            " VALUES ('c1','c1','x',?,'cloud_allowed')",
+            (T0,),
         )
     return conn
 

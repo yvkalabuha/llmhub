@@ -132,7 +132,8 @@ def job_error(job: sqlite3.Row) -> ApiError:
     """Error of a failed/cancelled job."""
     task_id = str(job["id"])
     if job["status"] == "cancelled":
-        return ApiError(ErrorCode.CANCELLED, "task was cancelled", task_id=task_id)
+        reason = job["error_code"] if job["error_code"] == "cloud_not_allowed" else None
+        return ApiError(ErrorCode.CANCELLED, "task was cancelled", reason=reason, task_id=task_id)
     raw = job["error_code"] or "internal_error"
     code = _KNOWN.get(str(raw))
     if code is None:

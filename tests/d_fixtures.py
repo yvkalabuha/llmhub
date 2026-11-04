@@ -24,7 +24,8 @@ class Env:
         migrate(self.conn)
         for cid in (CLIENT_ID, "c2", "c3"):
             self.conn.execute(
-                "INSERT INTO clients(id,name,key_hash,created_at) VALUES (?,?,?,0)",
+                "INSERT INTO clients(id,name,key_hash,created_at,data_class)"
+                " VALUES (?,?,?,0,'cloud_allowed')",
                 (cid, cid, "x"),
             )
         self.conn.execute(

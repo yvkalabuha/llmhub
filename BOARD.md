@@ -17,3 +17,6 @@
 - 2026-11-04 от T-370: composition root — `Controller(materials=make_material_fns(...))`, `make_cloud_inference(...)` для реальных провайдеров, Mock — `MockInference`; потребитель `on_timings` (EWMA pp/tg, доля MTP) (T-371).
 - 2026-11-04 от reviewer T-370 (R3-2/R3-3): admin-ручка/CLI `clear-weights-hold <pool>` (сейчас только `Controller.clear_weights_hold`) + runbook к инциденту `weights_config` critical; нижняя граница `retry.host_blacklist_s` (T-371).
 - 2026-11-04 от reviewer T-370 (R3-1, R2-6): на реальных замерах проверить HF 429 (`rate_limited` → чёрный список хоста, ≤ 3 запуска на волну) и пессимизм `_eta` на старте (T-372).
+- 2026-11-04 от reviewer T-369: сбой `list_offers` (5xx) метится `gpu_unavailable` вместо `provider_api_error` — в `provisioner.py` записывать `last_error` через `normalize_error` и передавать его в `_reason_of` при истечении `offer_wait_s` (T-372).
+- 2026-11-04 от reviewer T-369 (SEC-L2): `/docs`, `/redoc`, `/openapi.json` доступны без ключа — флаг `serve` для их отключения (`docs_url=None` и т. д.) (T-371).
+- 2026-11-04 от reviewer T-369 (SEC-L4): лимит одновременных запросов/задач на клиента (429); `waiter._tick` — `IN (...)` пачками по 500 (> 32766 переменных ломает тик) (T-371).

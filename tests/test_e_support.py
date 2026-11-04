@@ -42,8 +42,8 @@ def make_conn(tmp: Path) -> sqlite3.Connection:
     conn = connect(tmp / "state.db")
     migrate(conn)
     conn.execute(
-        "INSERT INTO clients(id, name, key_hash, created_at) VALUES ('c1','c1','x',0),"
-        "('c2','c2','x',0)"
+        "INSERT INTO clients(id, name, key_hash, created_at, data_class) VALUES"
+        " ('c1','c1','x',0,'cloud_allowed'), ('c2','c2','x',0,'cloud_allowed')"
     )
     return conn
 

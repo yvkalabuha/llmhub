@@ -125,6 +125,7 @@ src не правился. Тесты: `tests/test_review_t369_sec_api.py` — 3
   - BOARD «Входящие» для T-371 (nginx `proxy_read_timeout` > 480 с, `proxy_buffering off`) уже была — не дублировал.
   - Находка для ревью/T-372 (ядро, не правил): 5xx провайдера на поиске предложений до первого `create` ядро помечает у задачи как `fallback_reason=gpu_unavailable` (`_reason_of`, create не вызывался); API после открытия breaker правильно отвечает `provider_api_error`. I2 проверяет `provider_api_error` со второго запроса.
 - 2026-11-04: implementer, раунд исправлений 1 (секция «Исправления (раунд 1)» ниже): FN-1…3, надзор циклов, SEC-M1…M3, SEC-L1, SEC-L3, stream `X-LLMHub-Fallback`, docs, нестабильные тесты. Статус review.
+- 2026-11-04: implementer — исправления раунда 2 (R3-1…R3-5), см. «Исправления (раунд 2)». Статус review.
 
 ## Исправления (раунд 1)
 > TL;DR: 2026-11-04, раунд 1 из 3 (ТЗ §18). Исправлены FN-1…FN-3, надзор за циклами, SEC-M1…M3, SEC-L1, SEC-L3, `X-LLMHub-Fallback` в stream, текст про Retry-After и два нестабильных теста. Все `xfail` ревьюеров сняты и проходят; новые регрессионные тесты — `tests/test_fix1_t369.py` (19); устранено зависание тестовой инфраструктуры (`to_thread` и FakeClock). Отложено: метка `last_error` провайдера (T-372), SEC-L2 и SEC-L4 (T-371). Статус review.
@@ -161,3 +162,110 @@ src не правился. Тесты: `tests/test_review_t369_sec_api.py` — 3
 - Быстрый набор `uv run pytest -q -p no:cacheprovider -m "not slow and not docker"` ×3 → 2493 passed (×3), 80 с.
 - Полный `uv run pytest -q -p no:cacheprovider -rs -m "slow or docker or not slow"` → 2601 passed, 1 skipped (dotnet SDK не установлен), 0 xfailed, 293 с.
 - `ruff format --check` по изменённым файлам: чисто, кроме давнего `controller.py:307` (не мои строки, не трогал).
+
+## Ревью (цикл 3: повторное)
+> TL;DR: 2026-11-04, коммит 3f9a93e. Все находки циклов 1–2 исправлены верно, регрессий нет. FN-2 безопасен: private не присоединяется к облачной задаче, двойной оплаты сверх явного повтора нет, циклов нет. SEC-M3 закрыт только для reload: при перезапуске со старым конфигом облачные задачи отозванного клиента остаются в очереди (R3-1, medium). Ещё 4 low. Вердикт: **changes required** — только R3-1 и одна строка в `integration.md`; остальное по желанию или в T-371.
+
+src не правился. Новые тесты: `tests/test_review_t369_r3_revoke.py` (5 passed, 3 `xfail(strict)`), `tests/test_review_t369_r3_supervise.py` (2 passed, 2 xfail), `tests/test_review_t369_r3_fn1.py` (3 passed). Каждый xfail — подтверждённый дефект: `--runxfail` → 5 failed по ожидаемой причине. После исправления маркер снять.
+
+**Проверка исправлений**
+- FN-1 — ок. `x-should-retry` = `retryable` в каждом ответе об ошибке: ApiError, валидация, 404/405, `Busy` → 503 true, необработанное → 500 true, 413 из `_Edge` → false (`test_review_t369_r3_fn1`). Заголовок `Retry-After` > 120 с SDK 3.45 проверяет раньше `x-should-retry` → без повтора, как написано в документе.
+- FN-2 — ок.
+  - Предикат вызывается внутри `BEGIN IMMEDIATE` (`queue.py:99-112`), поэтому два одновременных повтора создают одну новую задачу; следующий повтор присоединяется к ней.
+  - `job_error` чистый, все 4 нужных столбца выбраны.
+  - Private с тем же ключом: другое каноническое тело → 409 или 403. Упавшая облачная задача не переиспользуется, ключ с неё не снимается (`test_retry_same_key_private_header_never_reuses_failed_cloud_job`).
+  - Цепочка `upstream_timeout` → новая задача → `context_too_large` останавливается: возвращается последняя задача (`test_retry_chain_stops_at_non_retryable_failure`).
+  - Старая задача остаётся `failed` навсегда: `requeue` берёт только running/queued.
+  - Двойная оплата возможна только при новом запуске после повторяемого сбоя. Этого и хочет клиент. SDK делает до 2 таких повторов на запрос; без ключа неявная дедупликация `failed` не ловила и раньше. Это не регрессия.
+- FN-3 — ок. `Busy` и любое исключение → следующий проход через `poll_s`, `CancelledError` не перехватывается. При стойкой ошибке — строка лога каждые `poll_s` (приемлемо).
+- Надзор — ок.
+  - `stop.set()` в lifespan стоит раньше `cancel()`, поэтому штатный SIGTERM ложной фатальной ошибки не даёт (живой тест SIGTERM → 0 зелёный).
+  - Мёртвый контроллер → `serve()` возвращает 1, uvicorn останавливается, `aclose` выполняется (`test_dead_controller_stops_serve_with_exit_code_1`, настоящий uvicorn на порту 0).
+  - `__main__` → `sys.exit(main())`.
+- SEC-M1 — ок. Traceback рендерится и маскируется в фильтре, `exc_info` очищается (`Formatter.format` берёт `exc_text`), `stack_info` маскируется. Не-str `msg` (исключение, dict) с `exc_info` → без падения, маска применена. Записи не теряются: фильтр всегда возвращает True. Остаток — R3-4.
+- SEC-M2 — ок. Ключи словаря с не-строковым значением сканируются, шаблоны добавлены, ограничения описаны в `integration.md` §2.
+- SEC-M3 — для reload ок.
+  - В одной транзакции: upsert, disable, `queue.cancel` queued/submitted (implicit lease закрывается в `_finish_cancel`) и закрытие explicit/prewarm с `revoked`.
+  - `Busy` откатывает всё, индекс и `cfg` не меняются (тест реализатора).
+  - Running облачные задачи не трогаются: их GPU уже оплачен, это верно. Но после повторной постановки они возвращаются в облако (R3-2).
+  - Закрытие lease прямым UPDATE эквивалентно `leases.close`. Контроллер читает lease из БД на каждом шаге, кеша в памяти нет. `on_revoke`/`wake` будит его.
+  - Reload, который ничего не меняет, ничего не отзывает (`test_revoke_closes_explicit_lease_but_not_other_clients`).
+- SEC-L1 — ок. `Headers.items()` хранит повторы, мусор → 400. Склеенное прокси значение `private, cloud_allowed` → 400 (fail-closed).
+- SEC-L3 — ок.
+  - Хеш клиента сверяется с действующим и с новым admin-хешем. При отказе ничего не меняется: admin, индекс, таблица.
+  - Старый admin-ключ после ротации — только клиент: `/admin` → 403 (`test_old_admin_key_never_becomes_admin_after_rotation_even_as_client`).
+  - `cfg` присваивается после успешного `_apply`, `validate_assignment` нет, исключение после коммита невозможно.
+  - Файл без `admin_key_sha256` отключает admin-API: fail-safe, допустимо.
+- Stream `X-LLMHub-Fallback` — ок: `first` читается после UPDATE `fallback_reason` в `Submitter`.
+- `integration.md` — ок: сверено с `openai/_base_client.py` 3.45 (`MAX_RETRY_AFTER_DELAY=120`, `_should_retry`). Неточность только в §1 (см. R3-1).
+- Нестабильные тесты — ок: `process_time`, тест SEC-M1 детерминирован. В 1 быстром и 1 полном прогоне падений нет.
+- `TrackingExecutor` — настоящие зависания не скрывает. Зависший поток держит `settle` не больше 2000×1 мс, потом тест висит или падает, как и раньше. Есть узкое окно гонки (R3-5).
+- Отложенное приемлемо: `last_error` → T-372; SEC-L2 и SEC-L4 — за VPN, в T-371; завышенный `Retry-After` — консервативен; повторы прочих `X-LLMHub-*` на безопасность не влияют (priority ограничен `max_priority`). Замечание: в «Входящие» BOARD для T-371 и T-372 эти пункты не внесены — добавить строки.
+
+**Находки**
+- R3-1 (medium, SEC-M3 не полон) `src/llmhub/api_gateway/auth.py:64-66,68-107`. `sync()` при старте вызывает `_apply(..., revoked=())`. Если конфиг поправили при остановленной службе и сделали `systemctl restart` (обычный путь оператора), queued облачные задачи клиента, у которого сняли `cloud_allowed` или которого удалили, уходят в облако, а его explicit/prewarm lease живут до TTL. `integration.md` §1 обещает «сразу теряет облако». Тест `test_boot_sync_revokes_queued_cloud_jobs_of_client_without_cloud` (xfail). Патч: отзыв считать по БД в `_apply`, тогда он идемпотентен и одинаков для sync и reload.
+  ```python
+  def _apply(self, clients: Mapping[str, ClientConfig]) -> list[str]:
+      ...  # index, upsert, disable — как сейчас, внутри того же tx:
+          cloud = {n for n, c in clients.items() if c.cloud_allowed}
+          rows = self.conn.execute(
+              "SELECT client_id FROM jobs WHERE pool IS NOT NULL AND status IN ('submitted','queued')"
+              " UNION SELECT client_id FROM leases WHERE kind IN ('explicit','prewarm')"
+              " AND closed_at IS NULL AND client_id IS NOT NULL"
+          ).fetchall()
+          revoked = [r[0] for r in rows if r[0] not in cloud]
+          for client_id in revoked:
+              self._revoke_cloud(client_id, now)
+      self._by_hash = index
+      return revoked
+  ```
+  `reload` берёт `revoked = self._apply(new.clients)` для `on_revoke`; список из `self.cfg.clients` больше не нужен.
+- R3-2 (low) `src/llmhub/task_queue/queue.py:214-254`. Running облачная задача отозванного клиента при `requeue` (restart, NetworkLost, смерть инстанса) возвращается в облачную очередь и запускается снова. Тест `test_running_cloud_job_of_revoked_client_does_not_return_to_cloud_queue` (xfail). Патч: в `requeue` для `pool IS NOT NULL` проверить `clients.disabled_at IS NULL AND data_class='cloud_allowed'`, иначе `_finish_cancel` (или `fallback_local`). Либо в `_revoke_cloud` ставить флаг у running, а `requeue` по флагу отменяет. Можно в T-371.
+- R3-3 (low, TOCTOU) `src/llmhub/api_gateway/submission.py:161-214`. `Principal` взят до `await asyncio.gather(to_thread…)`. SIGHUP или reload в этом окне (миллисекунды, на 4 МБ теле — дольше) ставит облачную задачу уже отозванному клиенту. Тест `test_reload_during_submit_does_not_queue_cloud_job` (xfail). Патч: перед `rt.controller.submit` при `spec.pool is not None` перечитать принципала (`rt.registry.by_id(principal.client_id)`, новый метод), при `None` или `not cloud_allowed` → `ApiError(FORBIDDEN, reason="cloud_not_allowed")`.
+- R3-4 (low) `src/llmhub/api_gateway/logging.py:42-45`. Ловятся только `TypeError` и `ValueError` из `getMessage()`. `KeyError` (`log.x("%(a)s", {"b": 1})`) вылетает из фильтра в вызывающий код, а сам logging ошибки формата только печатает через `handleError`. Опечатка в лог-вызове внутри контроллера или воркера теперь роняет процесс с кодом 1 (через надзор; у воркера — строка лога на каждом тике). Тест `test_mask_filter_never_raises_on_bad_format` (xfail). Патч: `except Exception: message = str(record.msg)`; тело фильтра обернуть в `try/except Exception`, в `except` — `record.msg = "<log record dropped by mask filter>"; record.args = None; record.exc_info = None; record.exc_text = None` и `return True`.
+- R3-5 (low, только тесты) `tests/harness.py:82-85`. `pending` уменьшается в колбэке concurrent-future раньше, чем колбэк asyncio (`wrap_future`) ставит результат в loop. `settle()` может увидеть `pending=0` и пустую очередь до доставки результата — та же редкая гонка, что и исходное зависание. Тест `test_settle_waits_until_to_thread_result_is_delivered` (xfail; окно расширено `sleep` в `_done`). Патч: считать на стороне asyncio:
+  ```python
+  def install_tracking_executor() -> None:
+      loop = asyncio.get_running_loop()
+      ex = TrackingExecutor()  # _done больше не уменьшает pending
+      loop.set_default_executor(ex)
+      orig = loop.run_in_executor
+      def rie(executor, func, *args):
+          fut = orig(executor, func, *args)
+          with ex._lock: ex.pending += 1
+          fut.add_done_callback(lambda _f: ex._dec())  # на loop, после доставки результата
+          return fut
+      loop.run_in_executor = rie
+  ```
+
+**Команды и результаты**
+- `uv run pytest -q -p no:cacheprovider tests/test_review_t369_r3_*.py` → 10 passed, 5 xfailed; с `--runxfail` → 5 failed по ожидаемой причине (`'queued' == 'cancelled'`, `queued and 'p1'`, облачная задача в очереди, `KeyError: 'missing'`, `assert False`).
+- `uv run ruff check src tests scripts` → All checks passed; `uv run pyright` → 0 errors.
+- Быстрый набор `uv run pytest -q -p no:cacheprovider -m "not slow and not docker"` → 2503 passed, 5 xfailed, 80 с.
+- Полный `uv run pytest -q -p no:cacheprovider -rs -m "slow or docker or not slow"` → 2611 passed, 1 skipped (dotnet SDK не установлен), 5 xfailed (только R3), 292 с; живые тесты (`test_int_live`: SIGTERM → 0, SIGHUP) и примеры зелёные.
+
+**Вердикт цикла 3: changes required.** Blocker и major нет; все находки циклов 1–2 закрыты верно. Обязательно: R3-1 (патч выше) и снять его xfail. Тогда фраза в `integration.md` §1 станет верной; если R3-2 не делать, дописать туда «running облачная задача доработает». R3-2…R3-5 — по желанию или строкой в T-371. По ТЗ §18 это последний, третий раунд ревью: R3-1 достаточно проверить снятием xfail и прогоном тестов задачи, без нового цикла ревью; невыполненное — списком заказчику.
+
+## Исправления (раунд 2)
+> TL;DR: 2026-11-04, финальный раунд исправлений после цикла 3. Закрыты R3-1…R3-5; все 5 `xfail` ревьюера сняты и проходят, добавлено 9 регрессионных тестов (`tests/test_fix2_t369.py`). `integration.md` §1 уточнён. Отложенное внесено в «Входящие» BOARD (T-371, T-372). Статус review.
+
+| Находка | Исправление | Тест |
+|---|---|---|
+| R3-1 (medium) | `ClientRegistry._apply` (`api_gateway/auth.py`) считает отзыв по БД в той же транзакции: клиенты с облачными задачами в `submitted/queued` или открытыми explicit/prewarm lease, которых нет в конфиге или у которых нет `cloud_allowed`, теряют их (`_revoke_cloud`). Возвращает список отозванных. `sync()` (старт службы) и `reload()` используют один путь и оба вызывают `on_revoke` (= `Controller.wake`), если что-то отозвано; повторный `sync` ничего не находит (идемпотентно). Отменённые задачи помечены `error_code='cloud_not_allowed'`, `GET /v1/tasks/{id}` → `error.code=cancelled`, `error.reason=cloud_not_allowed` (`results.job_error`) | `test_review_t369_r3_revoke::test_boot_sync_revokes_queued_cloud_jobs_of_client_without_cloud`; `test_fix2_t369::test_boot_sync_closes_explicit_lease_tags_job_and_wakes`, `test_boot_sync_revokes_removed_client`, `test_boot_sync_keeps_cloud_jobs_of_allowed_clients` |
+| R3-2 (low) | `queue.requeue`: облачная задача (`pool IS NOT NULL`), клиент которой отключён или не `data_class='cloud_allowed'` (`queue.cloud_allowed`), не возвращается в очередь и не уходит в local fallback, а отменяется (`_finish_cancel(..., error_code=CLOUD_NOT_ALLOWED)`), результат `"failed"`. Running задача при отзыве по-прежнему дорабатывает. Инвариант private не затронут (облака нет ни в одной ветке) | `test_review_t369_r3_revoke::test_running_cloud_job_of_revoked_client_does_not_return_to_cloud_queue`; `test_fix2_t369::test_requeue_of_revoked_running_cloud_job_cancels_with_reason`, `test_requeue_of_allowed_client_running_cloud_job_still_requeues` |
+| R3-3 (low) | `Submitter.submit` (`api_gateway/submission.py`): при `spec.pool is not None` непосредственно перед `controller.submit` (без `await` между ними) принципал перечитывается `registry.by_id(client_id)` (новый метод); `None` или нет `cloud_allowed` → `403 forbidden`, `reason=cloud_not_allowed` | `test_review_t369_r3_revoke::test_reload_during_submit_does_not_queue_cloud_job`; `test_fix2_t369::test_submit_refused_when_client_vanished_before_controller_submit`, `test_local_submit_not_affected_by_rights_recheck` |
+| R3-4 (low) | `SecretMaskFilter.filter` (`api_gateway/logging.py`): `getMessage()` ловит любое `Exception`; всё маскирование обёрнуто в `try/except Exception` — при сбое запись заменяется на `<log record dropped by mask filter>` (args/exc_info/exc_text/stack_info очищены), фильтр всегда возвращает True и никогда не бросает | `test_review_t369_r3_supervise::test_mask_filter_never_raises_on_bad_format`; `test_fix2_t369::test_mask_filter_bad_format_keeps_masking`, `test_mask_filter_unexpected_error_drops_record_but_returns_true` |
+| R3-5 (low, тесты) | `tests/harness.py`: `TrackingExecutor` больше не считает в `submit`/колбэке concurrent-future; `install_tracking_executor` оборачивает `loop.run_in_executor`, `pending` растёт при постановке и падает в done-колбэке asyncio-future (`_done`) — на loop после доставки результата, когда пробуждение ожидающей задачи уже в очереди | `test_review_t369_r3_supervise::test_settle_waits_until_to_thread_result_is_delivered` |
+
+**Отклонения и побочные правки**
+- Тестовые фикстуры, вставляющие клиентов напрямую (`tests/harness.py`, `d_fixtures.py`, `test_c_support.py`, `test_e_support.py`), теперь ставят `data_class='cloud_allowed'`: раньше у них был `private` по умолчанию при облачных задачах — несогласованное состояние, которое после R3-2 отменяло бы их задачи при повторной постановке.
+- `queue.cancel(..., error_code=)` — новый необязательный аргумент (метка немедленной отмены); ручной `POST /v1/tasks/{id}/cancel` не меняется.
+- Клиент, восстановленный `_restore_bodies` (запись `clients` с `key_hash='restored'`, `private`), облако по R3-2 не получит — это fail-closed.
+- `integration.md` §1: отзыв действует и при перезапуске; running облачная задача дорабатывает, после прерывания отменяется с `cloud_not_allowed`.
+- BOARD «Входящие»: строки про `last_error` провайдера (T-372), SEC-L2 и SEC-L4 (T-371).
+
+**Команды и результаты**
+- `uv run pytest -q -p no:cacheprovider tests/test_review_t369_r3_*.py tests/test_fix2_t369.py` → 24 passed (xfail нет).
+- `uv run ruff check src tests scripts` → All checks passed; `uv run pyright` → 0 errors.
+- Быстрый набор `uv run pytest -q -p no:cacheprovider -m "not slow and not docker"` → 2517 passed, 0 failed.
+- Полный `uv run pytest -q -p no:cacheprovider -rs -m "slow or docker or not slow"` → 2625 passed, 1 skipped (dotnet SDK не установлен), 294 с.

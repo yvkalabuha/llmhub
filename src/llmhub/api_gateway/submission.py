@@ -210,6 +210,14 @@ class Submitter:
             deadline_at=None if opts.deadline_in_s is None else now + opts.deadline_in_s,
             est_tokens_in=tokens_in, max_tokens=max_tokens, est_cost_usd=decision.est_cost_usd,
         )  # fmt: skip
+        if spec.pool is not None:
+            # R3-3: the principal was taken before the to_thread awaits; a reload (SIGHUP) in
+            # that window may have revoked the cloud. No await between this and submit.
+            current = rt.registry.by_id(principal.client_id)
+            if current is None or not current.cloud_allowed:
+                raise ApiError(
+                    ErrorCode.FORBIDDEN, "client may not use the cloud", reason="cloud_not_allowed"
+                )
         try:
             result = rt.controller.submit(spec, retry_failed=_retryable_failure)
         except IdempotencyConflict as exc:

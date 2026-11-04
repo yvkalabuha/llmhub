@@ -10,7 +10,7 @@ import logging
 import secrets
 import signal
 import sqlite3
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -61,13 +61,23 @@ class ClientRegistry:
         self._by_hash: dict[str, Principal] = {}
         self.on_revoke: Callable[[], None] | None = None  # e.g. Controller.wake
 
-    def sync(self) -> None:
-        """Config -> `clients` table (upsert, absent clients disabled) and the key index."""
-        self._apply(self.cfg.clients, revoked=())
+    def sync(self) -> list[str]:
+        """Config -> `clients` table (upsert, absent clients disabled) and the key index.
+        At boot it also revokes the cloud work of clients that lost the cloud while the
+        service was down (R3-1); returns the revoked client ids."""
+        revoked = self._apply(self.cfg.clients)
+        if revoked and self.on_revoke is not None:
+            self.on_revoke()
+        return revoked
 
-    def _apply(self, clients: Mapping[str, ClientConfig], revoked: Iterable[str]) -> None:
+    def _apply(self, clients: Mapping[str, ClientConfig]) -> list[str]:
         """Build the index, write the table and revoke cloud work in one transaction, then
-        swap the index. Busy/any error leaves the previous index and table untouched."""
+        swap the index. Busy/any error leaves the previous index and table untouched.
+
+        Revocation is computed from the database, not from a diff against the running
+        config, so it is idempotent and the same for boot sync and reload: every client
+        that has queued cloud jobs or open explicit/prewarm leases but is absent or not
+        `cloud_allowed` in `clients` loses them."""
         now = self.clock.now()
         index = {
             c.key_sha256: Principal(
@@ -102,9 +112,20 @@ class ClientRegistry:
                 f"UPDATE clients SET disabled_at=? WHERE disabled_at IS NULL AND id NOT IN ({marks})",
                 (now, *names),
             )
+            cloud = {n for n, c in clients.items() if c.cloud_allowed}
+            holders = self.conn.execute(
+                "SELECT client_id FROM jobs WHERE pool IS NOT NULL"
+                " AND status IN ('submitted','queued')"
+                " UNION SELECT client_id FROM leases WHERE kind IN ('explicit','prewarm')"
+                " AND closed_at IS NULL AND client_id IS NOT NULL"
+            ).fetchall()
+            revoked = sorted(str(r[0]) for r in holders if r[0] not in cloud)
             for client_id in revoked:
                 self._revoke_cloud(client_id, now)
         self._by_hash = index
+        if revoked:
+            log.warning("cloud work revoked for %d client(s)", len(revoked))
+        return revoked
 
     def _revoke_cloud(self, client_id: str, now: float) -> None:
         """A client lost the cloud (removed or `cloud_allowed: false`, SEC-M3): its queued
@@ -116,7 +137,7 @@ class ClientRegistry:
             (client_id,),
         ).fetchall()
         for row in rows:
-            queue.cancel(self.conn, row["id"], now)
+            queue.cancel(self.conn, row["id"], now, error_code=queue.CLOUD_NOT_ALLOWED)
         self.conn.execute(
             "UPDATE leases SET closed_at=?, close_reason='revoked' WHERE client_id=?"
             " AND kind IN ('explicit','prewarm') AND closed_at IS NULL",
@@ -134,12 +155,7 @@ class ClientRegistry:
         for name, c in new.clients.items():
             if c.key_sha256 in admins:
                 raise ConfigError(f"clients.{name}.key_sha256: equals an admin key hash")
-        revoked = [
-            name
-            for name in self.cfg.clients
-            if name not in new.clients or not new.clients[name].cloud_allowed
-        ]
-        self._apply(new.clients, revoked)
+        revoked = self._apply(new.clients)
         self.cfg.clients = new.clients
         if new_admin != running_admin:
             self.cfg.api.admin_key_sha256 = new_admin
@@ -147,6 +163,13 @@ class ClientRegistry:
         if revoked and self.on_revoke is not None:
             self.on_revoke()
         return len(new.clients)
+
+    def by_id(self, client_id: str) -> Principal | None:
+        """The current principal of a client (after any reload), None if it is gone."""
+        for p in self._by_hash.values():
+            if p.client_id == client_id:
+                return p
+        return None
 
     def by_key(self, key: str) -> Principal | None:
         digest = hash_key(key)
