@@ -233,3 +233,12 @@ def test_recorded_fixtures_parse(path: Path) -> None:
     elif kind in ("networkvolumes", "templates"):
         for it in items:
             assert isinstance(it.get("id"), str) and isinstance(it.get("name"), str)
+
+
+async def test_null_list_answer_is_empty() -> None:
+    """L0 2026-11-04: the real REST API answers JSON `null` (not `[]`) for an empty list
+    (seen on /containerregistryauth). A null page is an empty list, not a parse error."""
+    api = RunpodApi(lambda: FAKE_KEY,
+                    transport=httpx.MockTransport(lambda r: httpx.Response(200, text="null")))
+    assert await api.list_network_volumes() == []
+    assert await api.list_templates() == []

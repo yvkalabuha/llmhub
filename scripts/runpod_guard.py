@@ -57,6 +57,7 @@ MAX_AGE_S = 75 * 60
 MAX_SPEND_H = 0.30
 MAX_PODS = 1
 TIMEOUT_S = 20
+USER_AGENT = "llmhub-guard/0.3.2"
 DEFAULT_TTL_S = 24 * 3600  # --until default: before.taken_at + 24 h (REV-S9)
 FIRST_SEEN = "first_seen.json"
 UTC = dt.timezone.utc  # noqa: UP017 -- Python 3.10 (unit: /usr/bin/python3) has no dt.UTC (R3-1)
@@ -122,6 +123,9 @@ def http_json(method: str, url: str, key: str, body: Any = None) -> Any:
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("Authorization", f"Bearer {key}")
     req.add_header("Accept", "application/json")
+    # The REST edge refuses urllib's default "Python-urllib/3.x" User-Agent with 403
+    # (seen in L0 on 2026-11-04; curl and httpx agents get 200), so always send our own.
+    req.add_header("User-Agent", USER_AGENT)
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
@@ -200,6 +204,8 @@ def _split_pods(raw: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], l
     delete). Any other item (no string `name`, a foreign name) with a missing field is skipped
     with a note: openapi `Pod` has no `required`, and a malformed FOREIGN pod must not blind
     the guard to ours (R3-6)."""
+    if raw is None:  # the real REST API answers JSON `null` for an empty list (L0 2026-11-04)
+        raw = []
     if not isinstance(raw, list):
         raise parse_error("pods: not a list")
     pods: list[dict[str, Any]] = []
@@ -262,6 +268,8 @@ def parse_pods(raw: Any) -> list[dict[str, Any]]:
 
 
 def parse_named(raw: Any, kind: str) -> list[dict[str, Any]]:
+    if raw is None:  # JSON `null` = empty list on the real API (containerregistryauth, L0)
+        raw = []
     if not isinstance(raw, list):
         raise parse_error(f"{kind}: not a list")
     out = []
@@ -509,6 +517,8 @@ def cmd_record(a: argparse.Namespace) -> int:
     }  # fmt: skip
     for kind, path in sources.items():
         raw = http_json("GET", REST + path, key)
+        if raw is None:  # JSON `null` = empty list
+            raw = []
         if not isinstance(raw, list):
             raise parse_error(f"{kind}: not a list")
         doc = {"_source": "recorded", "_kind": kind,

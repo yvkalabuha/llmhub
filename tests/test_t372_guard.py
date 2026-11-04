@@ -441,3 +441,24 @@ def test_systemd_unit_sets_state_dir_and_expiry() -> None:
     assert "--state-dir " in exec_start and "--before ${GUARD_BEFORE}" in exec_start
     env = (ROOT / "deploy" / "workstation" / "guard.env.example").read_text()
     assert "GUARD_UNTIL=" in env and "+ 6 h" in env
+
+
+def test_guard_sends_own_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """L0 2026-11-04: RunPod's REST edge answers 403 to urllib's default `Python-urllib/3.x`
+    User-Agent (curl/httpx get 200). Every guard request must carry its own agent."""
+    seen: list[str | None] = []
+
+    class _Op:
+        def open(self, req: Any, timeout: float = 0) -> Any:
+            seen.append(req.get_header("User-agent"))
+            return _Resp(b"[]")
+
+    monkeypatch.setattr(g, "OPENER", _Op())
+    assert g.http_json("GET", "https://rest.runpod.io/v1/pods", "k") == []
+    assert seen and seen[0] and not seen[0].startswith("Python-urllib")
+    assert seen[0].startswith("llmhub-guard/")
+
+
+def test_null_list_is_empty() -> None:
+    """L0 2026-11-04: GET /containerregistryauth with nothing registered answers `null`."""
+    assert g.parse_named(None, "registry_auths") == []

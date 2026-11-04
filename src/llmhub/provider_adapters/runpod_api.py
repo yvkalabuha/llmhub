@@ -405,6 +405,8 @@ class RunpodApi:
         query = dict(params or {})
         for _ in range(MAX_PAGES):
             raw = await self._rest("GET", path, template, params=query)
+            if raw is None:  # the real API answers JSON `null` for an empty list (L0 2026-11-04)
+                return out
             if isinstance(raw, list):
                 return out + raw
             d = p.obj(raw, "page")
