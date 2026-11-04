@@ -11,7 +11,7 @@ pools:
     models: [big]
 local_backends:
   cpu:
-    url: http://127.0.0.1:8091/v1
+    url: http://fake-llama-a/v1
     model: local-model
     ctx_tokens: 32768
     pp_tps: 50
