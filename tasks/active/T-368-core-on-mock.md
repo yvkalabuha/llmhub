@@ -5,8 +5,8 @@
 - Проект: llmhub
 - Тип: impl
 - Агент: analyst → implementer → reviewer (ворота critic + advocate на план, P1)
-- Статус: todo
-- План: tasks/plans/T-368-plan.md (создаёт analyst)
+- Статус: in-progress
+- План: tasks/plans/T-368-plan.md
 - Приоритет: P1
 - Зависит от: —
 - Документы: decisions/ADR-0138-cloud-gpu-manager.md; /var/www/projectVoiceBot/platform/docs/research/T-367-cloud-gpu-manager.md (§6.3, §6.4, §6.5, §6.6, §6.7, §6.8, §6.9, §9); T-367-tz-v2.md (ТЗ)
@@ -27,7 +27,7 @@
 - [ ] Прогон S1–S6/RF2–RF6 симулятора через Mock с ускоренными часами: число запусков и $ совпадают ±5 %.
 - [ ] `uv run pytest`, `ruff check`, `pyright` чисто; ревью ≤ 3 раундов; автомат/leases/бюджет/create-reconcile — 2 независимых цикла ревью.
 ## Подзадачи
-- [ ] Ворота critic + advocate на план
+- [x] Ворота critic + advocate на план (2026-11-04)
 - [ ] persistence + configuration
 - [ ] provider_adapters base/mock + contract
 - [ ] lifecycle_manager + leases
@@ -39,3 +39,7 @@
 <заполняет reviewer: находки, команды, результаты, вердикт>
 ## Журнал
 - 2026-11-04: задача создана координатором при создании репозитория.
+- 2026-11-04: analyst — план `tasks/plans/T-368-plan.md` (41 шаг, потоки A–F, DDL, таблица переходов E1–E22, тесты §15 и 19 ситуаций); статус planned; следующий шаг — ворота critic + advocate.
+- 2026-11-04: analyst — правки по воротам critic + advocate внесены в план (§14: 1 high, 11 medium, low, advocate a–e, решения Q1/Q3/Q4/hold); S0 добавлен, 42 шага; Capability.SPEND_RATE — расширение списка §6.5; статус planned.
+- 2026-11-04: implementer — A1–A5 и S0 выполнены (A6 — следующий). Пакеты: `clock.py`; `configuration/{models,loader}.py`; `persistence/{db.py, migrations/0001_initial.sql}` (13 таблиц, DDL из §4 дословно); `provider_adapters/{base,labels,mock,mock_store,mock_inference}.py`; `cloud_manager/{inference,pools,offers,provisioner}.py`; `lifecycle_manager/{states,machine,leases,teardown,recovery}.py`; `task_queue/{models,bodies,queue}.py`; `budget_manager/limits.py` (только `Gate`); `killswitch.py` (KillReport, check_kill_file); `controller.py`; `tests/harness.py`. Тесты: `test_a_clock`, `test_a_config`, `test_a_schema`, `test_a_unique_pool` (A4 + гонка 10 потоков), `test_a_tx` (A5: контроллер 300 мс -> `Busy`, сторож 5000 мс ждёт), `test_s0_skeleton` (happy path PROVISIONING→...→STOPPED, детерминизм, повторное использование инстанса, CAS, таблица рёбер). Итог: pytest 66 passed, ruff и pyright чисто.
+- 2026-11-04: отклонения и уточнения интерфейсов: (1) `trigger` в `transition`/`check_edge` — id ребра `E1`..`E22` (у E15 шесть рёбер, у E17 два; всего 28 рёбер); подробность причины — `reason=` в `**fields` (по умолчанию = id), в `transitions.reason`; (2) `transition` и `set_provider_ref` присоединяются к открытой транзакции или открывают свою; `insert_provisioning` и `try_idle_to_stopping` всегда одна своя; (3) E1 пишет строку `transitions` (STOPPED→PROVISIONING); (4) `connect(path, busy_timeout_ms=300)`; `tx` при занятой БД бросает `persistence.db.Busy`; вложенный `tx` — AssertionError; (5) `queue.complete(..., res_path=None)` — добавлен необязательный аргумент; (6) функции очереди лежат в `task_queue/queue.py`, типы — `task_queue/models.py`; (7) `JobRunSpec(job_id, model_alias, tokens_in, max_tokens, body)` и `JobRunResult(tokens_in, tokens_out, finish_reason, body)` — поля план не задавал; (8) заглушки с `NotImplementedError`: `MockProvider.inject/stopped_but_billing`, `queue.{requeue,fallback_local,cancel,requeue_orphaned_running,purge_expired}`, `find_duplicates`, `kill_all`, `Controller.{kill,resume,hold,release}`; (9) в S0 нет резерва `session` в `insert_provisioning`, KILL-файла в `step()`, таймаутов состояний, GuardedAdapter; (10) `pyproject.toml`: marker `slow`, `asyncio_default_fixture_loop_scope`, pyright `extraPaths=["tests"]`; `tests/conftest.py` не создавался (не понадобился).

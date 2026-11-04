@@ -20,6 +20,8 @@ packages = ["src/llmhub"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = ["slow: long-running tests (simulator parity, subprocess reaper)"]
 testpaths = ["tests"]
 
 [tool.ruff]
@@ -29,3 +31,4 @@ src = ["src", "tests"]
 [tool.pyright]
 include = ["src", "tests"]
 pythonVersion = "3.12"
+extraPaths = ["tests"]
