@@ -125,6 +125,8 @@ class ApiError(Exception):
             h["Retry-After"] = str(max(1, math.ceil(self.retry_after_s)))
         if self.code is ErrorCode.UNAUTHORIZED:
             h.setdefault("WWW-Authenticate", "Bearer")
+        # openai-python retries 409/5xx on its own unless told otherwise (FN-1)
+        h.setdefault("x-should-retry", "true" if self.retryable else "false")
         return h
 
     def response(self) -> JSONResponse:

@@ -139,6 +139,7 @@ async def reload_clients(request: Request) -> JSONResponse:
         n = rt.registry.reload(rt.config_path)
     except ConfigError as exc:
         raise ApiError(ErrorCode.INVALID_REQUEST, f"config rejected: {exc}"[:300]) from None
+    rt.controller.wake()  # revoked clients' leases/jobs may free a GPU
     return JSONResponse({"clients": n})
 
 

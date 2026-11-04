@@ -4,15 +4,15 @@
 
 ## 1. Подключение
 - Базовый URL `http://10.8.0.1:8095` (только VPN); OpenAI-клиентам — `OPENAI_BASE_URL=http://10.8.0.1:8095/v1`.
-- Ключ клиента: `Authorization: Bearer lh_...`. Выдаёт администратор (`python -m llmhub keys new --name <client>` печатает ключ один раз и его sha256; в конфиге и БД — только хеш). Новый клиент подключается без перезапуска (`SIGHUP` или `POST /admin/reload_clients`).
+- Ключ клиента: `Authorization: Bearer lh_...`. Выдаёт администратор (`python -m llmhub keys new --name <client>` печатает ключ один раз и его sha256; в конфиге и БД — только хеш). Новый клиент подключается без перезапуска (`SIGHUP` или `POST /admin/reload_clients`); перечитывание применяет и `api.admin_key_sha256` (ротация admin-ключа). Клиент, которого удалили или у которого сняли `cloud_allowed`, сразу теряет облако: его облачные задачи в очереди отменяются (`cancelled`), явные и prewarm lease закрываются (`revoked`), продление lease → `403 cloud_not_allowed`.
 - У клиента в конфиге: `allowed_models` (псевдонимы или `*`), `max_priority`, `default_priority`, `default_policy`, `cloud_allowed` (по умолчанию `false`).
 - `GET /v1/models` — псевдонимы, доступные клиенту, и `auto` (поле `llmhub`: `local`, `cloud`, `ctx_tokens`).
 - `/healthz` (без ключа) — жив ли процесс; `/readyz` — жив ли цикл контроллера.
 
 ## 2. Конфиденциальность: `data_class`
-- Эффективный класс = клиент ∧ заголовок `X-LLMHub-Data-Class` ∧ поле тела `llmhub.data_class`. Любой источник может только **сузить** до `private`; расширить до `cloud_allowed` можно лишь в конфиге клиента.
+- Эффективный класс = клиент ∧ заголовок `X-LLMHub-Data-Class` ∧ поле тела `llmhub.data_class`. Любой источник может только **сузить** до `private` (повторённый заголовок: хватает одного `private`); расширить до `cloud_allowed` можно лишь в конфиге клиента.
 - `private` (по умолчанию) — **только локальные модели**: ни правилом политики, ни запасным путём, ни перезапуском такая задача в облако не уходит. Нет локальной модели у псевдонима → `403 forbidden` (`reason=private_requires_local`); локальная недоступна → `503 local_unavailable`.
-- Детектор секретов сканирует все строки запроса (сообщения, content-parts, `tool_calls.arguments`, ответы tools, `tools`, `response_format`): ключи API, пароли в `KEY=…`/JSON/YAML, JWT, `https://user:pass@host`, приватные ключи OpenSSH/PGP. Найден секрет → задача только локальная, заголовок ответа `X-LLMHub-Warning: secret_detected`; у облачного псевдонима без локальной модели → `403`.
+- Детектор секретов сканирует все строки запроса (сообщения, content-parts, `tool_calls.arguments`, ответы tools, `tools`, `response_format`): ключи API, пароли в `KEY=…`/JSON/YAML, JWT, `https://user:pass@host`, приватные ключи OpenSSH/PGP. Найден секрет → задача только локальная, заголовок ответа `X-LLMHub-Warning: secret_detected`; у облачного псевдонима без локальной модели → `403`. Детектор эвристический (страховка, гарантию даёт только `private`): секрет в base64, разбитый на несколько сообщений или с zero-width-символами он не найдёт.
 
 ## 3. OpenAI-совместимый шлюз
 - `POST /v1/chat/completions` — тело OpenAI (`model`, `messages`, `tools`, `response_format`, `max_tokens`/`max_completion_tokens`, `stream`, `stream_options.include_usage`; прочие поля уходят модели как есть). `model` — псевдоним или `auto`.
@@ -43,15 +43,16 @@
 ### Синхронное окно и таймауты клиента
 - Сервер ждёт результат до 480 с (`X-LLMHub-Wait` — меньше). Не успел → `503 queue_wait_exceeded` + `Retry-After` + `task_id`; **задача остаётся в очереди**. Повтор того же запроса (тот же `Idempotency-Key` или то же тело) присоединяется к ней.
 - Таймаут HTTP-клиента должен быть **больше 480 с**: openai-python — `timeout=600`, C# — `HttpClient.Timeout = 10 мин`, curl — `--max-time 600`. Прокси между клиентом и llmhub — `proxy_read_timeout` > 480 с и `proxy_buffering off` для SSE (T-371).
-- openai-python сам повторяет `503` (`max_retries`, по умолчанию 2) и присоединяется к той же задаче, но `Retry-After` больше 60 с не уважает: общее ожидание до ~24 мин. Для долгих задач — `/v1/tasks`.
+- openai-python сам повторяет `409` и `5xx` (`max_retries`, по умолчанию 2), если сервер не запретил: llmhub в каждом ответе об ошибке ставит `x-should-retry: true|false` (= `error.retryable`), поэтому `409 cancelled`, `504 deadline_exceeded`, `503 controller_halted` и прочие неповторяемые ошибки SDK не повторяет. Повтор `503 queue_wait_exceeded` присоединяется к той же задаче (общее ожидание до ~24 мин). `Retry-After` до 120 с SDK выдерживает; **если `Retry-After` больше 120 с, SDK не повторяет вовсе** и сразу поднимает исключение. Сервер ставит `Retry-After` по ETA в пределах `api.retry_after_min_s`..`api.retry_after_max_s` (по умолчанию до 900 с), так что при длинной очереди повтора от SDK не будет — для долгих задач `/v1/tasks`.
 - **Разрыв соединения не отменяет задачу**: результат остаётся доступен по `task_id` (`X-LLMHub-Task` или `error.task_id`). Повтор после сетевой ошибки — с тем же `Idempotency-Key`.
 
 ### Stream (SSE) в v1
 - Заголовки ответа приходят сразу, затем комментарии `: keep-alive` каждые 15 с, пока задача ждёт и идёт. **Первый чанк с текстом приходит только в конце** (ответ отдаётся буфером), затем `finish_reason`, `usage` (при `include_usage`) и `data: [DONE]`. `tool_calls` (с `index`) и `reasoning_content` передаются в дельтах.
+- `X-LLMHub-Fallback` в stream-ответе ставится по решению, принятому при постановке (заголовки уходят до завершения задачи); запасной путь, выбранный позже ядром (облако отказало уже в работе), виден только в `GET /v1/tasks/{id}` (`fallback`).
 - Ошибка после отправки заголовков приходит событием `data: {"error": {...}}` без `[DONE]` (openai-python поднимает `APIError`).
 
 ## 4. Задачи (`/v1/tasks`)
-1. `POST /v1/tasks` (тело как у chat) → `202` + `Location` + `{"id","status","route","backend"}`; дубликат → `200` с тем же `id`.
+1. `POST /v1/tasks` (тело как у chat) → `202` + `Location` + `{"id","status","route","backend"}`; дубликат → `200` с тем же `id`. Исключение: если задача с этим `Idempotency-Key` упала с `retryable=true`, ключ переходит к новой задаче (`202`, новый `id`); упавшая с `retryable=false` или отменённая возвращается как есть.
 2. `GET /v1/tasks/{id}` → статус, `eta_s`, маршрут, `est_cost_usd`/`cost_usd`, `fallback`, `warnings`, `error`. Опрашивайте с паузой ≈ `eta_s/4` (не чаще раза в 0,5 с, не реже раза в 30 с).
 3. `GET /v1/tasks/{id}/result` → `chat.completion` с заголовками ответа; не готово → `409 task_not_ready` (`retry_after_s`); упала → объект ошибки задачи; отменена → `409 cancelled`.
 4. `POST /v1/tasks/{id}/cancel`: в очереди → `cancelled`; локальная в работе → вызов рвётся, `cancelled`; **облачная в работе → `cancel_requested`, итог `cancelled`, уже потраченное время GPU оплачено**; завершённая — без изменений.
@@ -95,7 +96,7 @@
 
 Шесть причин недоступности облака (`reason` у `cloud_unavailable`, значение `X-LLMHub-Fallback`): `provider_api_error`, `gpu_unavailable`, `deployment_error` — временные (`retryable=true`); `insufficient_balance`, `quota_exceeded`, `budget_limit_reached` — нет (нужен оператор). Если у псевдонима есть локальная модель, запрос с разрешённым облаком выполняется локально (`200` + `X-LLMHub-Fallback`).
 
-Повторять стоит только `retryable=true`, с паузой `retry_after_s`/`Retry-After` и тем же `Idempotency-Key`.
+Повторять стоит только `retryable=true`, с паузой `retry_after_s`/`Retry-After` и тем же `Idempotency-Key`: после итоговой повторяемой ошибки тот же ключ запускает новую задачу (§4), после неповторяемой возвращает ту же ошибку — нужен новый ключ и, как правило, оператор.
 
 ## 7. Примеры (`examples/`)
 Все используют только `$LLMHUB_URL`, `$LLMHUB_KEY` (`$LLMHUB_ADMIN_KEY` — admin), openai-python — `OPENAI_BASE_URL`/`OPENAI_API_KEY`; необязательно `$LLMHUB_MODEL` (умолчание `auto`). Каждый исполняется в `tests/test_o_examples.py` против живого приложения на Mock.

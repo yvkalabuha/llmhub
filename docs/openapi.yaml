@@ -77,7 +77,7 @@ paths:
       responses:
         '200':
           description: chat.completion (or text/event-stream when stream=true)
-          headers: &id009
+          headers: &id011
             X-LLMHub-Task:
               description: task id of this answer
               schema:
@@ -112,45 +112,60 @@ paths:
                 type: string
         '204':
           description: client disconnected; the task keeps running
-        '400': &id003
+        '400': &id005
           description: invalid_request | context_too_large
           content:
             application/json:
               schema: &id001
                 $ref: '#/components/schemas/Error'
-        '401': &id002
+          headers: &id002
+            x-should-retry: &id003
+              description: true|false = error.retryable; stops openai-python's own retries of non-retryable
+                409/5xx errors
+              schema:
+                type: string
+                enum:
+                - 'true'
+                - 'false'
+        '401': &id004
           description: 'unauthorized: missing or invalid API key'
           content:
             application/json:
               schema: *id001
-        '403': &id004
+          headers: *id002
+        '403': &id006
           description: forbidden (model, priority, private data without a local model)
           content:
             application/json:
               schema: *id001
-        '404': &id005
+          headers: *id002
+        '404': &id007
           description: model_not_available
           content:
             application/json:
               schema: *id001
-        '409': &id006
+          headers: *id002
+        '409': &id008
           description: idempotency_conflict (task_id of the existing task)
           content:
             application/json:
               schema: *id001
-        '413': &id007
+          headers: *id002
+        '413': &id009
           description: request_too_large
           content:
             application/json:
               schema: *id001
-        '503': &id008
+          headers: *id002
+        '503': &id010
           description: queue_wait_exceeded (Retry-After, task_id; the task stays) | cloud_unavailable
             (reason) | local_unavailable | controller_halted | busy
           content:
             application/json:
               schema: *id001
-          headers: &id010
-            Retry-After:
+          headers:
+            x-should-retry: *id003
+            Retry-After: &id012
               description: seconds
               schema:
                 type: integer
@@ -159,6 +174,7 @@ paths:
           content:
             application/json:
               schema: *id001
+          headers: *id002
   /v1/models:
     get:
       summary: Aliases allowed to this client (+ auto)
@@ -172,7 +188,7 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ModelList'
-        '401': *id002
+        '401': *id004
   /v1/tasks:
     post:
       summary: Submit an asynchronous task
@@ -246,13 +262,13 @@ paths:
             Location:
               schema:
                 type: string
-        '400': *id003
-        '401': *id002
-        '403': *id004
-        '404': *id005
-        '409': *id006
-        '413': *id007
-        '503': *id008
+        '400': *id005
+        '401': *id004
+        '403': *id006
+        '404': *id007
+        '409': *id008
+        '413': *id009
+        '503': *id010
   /v1/tasks/{task_id}:
     get:
       summary: Task status (ETA, route, cost, error)
@@ -273,12 +289,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/TaskStatus'
-        '401': *id002
+        '401': *id004
         '404':
           description: not_found (other clients' tasks too)
           content:
             application/json:
               schema: *id001
+          headers: *id002
   /v1/tasks/{task_id}/result:
     get:
       summary: Task result
@@ -299,30 +316,35 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ChatCompletion'
-          headers: *id009
-        '401': *id002
+          headers: *id011
+        '401': *id004
         '404':
           description: not_found
           content:
             application/json:
               schema: *id001
+          headers: *id002
         '409':
           description: task_not_ready (retry_after_s) | cancelled
           content:
             application/json:
               schema: *id001
-          headers: *id010
+          headers:
+            x-should-retry: *id003
+            Retry-After: *id012
         '503':
           description: 'error of the failed task: cloud_unavailable, local_unavailable, queue_wait_exceeded,
             ...'
           content:
             application/json:
               schema: *id001
+          headers: *id002
         '504':
           description: deadline_exceeded | upstream_timeout
           content:
             application/json:
               schema: *id001
+          headers: *id002
   /v1/tasks/{task_id}/cancel:
     post:
       summary: 'Cancel (running cloud task: GPU time already spent is paid)'
@@ -343,12 +365,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CancelResult'
-        '401': *id002
+        '401': *id004
         '404':
           description: not_found
           content:
             application/json:
               schema: *id001
+          headers: *id002
   /v1/leases:
     post:
       summary: 'Explicit (or prewarm) lease: keeps the cloud GPU while renewed'
@@ -373,17 +396,20 @@ paths:
           content:
             application/json:
               schema: *id001
-        '401': *id002
+          headers: *id002
+        '401': *id004
         '403':
           description: forbidden (client without cloud_allowed, model not allowed)
           content:
             application/json:
               schema: *id001
+          headers: *id002
         '404':
           description: model_not_available | not_found (no cloud pool)
           content:
             application/json:
               schema: *id001
+          headers: *id002
   /v1/leases/{lease_id}/renew:
     post:
       summary: 'Heartbeat: renew the lease TTL'
@@ -404,22 +430,25 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LeaseRenewed'
-        '401': *id002
+        '401': *id004
         '404':
           description: not_found
           content:
             application/json:
               schema: *id001
+          headers: *id002
         '409':
           description: lease_closed
           content:
             application/json:
               schema: *id001
+          headers: *id002
         '410':
           description: lease_expired
           content:
             application/json:
               schema: *id001
+          headers: *id002
   /v1/leases/{lease_id}/close:
     post:
       summary: Close the lease (idempotent); final=true drains the GPU
@@ -446,12 +475,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/LeaseClosed'
-        '401': *id002
+        '401': *id004
         '404':
           description: not_found
           content:
             application/json:
               schema: *id001
+          headers: *id002
   /admin/status:
     get:
       summary: Pools, local backends, budget, providers, incidents
@@ -465,12 +495,13 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AnyObject'
-        '401': *id002
-        '403': &id011
+        '401': *id004
+        '403': &id013
           description: 'forbidden: admin key required (or admin API disabled)'
           content:
             application/json:
               schema: *id001
+          headers: *id002
   /admin/budget:
     get:
       summary: Budget stage, committed amounts, warnings
@@ -484,8 +515,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AnyObject'
-        '401': *id002
-        '403': *id011
+        '401': *id004
+        '403': *id013
   /admin/clients:
     get:
       summary: Clients (no key hashes)
@@ -499,8 +530,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AnyObject'
-        '401': *id002
-        '403': *id011
+        '401': *id004
+        '403': *id013
   /admin/reload_clients:
     post:
       summary: Re-read the clients section (same as SIGHUP)
@@ -519,8 +550,9 @@ paths:
           content:
             application/json:
               schema: *id001
-        '401': *id002
-        '403': *id011
+          headers: *id002
+        '401': *id004
+        '403': *id013
   /admin/hold:
     post:
       summary: Admin hold of a pool (<= 8 h)
@@ -545,18 +577,21 @@ paths:
           content:
             application/json:
               schema: *id001
-        '401': *id002
-        '403': *id011
+          headers: *id002
+        '401': *id004
+        '403': *id013
         '404':
           description: not_found
           content:
             application/json:
               schema: *id001
+          headers: *id002
         '409':
           description: 'conflict: hold rejected (reason)'
           content:
             application/json:
               schema: *id001
+          headers: *id002
   /admin/release:
     post:
       summary: Release admin holds
@@ -576,8 +611,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AnyObject'
-        '401': *id002
-        '403': *id011
+        '401': *id004
+        '403': *id013
   /admin/kill:
     post:
       summary: HALT and destroy every resource (<= 60 s)
@@ -597,8 +632,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AnyObject'
-        '401': *id002
-        '403': *id011
+        '401': *id004
+        '403': *id013
   /admin/resume:
     post:
       summary: Lift HALTED and provider blocks
@@ -618,13 +653,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AnyObject'
-        '401': *id002
-        '403': *id011
+        '401': *id004
+        '403': *id013
         '409':
           description: 'conflict: kill_file_present | reconcile_required'
           content:
             application/json:
               schema: *id001
+          headers: *id002
   /admin/reload_billing:
     post:
       summary: Provider billing since month start -> ledger
@@ -638,13 +674,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AnyObject'
-        '401': *id002
-        '403': *id011
+        '401': *id004
+        '403': *id013
         '503':
           description: busy
           content:
             application/json:
               schema: *id001
+          headers: *id002
   /admin/clear_weights_hold:
     post:
       summary: Lift a weights_hold launch block
@@ -664,8 +701,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AnyObject'
-        '401': *id002
-        '403': *id011
+        '401': *id004
+        '403': *id013
   /healthz:
     get:
       summary: Liveness (no key, no LLM dependency)
@@ -709,8 +746,8 @@ paths:
             text/plain:
               schema:
                 type: string
-        '401': *id002
-        '403': *id011
+        '401': *id004
+        '403': *id013
 components:
   schemas:
     Error:
@@ -719,7 +756,7 @@ components:
         error:
           type: object
           properties:
-            message: &id013
+            message: &id015
               type: string
             type:
               type: string
@@ -733,22 +770,22 @@ components:
             code:
               $ref: '#/components/schemas/ErrorCode'
             reason:
-              type: &id012
+              type: &id014
               - string
               - 'null'
               description: 'cause, e.g. one of the six cloud-unavailability reasons: insufficient_balance,
                 quota_exceeded, provider_api_error, gpu_unavailable, deployment_error, budget_limit_reached'
-            retryable: &id014
+            retryable: &id016
               type: boolean
-            retry_after_s: &id018
+            retry_after_s: &id020
               type:
               - number
               - 'null'
             task_id:
-              type: *id012
+              type: *id014
               description: the task keeps running; poll /v1/tasks/{id}
-            fallback: &id016
-              type: *id012
+            fallback: &id018
+              type: *id014
           required:
           - message
           - type
@@ -795,9 +832,9 @@ components:
           - ECONOMY
           - BALANCED
           - QUALITY
-        deadline_s: &id017
+        deadline_s: &id019
           type: number
-        task_type: *id013
+        task_type: *id015
         data_class:
           type: string
           enum:
@@ -816,14 +853,14 @@ components:
           items:
             type: object
           minItems: 1
-        stream: *id014
+        stream: *id016
         stream_options:
           type: object
           properties:
-            include_usage: *id014
-        max_tokens: &id015
+            include_usage: *id016
+        max_tokens: &id017
           type: integer
-        max_completion_tokens: *id015
+        max_completion_tokens: *id017
         tools:
           type: array
         response_format:
@@ -837,32 +874,32 @@ components:
     ChatCompletion:
       type: object
       properties:
-        id: *id013
+        id: *id015
         object:
           const: chat.completion
-        created: *id015
-        model: *id013
+        created: *id017
+        model: *id015
         choices:
           type: array
           items:
             type: object
             properties:
-              index: *id015
-              finish_reason: *id013
+              index: *id017
+              finish_reason: *id015
               message:
                 type: object
                 properties:
-                  role: *id013
-                  content: *id016
-                  reasoning_content: *id016
+                  role: *id015
+                  content: *id018
+                  reasoning_content: *id018
                   tool_calls:
                     type: array
         usage:
           type: object
           properties:
-            prompt_tokens: *id015
-            completion_tokens: *id015
-            total_tokens: *id015
+            prompt_tokens: *id017
+            completion_tokens: *id017
+            total_tokens: *id017
       required:
       - id
       - object
@@ -877,25 +914,25 @@ components:
           items:
             type: object
             properties:
-              id: *id013
+              id: *id015
               object:
                 const: model
-              created: *id015
-              owned_by: *id013
+              created: *id017
+              owned_by: *id015
               llmhub:
                 type: object
                 properties:
-                  local: *id014
-                  cloud: *id014
+                  local: *id016
+                  cloud: *id016
                   ctx_tokens:
                     type:
                     - integer
                     - 'null'
-                  alias_of: *id013
+                  alias_of: *id015
     Task:
       type: object
       properties:
-        id: *id013
+        id: *id015
         object:
           const: llmhub.task
         status:
@@ -907,38 +944,38 @@ components:
           - completed
           - failed
           - cancelled
-        route: *id013
-        backend: *id016
-        created_at: *id017
+        route: *id015
+        backend: *id018
+        created_at: *id019
       required:
       - id
       - status
     TaskStatus:
       type: object
       properties:
-        id: *id013
-        object: *id013
-        status: *id013
-        route: *id013
-        backend: *id016
-        pool: *id016
-        priority: *id013
-        policy: *id013
-        created_at: *id017
-        started_at: *id018
-        finished_at: *id018
-        eta_s: *id018
-        est_cost_usd: *id018
-        cost_usd: *id018
-        finish_reason: *id016
+        id: *id015
+        object: *id015
+        status: *id015
+        route: *id015
+        backend: *id018
+        pool: *id018
+        priority: *id015
+        policy: *id015
+        created_at: *id019
+        started_at: *id020
+        finished_at: *id020
+        eta_s: *id020
+        est_cost_usd: *id020
+        cost_usd: *id020
+        finish_reason: *id018
         usage:
           type:
           - object
           - 'null'
-        fallback: *id016
+        fallback: *id018
         warnings:
           type: array
-          items: *id013
+          items: *id015
         error:
           type:
           - object
@@ -947,64 +984,64 @@ components:
     CancelResult:
       type: object
       properties:
-        id: *id013
-        status: *id013
-        cancel_requested: *id014
+        id: *id015
+        status: *id015
+        cancel_requested: *id016
     LeaseRequest:
       type: object
       properties:
-        model: *id013
+        model: *id015
         ttl_s:
           type: number
           minimum: 30
           maximum: 3600
-        prewarm: *id014
+        prewarm: *id016
       required:
       - model
     Lease:
       type: object
       properties:
-        id: *id013
-        pool: *id013
+        id: *id015
+        pool: *id015
         kind:
           type: string
           enum:
           - explicit
           - prewarm
-        ttl_s: *id017
-        expires_at: *id017
+        ttl_s: *id019
+        expires_at: *id019
     LeaseRenewed:
       type: object
       properties:
-        id: *id013
-        expires_at: *id017
+        id: *id015
+        expires_at: *id019
     LeaseClose:
       type: object
       properties:
-        final: *id014
+        final: *id016
     LeaseClosed:
       type: object
       properties:
-        id: *id013
-        closed: *id014
+        id: *id015
+        closed: *id016
     PoolOrModel:
       type: object
       properties:
-        pool: *id013
-        model: *id013
-        ttl_s: *id017
+        pool: *id015
+        model: *id015
+        ttl_s: *id019
     Health:
       type: object
       properties:
-        status: *id013
-        version: *id013
-        halted: *id014
-        uptime_s: *id017
+        status: *id015
+        version: *id015
+        halted: *id016
+        uptime_s: *id019
     Ready:
       type: object
       properties:
-        ready: *id014
-        reason: *id013
+        ready: *id016
+        reason: *id015
     AnyObject:
       type: object
   securitySchemes:

@@ -21,7 +21,7 @@ from llmhub.configuration.models import Config
 from llmhub.local_inference.client import LocalBackendClient, LocalError
 from llmhub.local_inference.eta import local_eta_s, work_s
 from llmhub.local_inference.stats import BackendStats, Ewma
-from llmhub.persistence.db import tx
+from llmhub.persistence.db import Busy, tx
 from llmhub.task_queue import local
 from llmhub.task_queue.bodies import BodyStore
 
@@ -124,10 +124,18 @@ class LocalWorker:
             while not stop.is_set():
                 self._wake.clear()
                 now = self.clock.now()
-                if now - self._probe_at >= self.cfg.local.probe_interval_s:
-                    self._probe_at = now
-                    await self.probe_all()
-                nxt = await self.step()
+                try:
+                    if now - self._probe_at >= self.cfg.local.probe_interval_s:
+                        self._probe_at = now
+                        await self.probe_all()
+                    nxt = await self.step()
+                except Busy:
+                    # database locked by another process (reaper): retry on the next tick
+                    log.warning("local worker step skipped: database busy")
+                    nxt = now + self.cfg.local.poll_s
+                except Exception as exc:  # noqa: BLE001 - the loop must survive any step error
+                    log.error("local worker step failed: %s", type(exc).__name__)
+                    nxt = now + self.cfg.local.poll_s
                 nxt = min(nxt, self._probe_at + self.cfg.local.probe_interval_s)
                 await self._sleep(nxt, stop)
         finally:

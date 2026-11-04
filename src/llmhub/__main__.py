@@ -30,8 +30,7 @@ def _serve(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 2
-    asyncio.run(serve(svc, port=args.port))
-    return 0
+    return asyncio.run(serve(svc, port=args.port))
 
 
 def _keys_new(args: argparse.Namespace) -> int:

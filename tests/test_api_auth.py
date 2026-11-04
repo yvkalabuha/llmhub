@@ -101,6 +101,8 @@ def _write_cfg(path: Path, tmp: Path, clients: dict[str, dict[str, object]]) -> 
                                    "ctx_tokens": 4096, "pp_tps": 1, "tg_tps": 1}},
         "models": {"big": {"local": "cpu"}},
         "clients": clients,
+        # reload applies the file's admin key too (SEC-L3): keep the running one
+        "api": {"admin_key_sha256": hash_key(ADMIN_KEY)},
     }  # fmt: skip
     path.write_text(yaml.safe_dump(raw))
 

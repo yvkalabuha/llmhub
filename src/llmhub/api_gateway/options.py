@@ -105,8 +105,13 @@ def parse_options(
             raise _bad("unknown task type")
 
     data_class: DataClass = "cloud_allowed" if principal.cloud_allowed else "private"
-    for raw, name in ((h.get("x-llmhub-data-class"), "X-LLMHub-Data-Class"),
-                      (ov.get("data_class"), "llmhub.data_class")):  # fmt: skip
+    # every copy of a repeated header counts (Starlette `Headers.items()` keeps duplicates):
+    # one `private` among them narrows the request (SEC-L1)
+    dc_raw: list[tuple[object, str]] = [
+        (v, "X-LLMHub-Data-Class") for k, v in headers.items() if k.lower() == "x-llmhub-data-class"
+    ]
+    dc_raw.append((ov.get("data_class"), "llmhub.data_class"))
+    for raw, name in dc_raw:
         if raw is not None and _data_class(raw, name) == "private":
             data_class = "private"
 

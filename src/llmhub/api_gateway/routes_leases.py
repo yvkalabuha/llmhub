@@ -87,6 +87,10 @@ async def renew_lease(
 ) -> JSONResponse:
     rt = runtime(request)
     row = _own_lease(request, principal, lease_id)
+    if not principal.cloud_allowed:  # revoked by a reload (SEC-M3): the GPU is not kept alive
+        raise ApiError(
+            ErrorCode.FORBIDDEN, "client may not use the cloud", reason="cloud_not_allowed"
+        )
     if row["closed_at"] is not None and row["close_reason"] == "expired":
         raise ApiError(ErrorCode.LEASE_EXPIRED, "lease expired")
     try:

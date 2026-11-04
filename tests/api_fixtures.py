@@ -16,7 +16,7 @@ from typing import Any
 import httpx
 
 from api_gateway_stubs import StubWorker
-from harness import Harness
+from harness import Harness, install_tracking_executor
 from llmhub.api_gateway.app import Runtime, create_app
 from llmhub.api_gateway.auth import ClientRegistry, hash_key
 from llmhub.api_gateway.waiter import JobWaiter
@@ -95,6 +95,7 @@ class ApiEnv:
         knobs: MockKnobs | None = None,
         config_path: Path | None = None,
     ) -> None:
+        install_tracking_executor()  # pump waits for to_thread work (no lost submits)
         self.cfg = cfg or api_config(tmp)
         self.h = Harness(tmp, self.cfg, knobs, clients=())
         self.clock = self.h.clock

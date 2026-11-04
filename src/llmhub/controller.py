@@ -16,7 +16,7 @@ import asyncio
 import json
 import sqlite3
 import uuid
-from collections.abc import Coroutine, Mapping
+from collections.abc import Callable, Coroutine, Mapping
 from typing import Any
 
 from llmhub.budget_manager import limits, reservations
@@ -209,8 +209,12 @@ class Controller:
             queue.submit(self.conn, self.bodies, spec, now, self.cfg)
             self.bodies.discard(job_id)
 
-    def submit(self, spec: JobSpec) -> SubmitResult:
-        result = queue.submit(self.conn, self.bodies, spec, self.clock.now(), self.cfg)
+    def submit(
+        self, spec: JobSpec, *, retry_failed: Callable[[sqlite3.Row], bool] | None = None
+    ) -> SubmitResult:
+        result = queue.submit(
+            self.conn, self.bodies, spec, self.clock.now(), self.cfg, retry_failed=retry_failed
+        )
         self._wake.set()
         return result
 

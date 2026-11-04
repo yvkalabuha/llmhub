@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from llmhub.api_gateway.auth import Principal
 from llmhub.api_gateway.errors import ApiError, ErrorCode
 from llmhub.api_gateway.options import RequestOptions
+from llmhub.api_gateway.results import job_error
 from llmhub.budget_manager import limits
 from llmhub.model_router.rules import (
     LocalView,
@@ -58,6 +59,12 @@ class Submitted:
     job_id: str
     created: bool
     decision: RouteDecision | None
+
+
+def _retryable_failure(row: sqlite3.Row) -> bool:
+    """A failed job whose error is `retryable=true`: a retry with the same Idempotency-Key
+    starts a new job instead of returning this failure for 7 days (FN-2)."""
+    return row["status"] == "failed" and job_error(row).retryable
 
 
 def route_error_to_api(exc: RouteError) -> ApiError:
@@ -204,7 +211,7 @@ class Submitter:
             est_tokens_in=tokens_in, max_tokens=max_tokens, est_cost_usd=decision.est_cost_usd,
         )  # fmt: skip
         try:
-            result = rt.controller.submit(spec)
+            result = rt.controller.submit(spec, retry_failed=_retryable_failure)
         except IdempotencyConflict as exc:
             raise ApiError(
                 ErrorCode.IDEMPOTENCY_CONFLICT,

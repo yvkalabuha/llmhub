@@ -13,7 +13,9 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from collections.abc import Awaitable
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +61,39 @@ def make_job(
 def _ready_count() -> int:
     loop = asyncio.get_running_loop()
     return len(getattr(loop, "_ready", ()))
+
+
+class TrackingExecutor(ThreadPoolExecutor):
+    """Default executor that counts in-flight `asyncio.to_thread` work: a loop with an empty
+    ready queue is not quiet while a worker thread (JSON parse, secret scan) still runs."""
+
+    def __init__(self) -> None:
+        super().__init__(max_workers=4, thread_name_prefix="test-exec")
+        self.pending = 0
+        self._lock = threading.Lock()
+
+    def submit(self, fn: Any, /, *args: Any, **kwargs: Any) -> Future[Any]:
+        with self._lock:
+            self.pending += 1
+        fut = super().submit(fn, *args, **kwargs)
+        fut.add_done_callback(self._done)
+        return fut
+
+    def _done(self, _fut: Future[Any]) -> None:
+        with self._lock:
+            self.pending -= 1
+
+
+def install_tracking_executor() -> None:
+    """Call from a running loop (async fixture/test) before driving a FakeClock."""
+    loop = asyncio.get_running_loop()
+    if not isinstance(getattr(loop, "_default_executor", None), TrackingExecutor):
+        loop.set_default_executor(TrackingExecutor())
+
+
+def threads_busy() -> bool:
+    ex = getattr(asyncio.get_running_loop(), "_default_executor", None)
+    return isinstance(ex, TrackingExecutor) and ex.pending > 0
 
 
 class Harness:
@@ -135,6 +170,10 @@ class Harness:
         """Let background tasks run until the event loop has nothing ready."""
         quiet = 0
         for _ in range(2000):
+            if threads_busy():  # real time: let the worker thread finish
+                await asyncio.sleep(0.001)
+                quiet = 0
+                continue
             await asyncio.sleep(0)
             quiet = quiet + 1 if _ready_count() == 0 else 0
             if quiet >= 2:

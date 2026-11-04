@@ -201,6 +201,7 @@ def build_service(
         conn, cfg, clock, bodies, backends, controller.boot_id, notify=waiter.notify
     )
     registry = ClientRegistry(conn, cfg, clock)
+    registry.on_revoke = controller.wake
     registry.sync()
     cloud = CloudState(conn, cfg, clock, has_adapter=lambda p: p in controller.adapters)
     rt = Runtime(
@@ -212,9 +213,10 @@ def build_service(
                    safe_mode=opened.safe_mode)  # fmt: skip
 
 
-async def serve(svc: Service, *, host: str | None = None, port: int | None = None) -> None:
+async def serve(svc: Service, *, host: str | None = None, port: int | None = None) -> int:
     """uvicorn on `api.host:api.port` with the controller and worker loops in its lifespan.
-    SIGHUP re-reads the clients; SIGTERM/SIGINT stop uvicorn, then clients are closed."""
+    SIGHUP re-reads the clients; SIGTERM/SIGINT stop uvicorn, then clients are closed.
+    Returns the process exit code: 0 on a clean stop, 1 when a background loop died."""
     import uvicorn
 
     rt = svc.rt
@@ -224,6 +226,13 @@ async def serve(svc: Service, *, host: str | None = None, port: int | None = Non
         log_config=None, access_log=False, lifespan="on", timeout_graceful_shutdown=10,
     )  # fmt: skip
     server = uvicorn.Server(config)
+    fatal: list[str] = []
+
+    def on_fatal(name: str) -> None:
+        fatal.append(name)
+        server.should_exit = True
+
+    rt.on_fatal = on_fatal
     if rt.config_path is not None:
         install_sighup(asyncio.get_running_loop(), rt.registry, rt.config_path)
     if threading.current_thread() is threading.main_thread():
@@ -242,6 +251,7 @@ async def serve(svc: Service, *, host: str | None = None, port: int | None = Non
     finally:
         await svc.aclose()
         rt.conn.close()
+    return 1 if fatal else 0
 
 
 __all__ = [

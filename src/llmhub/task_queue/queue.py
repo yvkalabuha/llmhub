@@ -7,6 +7,7 @@ import contextlib
 import hashlib
 import sqlite3
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from typing import Literal
 
@@ -37,7 +38,8 @@ def _release_expired_keys(conn: sqlite3.Connection, now: float) -> None:
 
 def _find_explicit(conn: sqlite3.Connection, client_id: str, key: str) -> sqlite3.Row | None:
     row: sqlite3.Row | None = conn.execute(
-        "SELECT id, body_sha256, status FROM jobs WHERE client_id=? AND idem_key=?",
+        "SELECT id, body_sha256, status, error_code, fallback_reason FROM jobs"
+        " WHERE client_id=? AND idem_key=?",
         (client_id, key),
     ).fetchone()
     return row
@@ -65,13 +67,22 @@ def _recovery_meta(spec: JobSpec) -> dict[str, object]:
 
 
 def submit(
-    conn: sqlite3.Connection, bodies: BodyStore, spec: JobSpec, now: float, cfg: Config
+    conn: sqlite3.Connection,
+    bodies: BodyStore,
+    spec: JobSpec,
+    now: float,
+    cfg: Config,
+    *,
+    retry_failed: Callable[[sqlite3.Row], bool] | None = None,
 ) -> SubmitResult:
     """Idempotent submit.
 
     Explicit `idem_key`: same body -> the existing job, other body -> IdempotencyConflict
     (stored for `cfg.queue.idem_ttl_s`, 7 days). No key: implicit dedup by sha256(client+body)
     while the job is queued/running and for `implicit_dedup_window_s` after completion.
+    `retry_failed(row)` (id, status, error_code, fallback_reason) True for a failed job of the
+    same key: the key is released from that job and a new job is created (a retryable failure
+    must be retryable with the same key).
     """
     sha = hashlib.sha256(spec.client_id.encode() + b"\x00" + spec.body).hexdigest()
     job_id = uuid.uuid4().hex[:12]
@@ -88,6 +99,17 @@ def submit(
                 dup = _find_explicit(conn, spec.client_id, spec.idem_key)
                 if dup is not None and dup["body_sha256"] != sha:
                     raise IdempotencyConflict(dup["id"])
+                if (
+                    dup is not None
+                    and dup["status"] == "failed"
+                    and retry_failed is not None
+                    and retry_failed(dup)
+                ):
+                    conn.execute(
+                        "UPDATE jobs SET idem_key=NULL, idem_expires_at=NULL WHERE id=?",
+                        (dup["id"],),
+                    )
+                    dup = None
             else:
                 dup = _find_implicit(
                     conn, spec.client_id, sha, now, cfg.queue.implicit_dedup_window_s

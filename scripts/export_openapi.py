@@ -24,8 +24,18 @@ OUT = ROOT / "docs" / "openapi.yaml"
 ERR = {"$ref": "#/components/schemas/Error"}
 
 
+SHOULD_RETRY = {
+    "x-should-retry": {
+        "description": "true|false = error.retryable; stops openai-python's own retries "
+        "of non-retryable 409/5xx errors",
+        "schema": {"type": "string", "enum": ["true", "false"]},
+    }
+}
+
+
 def _err(desc: str) -> dict[str, Any]:
-    return {"description": desc, "content": {"application/json": {"schema": ERR}}}
+    return {"description": desc, "content": {"application/json": {"schema": ERR}},
+            "headers": SHOULD_RETRY}  # fmt: skip
 
 
 def _obj(props: dict[str, Any], required: list[str] | None = None, extra: bool = True) -> dict:
@@ -178,7 +188,7 @@ CHAT_ERRORS = {
     "413": _err("request_too_large"),
     "503": {**_err("queue_wait_exceeded (Retry-After, task_id; the task stays) | "
                    "cloud_unavailable (reason) | local_unavailable | controller_halted | "
-                   "busy"), "headers": RETRY_AFTER},
+                   "busy"), "headers": {**SHOULD_RETRY, **RETRY_AFTER}},
     "504": _err("deadline_exceeded | upstream_timeout"),
 }  # fmt: skip
 
@@ -228,7 +238,7 @@ ROUTES: dict[tuple[str, str], dict[str, Any]] = {
             "200": {**_json("ChatCompletion", "chat.completion"), "headers": RESP_HEADERS},
             "404": _err("not_found"),
             "409": {**_err("task_not_ready (retry_after_s) | cancelled"),
-                    "headers": RETRY_AFTER},
+                    "headers": {**SHOULD_RETRY, **RETRY_AFTER}},
             "503": _err("error of the failed task: cloud_unavailable, local_unavailable, "
                         "queue_wait_exceeded, ..."),
             "504": _err("deadline_exceeded | upstream_timeout"),

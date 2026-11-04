@@ -84,6 +84,9 @@ async def chat_completions(
             yield chunk
 
     headers = response_headers(first)
+    if first["fallback_reason"] and first["status"] not in ("failed", "cancelled"):
+        # headers go out before the job ends: the fallback decided at submit is already known
+        headers["X-LLMHub-Fallback"] = str(first["fallback_reason"])
     headers["Cache-Control"] = "no-cache"
     headers["X-Accel-Buffering"] = "no"
     return StreamingResponse(events(), media_type="text/event-stream", headers=headers)

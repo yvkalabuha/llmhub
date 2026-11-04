@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -63,6 +63,8 @@ class Runtime:
     config_path: Path | None = None
     lag: LoopLag = field(default_factory=LoopLag)
     http_counts: dict[tuple[str, int], int] = field(default_factory=dict)
+    # called when a supervised background loop dies; `serve` stops uvicorn and exits non-zero
+    on_fatal: Callable[[str], None] | None = None
     submitter: Submitter = field(init=False)
 
     def __post_init__(self) -> None:
@@ -104,6 +106,25 @@ class _Edge:
         self.rt.http_counts[key] = self.rt.http_counts.get(key, 0) + 1
 
 
+def _supervise(rt: Runtime, stop: asyncio.Event) -> Callable[[asyncio.Task[Any]], None]:
+    """Done-callback of a background loop: a loop that ends before shutdown (exception or
+    return) is fatal. The process must not live on without its controller or worker; the
+    exit code is non-zero so systemd restarts it."""
+
+    def done(task: asyncio.Task[Any]) -> None:
+        if stop.is_set() or task.cancelled():
+            return
+        exc = task.exception()
+        log.critical(
+            "background loop %s stopped: %s",
+            task.get_name(), type(exc).__name__ if exc is not None else "returned",
+        )  # fmt: skip
+        if rt.on_fatal is not None:
+            rt.on_fatal(task.get_name())
+
+    return done
+
+
 def create_app(rt: Runtime, *, run_loops: bool = True) -> FastAPI:
     from llmhub.api_gateway import (
         routes_admin,
@@ -119,11 +140,13 @@ def create_app(rt: Runtime, *, run_loops: bool = True) -> FastAPI:
         tasks: list[asyncio.Task[Any]] = []
         if run_loops:
             tasks = [
-                asyncio.create_task(rt.controller.run_forever(stop)),
-                asyncio.create_task(rt.worker.run_forever(stop)),
-                asyncio.create_task(rt.waiter.run(stop)),
+                asyncio.create_task(rt.controller.run_forever(stop), name="controller"),
+                asyncio.create_task(rt.worker.run_forever(stop), name="local_worker"),
+                asyncio.create_task(rt.waiter.run(stop), name="waiter"),
                 asyncio.create_task(rt.lag.run(stop)),
             ]
+            for t in tasks[:3]:
+                t.add_done_callback(_supervise(rt, stop))
         try:
             yield
         finally:

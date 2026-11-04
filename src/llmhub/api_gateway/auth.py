@@ -10,6 +10,7 @@ import logging
 import secrets
 import signal
 import sqlite3
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -18,10 +19,11 @@ from fastapi import Request
 
 from llmhub.api_gateway.errors import ApiError, ErrorCode
 from llmhub.clock import Clock
-from llmhub.configuration.api_models import Policy
+from llmhub.configuration.api_models import ClientConfig, Policy
 from llmhub.configuration.loader import ConfigError, load_config
 from llmhub.configuration.models import Config
-from llmhub.persistence.db import tx
+from llmhub.persistence.db import Busy, tx
+from llmhub.task_queue import queue
 from llmhub.task_queue.models import Priority
 
 log = logging.getLogger("llmhub.api.auth")
@@ -57,13 +59,29 @@ class ClientRegistry:
         self.cfg = cfg
         self.clock = clock
         self._by_hash: dict[str, Principal] = {}
+        self.on_revoke: Callable[[], None] | None = None  # e.g. Controller.wake
 
     def sync(self) -> None:
         """Config -> `clients` table (upsert, absent clients disabled) and the key index."""
+        self._apply(self.cfg.clients, revoked=())
+
+    def _apply(self, clients: Mapping[str, ClientConfig], revoked: Iterable[str]) -> None:
+        """Build the index, write the table and revoke cloud work in one transaction, then
+        swap the index. Busy/any error leaves the previous index and table untouched."""
         now = self.clock.now()
-        index: dict[str, Principal] = {}
+        index = {
+            c.key_sha256: Principal(
+                client_id=name,
+                allowed_models=frozenset(c.allowed_models),
+                max_priority=c.max_priority,
+                default_priority=c.default_priority,
+                default_policy=c.default_policy,
+                cloud_allowed=c.cloud_allowed,
+            )
+            for name, c in clients.items()
+        }
         with tx(self.conn):
-            for name, c in self.cfg.clients.items():
+            for name, c in clients.items():
                 self.conn.execute(
                     "INSERT INTO clients(id, name, key_hash, default_policy, default_priority,"
                     " max_priority, allowed_models_json, data_class, created_at, disabled_at)"
@@ -78,28 +96,56 @@ class ClientRegistry:
                      c.max_priority, json.dumps(sorted(c.allowed_models)),
                      "cloud_allowed" if c.cloud_allowed else "private", now),
                 )  # fmt: skip
-                index[c.key_sha256] = Principal(
-                    client_id=name,
-                    allowed_models=frozenset(c.allowed_models),
-                    max_priority=c.max_priority,
-                    default_priority=c.default_priority,
-                    default_policy=c.default_policy,
-                    cloud_allowed=c.cloud_allowed,
-                )
-            names = list(self.cfg.clients)
+            names = list(clients)
             marks = ",".join("?" for _ in names)
             self.conn.execute(
                 f"UPDATE clients SET disabled_at=? WHERE disabled_at IS NULL AND id NOT IN ({marks})",
                 (now, *names),
             )
+            for client_id in revoked:
+                self._revoke_cloud(client_id, now)
         self._by_hash = index
 
+    def _revoke_cloud(self, client_id: str, now: float) -> None:
+        """A client lost the cloud (removed or `cloud_allowed: false`, SEC-M3): its queued
+        cloud jobs are cancelled and its explicit/prewarm leases closed, so neither a queued
+        job nor a renewed lease keeps a GPU alive on its behalf."""
+        rows = self.conn.execute(
+            "SELECT id FROM jobs WHERE client_id=? AND pool IS NOT NULL"
+            " AND status IN ('submitted','queued')",
+            (client_id,),
+        ).fetchall()
+        for row in rows:
+            queue.cancel(self.conn, row["id"], now)
+        self.conn.execute(
+            "UPDATE leases SET closed_at=?, close_reason='revoked' WHERE client_id=?"
+            " AND kind IN ('explicit','prewarm') AND closed_at IS NULL",
+            (now, client_id),
+        )
+
     def reload(self, path: Path) -> int:
-        """Re-read the config file, validate it, replace the client set. A broken file keeps
-        the old set (ConfigError propagates, nothing changes)."""
+        """Re-read the config file, validate it, replace the client set and the admin key.
+        A broken file, a client hash equal to the running or the new admin hash, or a failed
+        database write keep the old set (nothing changes)."""
         new = load_config(Path(path))
+        running_admin = self.cfg.api.admin_key_sha256
+        new_admin = new.api.admin_key_sha256
+        admins = {h for h in (running_admin, new_admin) if h is not None}
+        for name, c in new.clients.items():
+            if c.key_sha256 in admins:
+                raise ConfigError(f"clients.{name}.key_sha256: equals an admin key hash")
+        revoked = [
+            name
+            for name in self.cfg.clients
+            if name not in new.clients or not new.clients[name].cloud_allowed
+        ]
+        self._apply(new.clients, revoked)
         self.cfg.clients = new.clients
-        self.sync()
+        if new_admin != running_admin:
+            self.cfg.api.admin_key_sha256 = new_admin
+            log.warning("admin key rotated by reload")
+        if revoked and self.on_revoke is not None:
+            self.on_revoke()
         return len(new.clients)
 
     def by_key(self, key: str) -> Principal | None:
@@ -121,7 +167,7 @@ def install_sighup(loop: asyncio.AbstractEventLoop, registry: ClientRegistry, pa
         try:
             n = registry.reload(path)
             log.info("clients reloaded: %d", n)
-        except (ConfigError, OSError) as exc:
+        except (ConfigError, OSError, Busy) as exc:  # the old client set stays in force
             log.error("clients reload rejected: %s", type(exc).__name__)
 
     loop.add_signal_handler(signal.SIGHUP, handler)

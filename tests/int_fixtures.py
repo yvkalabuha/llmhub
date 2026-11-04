@@ -18,7 +18,7 @@ import httpx
 
 from api_fixtures import ADMIN_KEY, GAME_KEY, api_config
 from fake_llama import FakeLlama
-from harness import TEST_SECRET
+from harness import TEST_SECRET, install_tracking_executor, threads_busy
 from llmhub.api_gateway.app import create_app
 from llmhub.clock import FakeClock
 from llmhub.configuration.models import Config
@@ -39,6 +39,10 @@ def _ready() -> int:
 async def settle() -> None:
     quiet = 0
     for _ in range(5000):
+        if threads_busy():  # real time: let `asyncio.to_thread` work finish
+            await asyncio.sleep(0.001)
+            quiet = 0
+            continue
         await asyncio.sleep(0)
         quiet = quiet + 1 if _ready() == 0 else 0
         if quiet >= 3:
@@ -64,6 +68,7 @@ class IntEnv:
 
     # --- process lifecycle ------------------------------------------------------------
     async def start(self) -> IntEnv:
+        install_tracking_executor()
         self.boots += 1
         self.provider = MockProvider(MockStore(self.tmp / "mock_cloud.db"), self.clock, self.knobs)
         self.inference = MockInference(self.provider, self.clock, self.iknobs)

@@ -1,7 +1,7 @@
 """Secret detector for chat requests (T-369 stream R, critic high).
 
-Scans EVERY string of a request (message content and content-parts, tool_calls arguments,
-tool results, tools, response_format, system) and returns the NAMES of the patterns that fired,
+Scans EVERY string of a request, dict keys included (message content and content-parts,
+tool_calls arguments, tool results, tools, response_format, system) and returns the NAMES of the patterns that fired,
 never the matched text. Rules for the patterns: no nested quantifiers, every repetition is
 bounded or anchored at a token boundary, so a hostile 1 MB string cannot stall the loop.
 Callers run it in `asyncio.to_thread` (heavy pure function).
@@ -44,11 +44,18 @@ PATTERNS: tuple[_Pattern, ...] = (
     _p("aws_access_key", _B + r"AKIA[0-9A-Z]{16}", ("AKIA",)),
     _p("sk_key", _B + r"sk-[A-Za-z0-9_-]{20,}", ("sk-",)),
     _p(
-        "github_token",
-        _B + r"(?:gh[po]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})",
-        ("ghp_", "gho_", "github_pat_"),
+        "stripe_key",
+        _B + r"(?:sk|rk)_(?:live|test)_[A-Za-z0-9]{16,}",
+        ("sk_live_", "sk_test_", "rk_live_", "rk_test_"),
     ),
-    _p("slack_token", _B + r"xox[abpr]-[A-Za-z0-9-]{10,}", ("xox",)),
+    _p(
+        "github_token",
+        _B + r"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})",
+        ("ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_"),
+    ),
+    _p("gitlab_token", _B + r"glpat-[A-Za-z0-9_-]{20,}", ("glpat-",)),
+    _p("npm_token", _B + r"npm_[A-Za-z0-9]{36}", ("npm_",)),
+    _p("slack_token", _B + r"xox[abpres]-[A-Za-z0-9-]{10,}", ("xox",)),
     _p("google_api_key", _B + r"AIza[0-9A-Za-z_-]{35}", ("AIza",)),
     _p("hf_token", _B + r"hf_[A-Za-z0-9]{30,}", ("hf_",)),
     _p("runpod_key", _B + r"rpa_[A-Za-z0-9]{16,}", ("rpa_",)),
@@ -69,6 +76,8 @@ def _walk(obj: Any) -> Iterator[str]:
         yield obj
     elif isinstance(obj, dict):
         for k, v in obj.items():
+            if isinstance(k, str) and not isinstance(v, str):
+                yield k  # a key is a string of the request too: {"sk-...": 1}
             if isinstance(v, str):
                 # a native dict {"api_key": "x"} must look like text "api_key: x" to the key-name rule
                 yield f"{k}: {v}"
