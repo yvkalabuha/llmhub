@@ -1,8 +1,11 @@
 """HTTP client of the llmhub API used by the MCP server (T-373 plan §3.7).
 
 Only `/v1/tasks*` and `/v1/models`. Error codes are plain strings (no import of
-`llmhub.api_gateway`). The key is read through a callable on every request and goes only into
-the `Authorization` header; errors and logs carry codes, never exception text or URLs.
+`llmhub.api_gateway`). A request may carry an absolute `deadline` (client clock): each attempt's
+HTTP timeout is clamped to it and a timeout caused by the clamp is `HubError("deadline")`
+(review C2-F4: one deadline per MCP call, HTTP time included). The key is read through a
+callable on every request and goes only into the `Authorization` header; errors and logs carry
+codes, never exception text or URLs.
 """
 
 from __future__ import annotations
@@ -113,6 +116,7 @@ class HubClient:
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._key = key
+        self._timeout_s = timeout_s
         self._sleep = sleep
         self._monotonic = monotonic
         self._http = httpx.AsyncClient(
@@ -143,13 +147,25 @@ class HubClient:
         headers: dict[str, str] | None = None,
         budget_s: float = DEFAULT_BUDGET_S,
         no_retry: frozenset[str] = frozenset(),
+        deadline: float | None = None,
     ) -> httpx.Response:
         start = self._monotonic()
         attempt = 0
         while True:
+            timeout = self._timeout_s
+            if deadline is not None:
+                remaining = deadline - self._monotonic()
+                if remaining <= 0:
+                    raise HubError("deadline", "call deadline reached", retryable=True)
+                timeout = min(timeout, remaining)
             all_headers = {**(headers or {}), **self._auth()}
             try:
-                resp = await self._http.request(method, path, json=json_body, headers=all_headers)
+                resp = await self._http.request(method, path, json=json_body, headers=all_headers,
+                                                timeout=timeout)  # fmt: skip
+            except httpx.TimeoutException as exc:
+                if timeout < self._timeout_s:
+                    raise HubError("deadline", "call deadline reached", retryable=True) from None
+                error = HubError("transport", type(exc).__name__, retryable=True)
             except httpx.TransportError as exc:
                 error = HubError("transport", type(exc).__name__, retryable=True)
             else:
@@ -158,6 +174,8 @@ class HubClient:
                 error = _parse_error(resp)
             pause = error.retry_after_s if error.retry_after_s is not None else 1.0
             left = budget_s - (self._monotonic() - start)
+            if deadline is not None:
+                left = min(left, deadline - self._monotonic())
             if (
                 not error.retryable
                 or error.code in no_retry
@@ -180,6 +198,7 @@ class HubClient:
         policy: str | None,
         deadline_s: float | None,
         budget_s: float = DEFAULT_BUDGET_S,
+        deadline: float | None = None,
     ) -> Submitted:
         headers = {"Idempotency-Key": idem_key, "X-LLMHub-Data-Class": data_class}
         if priority is not None:
@@ -189,7 +208,7 @@ class HubClient:
         if deadline_s is not None:
             headers["X-LLMHub-Deadline"] = f"{deadline_s:g}"
         resp = await self._request("POST", "/v1/tasks", json_body=body, headers=headers,
-                                   budget_s=budget_s)  # fmt: skip
+                                   budget_s=budget_s, deadline=deadline)  # fmt: skip
         data = _json_object(resp)
         task_id, status = data.get("id"), data.get("status")
         if not isinstance(task_id, str) or not isinstance(status, str):
@@ -200,14 +219,19 @@ class HubClient:
     def _task_path(task_id: str, suffix: str = "") -> str:
         return f"/v1/tasks/{quote(task_id, safe='')}{suffix}"
 
-    async def status(self, task_id: str, *, budget_s: float = DEFAULT_BUDGET_S) -> dict[str, Any]:
-        resp = await self._request("GET", self._task_path(task_id), budget_s=budget_s)
+    async def status(
+        self, task_id: str, *, budget_s: float = DEFAULT_BUDGET_S, deadline: float | None = None
+    ) -> dict[str, Any]:
+        resp = await self._request("GET", self._task_path(task_id), budget_s=budget_s,
+                                   deadline=deadline)  # fmt: skip
         return _json_object(resp)
 
-    async def result(self, task_id: str, *, budget_s: float = DEFAULT_BUDGET_S) -> TaskResult:
+    async def result(
+        self, task_id: str, *, budget_s: float = DEFAULT_BUDGET_S, deadline: float | None = None
+    ) -> TaskResult:
         resp = await self._request(
             "GET", self._task_path(task_id, "/result"), budget_s=budget_s,
-            no_retry=frozenset({"task_not_ready"}),
+            no_retry=frozenset({"task_not_ready"}), deadline=deadline,
         )  # fmt: skip
         warn = resp.headers.get("X-LLMHub-Warning", "")
         return TaskResult(
@@ -229,16 +253,31 @@ class HubClient:
             raise HubError("bad_response", "no_data")
         return [cast(dict[str, Any], m) for m in cast(list[Any], items) if isinstance(m, dict)]
 
-    async def wait(self, task_id: str, wait_s: float) -> dict[str, Any]:
+    async def wait(
+        self,
+        task_id: str,
+        wait_s: float,
+        *,
+        deadline: float | None = None,
+        initial: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Poll the status until it is terminal or `wait_s` is over; returns the last status
         (the caller checks `status in TERMINAL`). Pause = clamp(eta_s/4, 0.5, 5), 2 s without
-        an ETA."""
-        deadline = self._monotonic() + max(0.0, wait_s)
+        an ETA. `deadline` bounds every poll request; when it cuts a poll short, the last known
+        status (or `initial`) is returned, i.e. the call ends as pending."""
+        until = self._monotonic() + max(0.0, wait_s)
+        last = initial
         while True:
-            st = await self.status(task_id)
+            try:
+                st = await self.status(task_id, deadline=deadline)
+            except HubError as exc:
+                if exc.code == "deadline" and last is not None:
+                    return last
+                raise
+            last = st
             if st.get("status") in TERMINAL:
                 return st
-            left = deadline - self._monotonic()
+            left = until - self._monotonic()
             if left <= 0:
                 return st
             eta = _float(st.get("eta_s"))

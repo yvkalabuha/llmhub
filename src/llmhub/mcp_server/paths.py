@@ -14,6 +14,7 @@ import os
 import re
 import secrets
 import stat
+import time
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +22,9 @@ from pathlib import Path
 log = logging.getLogger("llmhub.mcp")
 
 _SAFE_NAME = re.compile(r"[^A-Za-z0-9_.-]")
+_TMP_NAME = re.compile(r"^\.llmhub-mcp-[0-9a-f]{16}\.tmp$")
+STALE_TMP_S = 3600.0  # another MCP process may be writing a younger temp file right now
+PSEUDO_FS = ("/proc", "/sys", "/dev")  # review SEC-3: /proc/self/environ holds LLMHUB_KEY
 
 
 class PathDenied(Exception):
@@ -44,6 +48,16 @@ def _under(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip(os.sep) + os.sep)
 
 
+def _pseudo(path: str) -> bool:
+    return any(_under(path, p) for p in PSEUDO_FS)
+
+
+def forbidden_root(path: Path) -> bool:
+    """`/` and roots on pseudo-filesystems are never allowed (they expose /proc/self/environ)."""
+    real = os.path.realpath(path)
+    return real == os.sep or _pseudo(real) or _pseudo(os.path.normpath(os.path.abspath(path)))
+
+
 @dataclass(frozen=True)
 class Roots:
     roots: tuple[Path, ...]  # realpath, scratch included
@@ -53,15 +67,26 @@ class Roots:
     @classmethod
     def build(cls, roots: Sequence[Path], scratch: Path) -> Roots:
         scratch_abs = Path(os.path.normpath(os.path.abspath(scratch)))
+        scratch_real = Path(os.path.realpath(scratch_abs))
         try:
-            _make_private_dir(scratch_abs)
+            _make_private_dir(scratch_real)
         except OSError:
-            log.warning("llmhub-mcp: scratch directory is not available")
-        given = [Path(os.path.normpath(os.path.abspath(r))) for r in roots] + [scratch_abs]
+            log.warning("llmhub-mcp: scratch directory is not available or not private")
+        else:
+            _remove_stale_tmp(scratch_real)
+        kept: list[Path] = []
+        for r in roots:
+            if forbidden_root(r):
+                log.warning("llmhub-mcp: skipping root '/' or a root on /proc, /sys, /dev")
+                continue
+            kept.append(r)
+        given = [Path(os.path.normpath(os.path.abspath(r))) for r in kept]
+        if not forbidden_root(scratch_abs):
+            given.append(scratch_abs)
         real = [Path(os.path.realpath(r)) for r in given]
         return cls(
             roots=tuple(dict.fromkeys(real)),
-            scratch=Path(os.path.realpath(scratch_abs)),
+            scratch=scratch_real,
             lexical=tuple(dict.fromkeys(given + real)),
         )
 
@@ -79,6 +104,8 @@ class Roots:
         if ".." in raw.split(os.sep):
             raise PathDenied("dot_component")
         norm = os.path.normpath(raw)
+        if _pseudo(norm):
+            raise PathDenied("outside_roots")
         root = self._best(norm, self.lexical)
         if root is None:
             raise PathDenied("outside_roots")
@@ -87,6 +114,8 @@ class Roots:
         return norm
 
     def _check_real(self, real: str) -> str:
+        if _pseudo(real):
+            raise PathDenied("outside_roots")
         root = self._best(real, self.roots)
         if root is None:
             raise PathDenied("outside_roots")
@@ -215,7 +244,31 @@ class Roots:
 
 
 def _make_private_dir(path: Path) -> None:
-    if path.is_dir():
-        return
+    """Create or adopt the scratch directory: a real directory (not a symlink) owned by us,
+    mode 0700 (review SEC-2); a foreign-owned one is refused."""
     path.mkdir(parents=True, mode=0o700, exist_ok=True)
-    os.chmod(path, 0o700)
+    st = os.lstat(path)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+        raise OSError(errno.EPERM, "scratch directory is not private")
+    if stat.S_IMODE(st.st_mode) & 0o077:
+        os.chmod(path, 0o700)
+
+
+def _remove_stale_tmp(path: Path) -> None:
+    """Temp files left by a killed process (`write_text` between open and unlink); only ours,
+    only older than STALE_TMP_S. Best effort."""
+    now = time.time()
+    try:
+        names = os.listdir(path)
+    except OSError:
+        return
+    for name in names:
+        if not _TMP_NAME.match(name):
+            continue
+        try:
+            st = os.lstat(path / name)
+            if stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid() \
+                    and now - st.st_mtime > STALE_TMP_S:  # fmt: skip
+                os.unlink(path / name)
+        except OSError:
+            continue

@@ -47,8 +47,8 @@ llmhub_result(task_id, wait_s=...) later; the task keeps running.
 FILES: input_files / output_file / schema-as-path are absolute paths inside the allowed roots; \
 large answers are written to a scratch file (`output_file`, `truncated_inline=true`, `text` is \
 the beginning). data_class defaults to private (local only).
-Keep wait_s below the MCP tool timeout of the client (MCP_TOOL_TIMEOUT); for long tasks use \
-wait_s=0..30 and llmhub_result.
+A call lasts at most max(wait_s, 5) + ~20 s; keep that below the MCP tool timeout of the \
+client (MCP_TOOL_TIMEOUT); for long tasks use wait_s=0..30 and llmhub_result.
 """
 
 

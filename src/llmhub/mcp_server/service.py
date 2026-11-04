@@ -25,6 +25,10 @@ from llmhub.mcp_server.settings import McpSettings
 log = logging.getLogger("llmhub.mcp")
 
 MIN_SUBMIT_BUDGET_S = 5.0
+POLL_GRACE_S = 5.0  # a poll may still be in flight this long after wait_s
+RESULT_BUDGET_S = 10.0  # GET /result after a terminal status (retries included)
+# One call lasts at most max(wait_s, MIN_SUBMIT_BUDGET_S) + POLL_GRACE_S + RESULT_BUDGET_S
+# + check_timeout_s (= max(wait_s, 5) + 20 s with the defaults; review C2-F4, docs §8).
 
 HINT_OK = "Review the result before using it; if it is not acceptable, do the subtask yourself."
 HINT_PENDING = (
@@ -37,6 +41,10 @@ HINT_CHECK_FAILED = (
 )
 HINT_RETRYABLE = "Temporary error: the same call may be repeated after retry_after_s."
 HINT_FATAL = "Do the subtask yourself."
+HINT_OUTPUT_NOT_WRITTEN = (
+    "The answer passed the checks but output_file could not be written (e.g. it appeared "
+    "meanwhile); the answer is in the scratch file `output_file`. Review it before use."
+)
 
 
 class Invalid(Exception):
@@ -79,6 +87,10 @@ def _error(code: str, reason: str | None = None, *, retryable: bool = False,
 
 def _preview(text: str, limit: int) -> str:
     return text.encode("utf-8")[:limit].decode("utf-8", errors="ignore")
+
+
+def _str_or_none(value: object) -> str | None:
+    return value if isinstance(value, str) else None
 
 
 def _as_int(value: object) -> int | None:
@@ -143,6 +155,14 @@ class McpService:
         try:
             self._need_url()
             items = await self.client.models()
+            models: list[dict[str, Any]] = []
+            for m in items:
+                raw = m.get("llmhub")
+                meta = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
+                models.append({
+                    "id": _str_or_none(m.get("id")), "local": meta.get("local"),
+                    "cloud": meta.get("cloud"), "ctx_tokens": meta.get("ctx_tokens"),
+                })  # fmt: skip
         except Invalid as exc:
             out["error"] = ErrorInfo(code=exc.code, reason=exc.reason).model_dump()
             return out
@@ -150,12 +170,11 @@ class McpService:
             out["error"] = ErrorInfo(code=exc.code, reason=exc.reason, retryable=exc.retryable,
                                      retry_after_s=exc.retry_after_s).model_dump()  # fmt: skip
             return out
-        for m in items:
-            meta = cast(dict[str, Any], m.get("llmhub") or {})
-            out["models"].append({
-                "id": m.get("id"), "local": meta.get("local"), "cloud": meta.get("cloud"),
-                "ctx_tokens": meta.get("ctx_tokens"),
-            })  # fmt: skip
+        except Exception as exc:  # noqa: BLE001 - review C2-F6: never raise to the MCP layer
+            log.error("llmhub-mcp: internal error %s", type(exc).__name__)
+            out["error"] = ErrorInfo(code="internal_error").model_dump()
+            return out
+        out["models"] = models
         return out
 
     # --- helpers ------------------------------------------------------------------------
@@ -178,7 +197,7 @@ class McpService:
         text = self.roots.read_text(path, self.settings.max_input_bytes)
         try:
             data = json.loads(text)
-        except ValueError:
+        except (ValueError, RecursionError):
             raise Invalid("invalid_request", "schema file is not JSON") from None
         if not isinstance(data, dict):
             raise Invalid("invalid_request", "schema must be a JSON object")
@@ -239,16 +258,39 @@ class McpService:
         )  # fmt: skip
         clock = self.client.monotonic
         start = clock()
+        submit_budget = max(wait_s, MIN_SUBMIT_BUDGET_S)
         sub = await self.client.submit(
             body, idem_key=key, data_class=p.data_class, priority=p.priority, policy=p.policy,
-            deadline_s=p.deadline_s, budget_s=max(wait_s, MIN_SUBMIT_BUDGET_S),
+            deadline_s=p.deadline_s, budget_s=submit_budget, deadline=start + submit_budget,
         )  # fmt: skip
+        # From here on the task exists (and may be paid for): every outcome keeps its id.
+        return await self._after_submit(
+            sub.id, start + wait_s, checks, out_path, p.overwrite, {"status": sub.status}
+        )
+
+    async def _after_submit(
+        self,
+        task_id: str,
+        until: float,
+        checks: list[Check],
+        out_path: Path | None,
+        overwrite: bool,
+        initial: dict[str, Any] | None,
+    ) -> AskResult:
+        clock = self.client.monotonic
         try:
-            st = await self.client.wait(sub.id, max(0.0, wait_s - (clock() - start)))
-            return await self._finish(sub.id, st, checks, out_path, p.overwrite)
-        except HubError as exc:  # the task exists: keep its id for llmhub_result
-            exc.task_id = exc.task_id or sub.id
+            poll_deadline = max(until, clock()) + POLL_GRACE_S
+            st = await self.client.wait(task_id, max(0.0, until - clock()),
+                                        deadline=poll_deadline, initial=initial)  # fmt: skip
+            return await self._finish(task_id, st, checks, out_path, overwrite)
+        except HubError as exc:
+            exc.task_id = exc.task_id or task_id
             raise
+        except PathDenied as exc:
+            return _error(exc.code, task_id=task_id)
+        except Exception as exc:  # noqa: BLE001 - review C2-F1: the id must survive any error
+            log.error("llmhub-mcp: internal error %s, task %s", type(exc).__name__, task_id)
+            return _error("internal_error", task_id=task_id)
 
     async def _result(
         self,
@@ -267,19 +309,25 @@ class McpService:
         out_path = (
             self.roots.resolve_output(output_file, overwrite=overwrite) if output_file else None
         )
-        try:
-            st = await self.client.wait(task_id, self._wait_s(wait_s))
-            return await self._finish(task_id, st, checks, out_path, overwrite)
-        except HubError as exc:
-            exc.task_id = exc.task_id or task_id
-            raise
+        until = self.client.monotonic() + self._wait_s(wait_s)
+        return await self._after_submit(task_id, until, checks, out_path, overwrite, None)
 
     async def _cancel(self, task_id: str) -> AskResult:
         self._need_url()
         r = await self.client.cancel(task_id)
-        status = r.get("status") if isinstance(r.get("status"), str) else None
-        return AskResult(verdict="ok", task_id=task_id, status=status,
-                         hint="Cancellation requested; check with llmhub_result.")  # fmt: skip
+        status = _str_or_none(r.get("status"))
+        if status == "cancelled":
+            return AskResult(verdict="ok", task_id=task_id, status=status, hint="Cancelled.")
+        if status in TERMINAL:  # review C2-F5: say plainly that nothing was cancelled
+            return AskResult(
+                verdict="ok", task_id=task_id, status=status, warnings=["already_finished"],
+                hint="The task had already finished; nothing was cancelled. Use llmhub_result.",
+            )  # fmt: skip
+        return AskResult(
+            verdict="ok", task_id=task_id, status=status, warnings=["cancel_pending"],
+            hint="Cancellation requested but the task is still running (a running cloud task "
+            "stops at a safe point and is still paid for); check with llmhub_result.",
+        )  # fmt: skip
 
     # --- finishing ----------------------------------------------------------------------
     async def _finish(
@@ -308,7 +356,9 @@ class McpService:
                 retry_after_s=float(after) if isinstance(after, int | float) else None,
                 task_id=task_id, status=status,
             )  # fmt: skip
-        res = await self.client.result(task_id)
+        clock = self.client.monotonic
+        res = await self.client.result(task_id, budget_s=RESULT_BUDGET_S,
+                                       deadline=clock() + RESULT_BUDGET_S)  # fmt: skip
         choices = res.body.get("choices")
         choice = cast(dict[str, Any], choices[0]) if isinstance(choices, list) and choices else {}
         message = cast(dict[str, Any], choice.get("message") or {})
@@ -329,7 +379,8 @@ class McpService:
             out = _error("upstream_rejected", "the model server rejected the request",
                          task_id=task_id, status=status)  # fmt: skip
             return out.model_copy(update={k: v for k, v in common.items() if k != "status"})
-        results = await run_checks_async(text, finish, checks)
+        results = await run_checks_async(text, finish, checks,
+                                         timeout_s=self.settings.check_timeout_s)  # fmt: skip
         outs = [CheckOut(name=r.name, ok=r.ok, reason=r.reason) for r in results]
         size = len(text.encode("utf-8"))
         log.info("llmhub-mcp: task %s done, %d bytes", task_id, size)
@@ -343,7 +394,19 @@ class McpService:
                 **common,
             )  # fmt: skip
         if out_path is not None:
-            self.roots.write_text(out_path, text, overwrite=overwrite)
+            try:
+                self.roots.write_text(out_path, text, overwrite=overwrite)
+            except PathDenied as exc:  # review C2-F1: keep the paid answer reachable
+                spill = self.roots.scratch_file(f"{task_id}.txt")
+                self.roots.write_text(spill, text, overwrite=True)
+                out = _error(exc.code, "output_file was not written", task_id=task_id,
+                             status=status)  # fmt: skip
+                return out.model_copy(update={
+                    **common, "checks": outs, "output_file": str(spill),
+                    "text": _preview(text, self.settings.preview_bytes),
+                    "truncated_inline": size > self.settings.preview_bytes,
+                    "hint": HINT_OUTPUT_NOT_WRITTEN,
+                })  # fmt: skip
             return AskResult(
                 verdict="ok", checks=outs, output_file=str(out_path),
                 text=_preview(text, self.settings.preview_bytes),

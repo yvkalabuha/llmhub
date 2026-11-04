@@ -69,6 +69,7 @@ class McpSettings:
     default_wait_s: float = 90.0
     max_wait_s: float = 300.0
     http_timeout_s: float = 30.0
+    check_timeout_s: float = 5.0
     default_model: str = "auto"
 
     @classmethod
@@ -90,5 +91,6 @@ class McpSettings:
             default_wait_s=_float(env, "LLMHUB_MCP_DEFAULT_WAIT_S", 90.0, allow_zero=True),
             max_wait_s=_float(env, "LLMHUB_MCP_MAX_WAIT_S", 300.0, allow_zero=True),
             http_timeout_s=_float(env, "LLMHUB_MCP_HTTP_TIMEOUT_S", 30.0),
+            check_timeout_s=_float(env, "LLMHUB_MCP_CHECK_TIMEOUT_S", 5.0),
             default_model=(env.get("LLMHUB_MCP_MODEL") or "").strip() or "auto",
         )

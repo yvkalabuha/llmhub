@@ -1,26 +1,30 @@
 """Result checks run by the MCP server (T-373 plan §3.4).
 
-Syntax follows the `extllm_checks` pilot of the agents workspace (code is not shared). Reasons carry numbers and names
-only, never fragments of the checked text.
+Syntax follows the `extllm_checks` pilot of the agents workspace (code is not shared). Reasons
+carry numbers, names and length-capped schema paths only. Regex-bearing checks (`regex`,
+`no-regex`, `json-schema` with `pattern`/`patternProperties`) run in a killable child process
+(`sandbox.py`, review SEC-1); the rest run inline (linear in the text size).
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import re
 import unicodedata
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
+from urllib.parse import unquote
 
 import jsonschema
 from jsonschema import Draft202012Validator
-from jsonschema.exceptions import best_match
+
+from llmhub.mcp_server.sandbox import load_json, regex_outcome, run_isolated, schema_outcome
 
 MAX_PATTERN = 300
+DEFAULT_TIMEOUT_S = 5.0
 SCRIPTS = ("latin", "cyrillic", "han")
-_FENCE = re.compile(r"^\s*```[A-Za-z0-9_-]*\s*\n(.*?)\n?```\s*$", re.DOTALL)
+_REGEX_KEYS = frozenset({"pattern", "patternProperties"})
 
 
 @dataclass(frozen=True)
@@ -38,21 +42,10 @@ class CheckSpecError(ValueError):
 class Check:
     name: str
     fn: Callable[[str, str | None], CheckResult]
+    isolated: dict[str, Any] | None = None  # JSON spec for the sandbox process (regex-bearing)
 
     def __call__(self, text: str, finish_reason: str | None) -> CheckResult:
         return self.fn(text, finish_reason)
-
-
-def _unfence(text: str) -> str:
-    m = _FENCE.match(text)
-    return m.group(1) if m else text
-
-
-def _load_json(text: str) -> tuple[bool, Any]:
-    try:
-        return True, json.loads(_unfence(text))
-    except ValueError:
-        return False, None
 
 
 def _nonneg_int(arg: str, name: str) -> int:
@@ -78,24 +71,70 @@ def _not_truncated() -> Check:
     return Check("not-truncated", run)
 
 
+def _walk(schema: dict[str, Any]) -> list[dict[str, Any]]:
+    """All mappings of the schema tree, iteratively (no RecursionError on deep schemas)."""
+    out: list[dict[str, Any]] = []
+    stack: list[Any] = [schema]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            d = cast(dict[str, Any], node)
+            out.append(d)
+            stack.extend(d.values())
+        elif isinstance(node, list):
+            stack.extend(cast(list[Any], node))
+    return out
+
+
+def _pointer(schema: dict[str, Any], fragment: str) -> bool:
+    node: Any = schema
+    for raw in fragment.split("/")[1:]:
+        part = unquote(raw).replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict) and part in node:
+            node = cast(dict[str, Any], node)[part]
+        elif isinstance(node, list) and part.isdigit() and int(part) < len(cast(list[Any], node)):
+            node = cast(list[Any], node)[int(part)]
+        else:
+            return False
+    return isinstance(node, dict | bool)
+
+
+def _check_refs(schema: dict[str, Any], nodes: list[dict[str, Any]]) -> None:
+    """Only local references that resolve inside this schema (review C2-F2): an unresolvable
+    `$ref` would otherwise surface only after the LLM answered."""
+    anchors = {n.get(k) for n in nodes for k in ("$anchor", "$dynamicAnchor")}
+    if any("$id" in n for n in nodes if n is not schema):
+        raise CheckSpecError("json-schema: nested $id is not supported")
+    for n in nodes:
+        for key in ("$ref", "$dynamicRef"):
+            ref = n.get(key)
+            if not isinstance(ref, str):
+                continue
+            if not ref.startswith("#"):
+                raise CheckSpecError("json-schema: only local references (#...) are allowed")
+            frag = ref[1:]
+            ok = _pointer(schema, frag) if frag == "" or frag.startswith("/") else frag in anchors
+            if not ok:
+                raise CheckSpecError("json-schema: a reference does not resolve")
+
+
 def _json_schema(schema: dict[str, Any]) -> Check:
     try:
         Draft202012Validator.check_schema(schema)
+        nodes = _walk(schema)
     except jsonschema.SchemaError:
         raise CheckSpecError("json-schema: the schema is not a valid JSON Schema") from None
-    validator = Draft202012Validator(schema)
+    except RecursionError:
+        raise CheckSpecError("json-schema: the schema is nested too deeply") from None
+    _check_refs(schema, nodes)
+    regex_bearing = any(_REGEX_KEYS & n.keys() for n in nodes)
 
     def run(text: str, _f: str | None) -> CheckResult:
-        ok, data = _load_json(text)
-        if not ok:
-            return CheckResult("json-schema", False, "not_json")
-        err = best_match(validator.iter_errors(data))
-        if err is None:
-            return CheckResult("json-schema", True)
-        path = "/" + "/".join(str(p) for p in err.absolute_path)
-        return CheckResult("json-schema", False, f"{path}: {err.validator}")
+        ok, reason = schema_outcome(schema, text)
+        return CheckResult("json-schema", ok, reason)
 
-    return Check("json-schema", run)
+    spec = {"op": "json-schema", "schema": schema} if regex_bearing else None
+    return Check("json-schema", run, spec)
 
 
 def _sections(headings: list[str]) -> Check:
@@ -113,7 +152,7 @@ def _sections(headings: list[str]) -> Check:
 
 
 def _count_items(text: str) -> int:
-    ok, data = _load_json(text)
+    ok, data = load_json(text)
     if ok and isinstance(data, list):
         return len(data)  # pyright: ignore[reportUnknownArgumentType]
     if ok and isinstance(data, dict):
@@ -160,17 +199,15 @@ def _regex(pattern: str, *, negate: bool) -> Check:
     if len(pattern) > MAX_PATTERN:
         raise CheckSpecError(f"{name}: pattern longer than {MAX_PATTERN} characters")
     try:
-        rx = re.compile(pattern, re.MULTILINE)
-    except re.error:
+        re.compile(pattern, re.MULTILINE)
+    except (re.error, RecursionError, OverflowError):
         raise CheckSpecError(f"{name}: pattern does not compile") from None
 
     def run(text: str, _f: str | None) -> CheckResult:
-        found = rx.search(text) is not None
-        if negate:
-            return CheckResult(name, not found, "found" if found else "")
-        return CheckResult(name, found, "" if found else "not found")
+        ok, reason = regex_outcome(pattern, negate, text)
+        return CheckResult(name, ok, reason)
 
-    return Check(name, run)
+    return Check(name, run, {"op": "regex", "pattern": pattern, "negate": negate})
 
 
 # --- parsing -------------------------------------------------------------------------------
@@ -225,18 +262,35 @@ def build_checks(
 
 
 def run_checks(text: str, finish_reason: str | None, checks: Sequence[Check]) -> list[CheckResult]:
+    """In-process, no time limit: for trusted text only (tests, kinds validation)."""
     return [c(text, finish_reason) for c in checks]
 
 
 async def run_checks_async(
-    text: str, finish_reason: str | None, checks: Sequence[Check], *, timeout_s: float = 5.0
+    text: str,
+    finish_reason: str | None,
+    checks: Sequence[Check],
+    *,
+    timeout_s: float = DEFAULT_TIMEOUT_S,
 ) -> list[CheckResult]:
-    """Each check in a worker thread with a timeout (ReDoS guard, plan R5). A timed-out thread
-    keeps running in the background; acceptable for a per-agent stdio process."""
+    """`timeout_s` is one budget for all checks of the call (review C2-F4). Regex-bearing checks
+    run in a child process that is killed when the budget is over (SEC-1), so the event loop
+    stays free; the others (pure Python, linear) run in a worker thread. A check past the budget fails with reason `timeout`."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout_s
     out: list[CheckResult] = []
     for c in checks:
-        try:
-            out.append(await asyncio.wait_for(asyncio.to_thread(c, text, finish_reason), timeout_s))
-        except TimeoutError:
+        left = deadline - loop.time()
+        if left <= 0:
             out.append(CheckResult(c.name, False, "timeout"))
+            continue
+        if c.isolated is None:
+            try:
+                out.append(await asyncio.wait_for(asyncio.to_thread(c, text, finish_reason), left))
+            except TimeoutError:
+                out.append(CheckResult(c.name, False, "timeout"))
+            continue
+        res = await run_isolated(c.isolated, text, left)
+        out.append(CheckResult(c.name, False, "timeout") if res is None
+                   else CheckResult(c.name, res[0], res[1]))  # fmt: skip
     return out

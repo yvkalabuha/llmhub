@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import os
 from importlib import resources
 from pathlib import Path
 
 import pytest
 
+from llmhub.mcp_server import kinds as kinds_mod
 from llmhub.mcp_server.kinds import BUILTIN, Kind, KindsError, load_kinds
 
 NAMES = {"extract_json", "classify", "summarize", "translate", "review", "general"}
@@ -35,6 +37,7 @@ def test_user_file_adds_and_overrides(tmp_path: Path) -> None:
         "commits:\n  description: d\n  system: s\n  max_tokens: 10\n"
         "  checks: ['max-bytes:100']\n  task_type: summarize\n"
     )
+    f.chmod(0o644)
     kinds = load_kinds(f)
     assert kinds["classify"].max_tokens == 50 and kinds["classify"].think is False
     assert kinds["classify"].system == load_kinds(None)["classify"].system
@@ -58,7 +61,34 @@ def test_user_file_adds_and_overrides(tmp_path: Path) -> None:
 def test_user_file_errors(tmp_path: Path, text: str) -> None:
     f = tmp_path / "kinds.yaml"
     f.write_text(text)
+    f.chmod(0o644)
     with pytest.raises(KindsError):
+        load_kinds(f)
+
+
+@pytest.mark.parametrize("mode", [0o664, 0o646, 0o666])
+def test_user_file_writable_by_others_refused(tmp_path: Path, mode: int) -> None:
+    f = tmp_path / "kinds.yaml"
+    f.write_text("classify:\n  max_tokens: 50\n")
+    f.chmod(mode)
+    with pytest.raises(KindsError, match="owned by the current user"):
+        load_kinds(f)
+
+
+def test_user_file_foreign_owner_refused(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    f = tmp_path / "kinds.yaml"
+    f.write_text("classify:\n  max_tokens: 50\n")
+    f.chmod(0o644)
+    real = os.getuid()
+    monkeypatch.setattr(kinds_mod.os, "getuid", lambda: real + 1)
+    with pytest.raises(KindsError, match="owned by the current user"):
+        load_kinds(f)
+
+
+def test_user_file_not_regular_refused(tmp_path: Path) -> None:
+    f = tmp_path / "kinds.fifo"
+    os.mkfifo(f, 0o600)
+    with pytest.raises(KindsError, match="regular"):
         load_kinds(f)
 
 

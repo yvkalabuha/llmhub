@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 from dataclasses import dataclass, replace
 from importlib import resources
 from pathlib import Path
@@ -108,8 +110,31 @@ def load_kinds(user_file: Path | None) -> dict[str, Kind]:
     kinds = _merge({}, text, BUILTIN)
     if user_file is None:
         return kinds
+    return _merge(kinds, _read_user_file(user_file), "LLMHUB_MCP_KINDS")
+
+
+def _read_user_file(path: Path) -> str:
+    """The file sets system prompts and tool descriptions: only a regular file owned by the
+    current user and not writable by group/others (review, low; same idea as the key file)."""
     try:
-        user_text = user_file.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+    except OSError:
         raise KindsError("LLMHUB_MCP_KINDS: file is not readable") from None
-    return _merge(kinds, user_text, "LLMHUB_MCP_KINDS")
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise KindsError("LLMHUB_MCP_KINDS: not a regular file")
+        if st.st_uid != os.getuid() or st.st_mode & 0o022:
+            raise KindsError(
+                "LLMHUB_MCP_KINDS: must be owned by the current user and not group/other-writable"
+            )
+        with os.fdopen(fd, "rb", closefd=False) as fh:
+            raw = fh.read(1 << 20)
+    except OSError:
+        raise KindsError("LLMHUB_MCP_KINDS: file is not readable") from None
+    finally:
+        os.close(fd)
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        raise KindsError("LLMHUB_MCP_KINDS: file is not readable") from None
