@@ -3,9 +3,11 @@ dedup, requeue, cancel, fallback_local and purge_expired."""
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import sqlite3
 import uuid
+from pathlib import Path
 from typing import Literal
 
 from llmhub.cloud_manager.inference import JobRunResult
@@ -14,31 +16,94 @@ from llmhub.lifecycle_manager import leases
 from llmhub.persistence.db import tx
 from llmhub.provider_adapters.base import UnavailableReason
 from llmhub.task_queue.bodies import BodyStore
-from llmhub.task_queue.models import JobSpec, JobStatus, SubmitResult
+from llmhub.task_queue.models import IdempotencyConflict, JobSpec, JobStatus, SubmitResult
+
+
+def _join_or_open(conn: sqlite3.Connection) -> contextlib.AbstractContextManager[object]:
+    """Join an open transaction or open a short one (same convention as the state machine)."""
+    return contextlib.nullcontext() if conn.in_transaction else tx(conn)
+
+
+def _release_expired_keys(conn: sqlite3.Connection, now: float) -> None:
+    conn.execute(
+        "UPDATE jobs SET idem_key=NULL, idem_expires_at=NULL"
+        " WHERE idem_key IS NOT NULL AND idem_expires_at IS NOT NULL AND idem_expires_at<=?",
+        (now,),
+    )
+
+
+def _find_explicit(conn: sqlite3.Connection, client_id: str, key: str) -> sqlite3.Row | None:
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT id, body_sha256, status FROM jobs WHERE client_id=? AND idem_key=?",
+        (client_id, key),
+    ).fetchone()
+    return row
+
+
+def _find_implicit(
+    conn: sqlite3.Connection, client_id: str, sha: str, now: float, window_s: float
+) -> sqlite3.Row | None:
+    """Same client + body: still in flight, or finished within the dedup window."""
+    row: sqlite3.Row | None = conn.execute(
+        "SELECT id, status FROM jobs WHERE client_id=? AND body_sha256=? AND ("
+        " status IN ('submitted','queued','running')"
+        " OR (status='completed' AND finished_at IS NOT NULL AND finished_at>=?))"
+        " ORDER BY created_at DESC LIMIT 1",
+        (client_id, sha, now - window_s),
+    ).fetchone()
+    return row
 
 
 def submit(
     conn: sqlite3.Connection, bodies: BodyStore, spec: JobSpec, now: float, cfg: Config
 ) -> SubmitResult:
-    """S0: plain insert + implicit lease. No idempotency / dedup yet (stream D)."""
+    """Idempotent submit.
+
+    Explicit `idem_key`: same body -> the existing job, other body -> IdempotencyConflict
+    (stored for `cfg.queue.idem_ttl_s`, 7 days). No key: implicit dedup by sha256(client+body)
+    while the job is queued/running and for `implicit_dedup_window_s` after completion.
+    """
+    sha = hashlib.sha256(spec.client_id.encode() + b"\x00" + spec.body).hexdigest()
     job_id = uuid.uuid4().hex[:12]
+    # The body file is written before the transaction; removed again on a duplicate.
     path = bodies.write_request(job_id, spec.body, {"client_id": spec.client_id})
     out = spec.max_tokens or cfg.task_type_max_tokens.get(
         spec.task_type or "default", cfg.task_type_max_tokens["default"]
     )
-    with tx(conn):
-        conn.execute(
-            "INSERT INTO jobs(id, client_id, idem_key, body_sha256, created_at, priority,"
-            " prio_rank, task_type, model_alias, policy, data_class, pool, deadline_at,"
-            " max_queue_wait_s, timeout_s, status, route, route_reason, est_tokens_in,"
-            " est_tokens_out, req_path) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (job_id, spec.client_id, spec.idem_key, hashlib.sha256(spec.body).hexdigest(), now,
-             spec.priority, spec.priority.rank, spec.task_type, spec.model_alias, spec.policy,
-             spec.data_class, spec.pool, spec.deadline_at, spec.max_queue_wait_s, spec.timeout_s,
-             JobStatus.QUEUED, spec.route, spec.route_reason, spec.est_tokens_in, out, str(path)),
-        )  # fmt: skip
-        if spec.pool is not None:
-            leases.create_implicit(conn, job_id, spec.pool, spec.client_id, now)
+    try:
+        with tx(conn):
+            _release_expired_keys(conn, now)
+            dup: sqlite3.Row | None = None
+            if spec.idem_key is not None:
+                dup = _find_explicit(conn, spec.client_id, spec.idem_key)
+                if dup is not None and dup["body_sha256"] != sha:
+                    raise IdempotencyConflict(dup["id"])
+            else:
+                dup = _find_implicit(
+                    conn, spec.client_id, sha, now, cfg.queue.implicit_dedup_window_s
+                )
+            if dup is not None:
+                bodies.discard(job_id)
+                return SubmitResult(dup["id"], False, JobStatus(dup["status"]))
+            conn.execute(
+                "INSERT INTO jobs(id, client_id, idem_key, idem_expires_at, body_sha256,"
+                " created_at, priority, prio_rank, task_type, model_alias, policy, data_class,"
+                " pool, deadline_at, max_queue_wait_s, timeout_s, status, route, route_reason,"
+                " est_tokens_in, est_tokens_out, req_path, max_attempts)"
+                " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (job_id, spec.client_id, spec.idem_key,
+                 now + cfg.queue.idem_ttl_s if spec.idem_key is not None else None, sha, now,
+                 spec.priority, spec.priority.rank, spec.task_type, spec.model_alias,
+                 spec.policy, spec.data_class, spec.pool, spec.deadline_at,
+                 spec.max_queue_wait_s, spec.timeout_s, JobStatus.QUEUED, spec.route,
+                 spec.route_reason, spec.est_tokens_in, out, str(path),
+                 cfg.retry.job_max_attempts),
+            )  # fmt: skip
+            if spec.pool is not None:
+                leases.create_implicit(conn, job_id, spec.pool, spec.client_id, now)
+    except BaseException:
+        bodies.discard(job_id)
+        raise
     return SubmitResult(job_id=job_id, created=True, status=JobStatus.QUEUED)
 
 
@@ -101,27 +166,123 @@ def complete(
     leases.close_for_job(conn, job_id, now)
 
 
+def _close_lease(conn: sqlite3.Connection, job_id: str, now: float, reason: str) -> None:
+    conn.execute(
+        "UPDATE leases SET closed_at=?, close_reason=?"
+        " WHERE job_id=? AND kind='implicit' AND closed_at IS NULL",
+        (now, reason, job_id),
+    )
+
+
+_CLEAR_RUN = "instance_id=NULL, worker_id=NULL, worker_heartbeat_at=NULL"
+
+
 def requeue(
-    conn: sqlite3.Connection, job_id: str, now: float, *, count_attempt: bool, reason: str
+    conn: sqlite3.Connection,
+    job_id: str,
+    now: float,
+    *,
+    count_attempt: bool,
+    reason: str,
+    close_lease: bool = False,
 ) -> Literal["queued", "fallback", "failed"]:
-    raise NotImplementedError("stream D")
+    """Put a running/queued job back into the queue.
+
+    `mark_running` already did attempts+1. `count_attempt=False` refunds it (a controller
+    restart is not an attempt). With the attempts exhausted the job goes to local fallback.
+    "failed" is returned (and nothing changed) when the job is already terminal.
+    `close_lease=True` closes the implicit lease so a rejected job does not pin the GPU.
+    """
+    with _join_or_open(conn):
+        row = conn.execute(
+            "SELECT status, attempts, max_attempts, cancel_requested FROM jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        if row is None or row["status"] not in ("running", "queued"):
+            return "failed"
+        if row["cancel_requested"]:
+            _finish_cancel(conn, job_id, now)
+            return "failed"
+        attempts = row["attempts"] if count_attempt else max(row["attempts"] - 1, 0)
+        if attempts >= row["max_attempts"]:
+            fallback_local(conn, job_id, f"attempts_exhausted:{reason}", now)
+            return "fallback"
+        conn.execute(
+            f"UPDATE jobs SET status='queued', attempts=?, {_CLEAR_RUN}, error_code=? WHERE id=?",
+            (attempts, reason, job_id),
+        )
+        if close_lease:
+            _close_lease(conn, job_id, now, reason)
+        return "queued"
 
 
 def fallback_local(
     conn: sqlite3.Connection, job_id: str, reason: UnavailableReason | str, now: float
 ) -> None:
-    raise NotImplementedError("stream D")
+    """Send the job to the local queue (route 'local:fallback'); closes its implicit lease."""
+    with _join_or_open(conn):
+        conn.execute(
+            f"UPDATE jobs SET route='local:fallback', pool=NULL, status='queued',"
+            f" fallback_reason=?, {_CLEAR_RUN} WHERE id=? AND status IN ('queued','running')",
+            (str(reason), job_id),
+        )
+        _close_lease(conn, job_id, now, "fallback_local")
+
+
+def _finish_cancel(conn: sqlite3.Connection, job_id: str, now: float) -> None:
+    conn.execute(
+        f"UPDATE jobs SET status='cancelled', finished_at=?, {_CLEAR_RUN} WHERE id=?",
+        (now, job_id),
+    )
+    _close_lease(conn, job_id, now, "cancelled")
 
 
 def cancel(conn: sqlite3.Connection, job_id: str, now: float) -> JobStatus:
-    raise NotImplementedError("stream D")
+    """Queued -> cancelled at once; running -> `cancel_requested` (worker stops it);
+    terminal jobs are returned unchanged."""
+    with _join_or_open(conn):
+        row = conn.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise KeyError(job_id)
+        status = JobStatus(row["status"])
+        if status in (JobStatus.QUEUED, JobStatus.SUBMITTED):
+            _finish_cancel(conn, job_id, now)
+            return JobStatus.CANCELLED
+        if status is JobStatus.RUNNING:
+            conn.execute("UPDATE jobs SET cancel_requested=1 WHERE id=?", (job_id,))
+        return status
 
 
 def requeue_orphaned_running(
     conn: sqlite3.Connection, boot_id: str, now: float, stale_s: float
 ) -> list[str]:
-    raise NotImplementedError("stream D")
+    """Running jobs of an earlier boot (worker_id != boot_id) or with a stale heartbeat go
+    back to the queue. A restart is NOT an attempt: attempts refunded, `restarts` += 1."""
+    with _join_or_open(conn):
+        rows = conn.execute(
+            "SELECT id FROM jobs WHERE status='running' AND (worker_id IS NULL OR worker_id!=?"
+            " OR worker_heartbeat_at IS NULL OR worker_heartbeat_at<?) ORDER BY created_at",
+            (boot_id, now - stale_s),
+        ).fetchall()
+        ids = [r["id"] for r in rows]
+        for job_id in ids:
+            conn.execute("UPDATE jobs SET restarts=restarts+1 WHERE id=?", (job_id,))
+            requeue(conn, job_id, now, count_attempt=False, reason="restart")
+        return ids
+
+
+RESULT_TTL_S = 604800.0
 
 
 def purge_expired(conn: sqlite3.Connection, now: float) -> None:
-    raise NotImplementedError("stream D")
+    """Free idempotency keys and delete result files older than 7 days."""
+    with _join_or_open(conn):
+        _release_expired_keys(conn, now)
+        old = conn.execute(
+            "SELECT id, res_path FROM jobs WHERE res_path IS NOT NULL AND finished_at IS NOT NULL"
+            " AND finished_at<=?",
+            (now - RESULT_TTL_S,),
+        ).fetchall()
+        for r in old:
+            Path(r["res_path"]).unlink(missing_ok=True)
+            conn.execute("UPDATE jobs SET res_path=NULL WHERE id=?", (r["id"],))

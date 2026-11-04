@@ -669,7 +669,7 @@ CREATE TABLE cost_allocations (
 | [x] A3 | `test_a_schema.py`: `migrate` на пустой БД → `user_version` = 1, все 13 таблиц; повторный `migrate` — noop; WAL включён; CHECK отвергает неверный state | `migrations/0001_initial.sql`, `db.py` |
 | [x] A4 | `test_a_unique_pool.py`: 2-я живая строка пула → IntegrityError; при PENDING_DELETE/LEAKED/STOPPED вставка новой PROVISIONING проходит; 10 потоков × свои соединения → ровно 1 вставка | (DDL) |
 | [x] A5 | `test_a_tx.py`: `tx` откатывает при исключении; `assert_not_in_tx` бросает внутри `tx`; конкуренция: соединение сторожа держит запись → контроллер (300 мс) получает `Busy`, действие переносится на следующий `step()`; сторож (5000 мс) дожидается | `db.py` |
-| A6 | `test_a_integrity.py`: испорченный файл (перезапись байтов страницы) → `safe_mode`, `halted`, инцидент, старый файл переименован; `backup` создаёт копию, хранит 7 | `integrity.py`, `backup.py`, `state.py` |
+| [x] A6 | `test_a_integrity.py`: испорченный файл (перезапись байтов страницы) → `safe_mode`, `halted`, инцидент, старый файл переименован; `backup` создаёт копию, хранит 7 | `integrity.py`, `backup.py`, `state.py` |
 
 ### S0 — сквозной каркас (sonnet, один implementer, после A1–A3, до параллельных B–E) — [x] выполнен 2026-11-04
 Минимальные версии с финальными сигнатурами: `MockProvider` (create/get/list_owned/destroy без сбоев), `MockInference` (ping/health/test_request), `states.TRANSITIONS` + `machine.transition`, `Controller.step()` с одним проходом, `tests/harness.py`. Тест `test_s0_skeleton.py`: одна задача → PROVISIONING → BOOTING → LOADING_MODEL → READY → BUSY → IDLE → STOPPING → PENDING_DELETE → STOPPED на FakeClock. Дальше потоки расширяют свои файлы из S0 (владение — как в таблицах потоков), а harness переходит к F.
@@ -679,33 +679,34 @@ CREATE TABLE cost_allocations (
 ### Поток B — адаптеры и Mock (sonnet). Владеет: `provider_adapters/*`, `cloud_manager/inference.py`, `tests/test_b_*.py`, `tests/b_fixtures.py`. Зависит от A1
 | Шаг | Тест | Реализация |
 |---|---|---|
-| B1 | `test_b_types.py`: dataclass-ы frozen; у `ProviderAdapter` нет `stop` | `base.py`, `cloud_manager/inference.py` |
-| B2 | `test_b_labels.py`: формат, verify, подделанный hmac → False, чужой префикс → None | `labels.py` |
-| B3 | `test_b_mock_provider.py`: create/get/list_owned/destroy, начисления посекундно, баланс, каждый Fault из §7.3 на уровне адаптера, `list_owned_lag_s`, `destroy_delay_s`, общий `MockStore` из 2 соединений (файл) | `mock_store.py`, `mock.py` |
-| B4 | `test_b_mock_inference.py`: `load_s`, `test_fail`, `hang_load`, `run` по времени, `InstanceLost` при interrupt, `NetworkLost` | `mock_inference.py` |
-| B5 | `test_b_contract.py`: `run_contract(MockHarness)` проходит C1–C10; «сломанный» адаптер (с `stop`, без идемпотентного destroy) падает на C1/C5 | `contract.py` |
-| B6 | `test_b_guarded.py`: повторы GET 3× через FakeClock; create не повторяется; таймаут вызова 20 с; `assert_not_in_tx`; breaker closed → open → half_open; при open `destroy`/`get`/`list_owned` проходят, `create`/`list_offers` — нет; ошибки с `actor=reaper` не считаются | `guarded.py` |
+| [x] B1 | `test_b_types.py`: dataclass-ы frozen; у `ProviderAdapter` нет `stop` | `base.py`, `cloud_manager/inference.py` |
+| [x] B2 | `test_b_labels.py`: формат, verify, подделанный hmac → False, чужой префикс → None | `labels.py` |
+| [x] B3 | `test_b_mock_provider.py`: create/get/list_owned/destroy, начисления посекундно, баланс, каждый Fault из §7.3 на уровне адаптера, `list_owned_lag_s`, `destroy_delay_s`, общий `MockStore` из 2 соединений (файл) | `mock_store.py`, `mock.py` |
+| [x] B4 | `test_b_mock_inference.py`: `load_s`, `test_fail`, `hang_load`, `run` по времени, `InstanceLost` при interrupt, `NetworkLost` | `mock_inference.py` |
+| [x] B5 | `test_b_contract.py`: `run_contract(MockHarness)` проходит C1–C10; «сломанный» адаптер (с `stop`, без идемпотентного destroy) падает на C1/C5 | `contract.py` |
+| [x] B6 | `test_b_guarded.py`: повторы GET 3× через FakeClock; create не повторяется; таймаут вызова 20 с; `assert_not_in_tx`; breaker closed → open → half_open; при open `destroy`/`get`/`list_owned` проходят, `create`/`list_offers` — нет; ошибки с `actor=reaper` не считаются | `guarded.py` |
 
 ### Поток C — автомат, leases, teardown (sonnet; ревью ×2). Владеет: `lifecycle_manager/*`, `tests/test_c_*.py`. Зависит от A, B1
 | Шаг | Тест | Реализация |
 |---|---|---|
-| C1 | `test_c_states.py`: `TRANSITIONS` совпадает с §5 (E1–E22, перечислены явно); `check_edge` на запрещённых рёбрах бросает | `states.py` |
-| C2 | `test_c_machine.py`: CAS — 2 соединения переводят одну строку, побеждает одно; строка `transitions` пишется; `insert_provisioning` при живой строке → None | `machine.py` |
-| C3 | `test_c_leases.py`: все виды из §7.1, `renew` истёкшего, `expire_due` → инцидент, hold > 8 ч → ошибка, живой счёт по `now` | `leases.py` |
-| C4 | `test_c_idle_tx.py`: `try_idle_to_stopping` — пусто → stopping; задача, вставленная другим соединением до транзакции → busy; lease → busy; гонка: поток A вставляет задачу, поток B решает остановку, 200 повторов — нет ни одного «STOPPING при непустой очереди» | `machine.py` |
-| C5 | `test_c_teardown.py` (Mock): STOPPING → PENDING_DELETE по ACCEPTED и по `stop_confirm_s`; `confirm_zero` с lag; без `provider_ref` — ожидание grace; `mark_leaks` → LEAKED, блок, halt; LEAKED → STOPPED | `teardown.py` |
-| C6 | `test_c_recovery.py`: каждая ветка §8 (сценарии собираются прямыми вставками в БД и Mock) | `recovery.py` |
+| [x] C1 | `test_c_states.py`: `TRANSITIONS` совпадает с §5 (E1–E22, перечислены явно); `check_edge` на запрещённых рёбрах бросает | `states.py` |
+| [x] C2 | `test_c_machine.py`: CAS — 2 соединения переводят одну строку, побеждает одно; строка `transitions` пишется; `insert_provisioning` при живой строке → None | `machine.py` |
+| [x] C3 | `test_c_leases.py`: все виды из §7.1, `renew` истёкшего, `expire_due` → инцидент, hold > 8 ч → ошибка, живой счёт по `now` | `leases.py` |
+| [x] C4 | `test_c_idle_tx.py`: `try_idle_to_stopping` — пусто → stopping; задача, вставленная другим соединением до транзакции → busy; lease → busy; гонка: поток A вставляет задачу, поток B решает остановку, 200 повторов — нет ни одного «STOPPING при непустой очереди» | `machine.py` |
+| [x] C5 | `test_c_teardown.py` (Mock): STOPPING → PENDING_DELETE по ACCEPTED и по `stop_confirm_s`; `confirm_zero` с lag; без `provider_ref` — ожидание grace; `mark_leaks` → LEAKED, блок, halt; LEAKED → STOPPED | `teardown.py` |
+| [x] C6 | `test_c_recovery.py`: каждая ветка §8 (сценарии собираются прямыми вставками в БД и Mock) | `recovery.py` |
 
 ### Поток D — очередь и триггеры (sonnet). Владеет: `task_queue/*`, `scheduler/*`, `tests/test_d_*.py`. Зависит от A, B1 (типы `UnavailableReason`, `JobRunResult`), C3 (`create_implicit`, `close_for_job`)
 | Шаг | Тест | Реализация |
 |---|---|---|
-| D1 | `test_d_bodies.py`: права 0700/0600, атомарная запись, `iter_recoverable`, `purge` | `bodies.py` |
-| D2 | `test_d_submit.py`: явный ключ → та же задача; другое тело → `IdempotencyConflict`; ключ через 7 сут → новая задача; неявная дедупликация в очереди, ≤ 15 мин после и > 15 мин; 10 потоков с одним ключом → 1 строка | `queue.py` |
-| D3 | `test_d_pick.py`: urgent > normal > low; round-robin 3 клиента (A,A,A,B,C → A,B,C,A,A) | `queue.py` |
-| D4 | `test_d_requeue_cancel.py`: `requeue` с/без `attempts++`, на `max` → fallback; `cancel` из очереди → lease закрыт; `requeue_orphaned_running` по `boot_id`; `purge_expired` | `queue.py` |
-| D5 | `test_d_triggers.py` (чистые функции): urgent → сразу; 4 low → нет, `wake_at` = oldest + 1800; 5 low → да; дедлайн с T_cold + T_work + margin; normal → сразу; prewarm; пустая очередь | `scheduler/triggers.py` |
+| D1 [x] | `test_d_bodies.py`: права 0700/0600, атомарная запись, `iter_recoverable`, `purge` | `bodies.py` |
+| D2 [x] | `test_d_submit.py`: явный ключ → та же задача; другое тело → `IdempotencyConflict`; ключ через 7 сут → новая задача; неявная дедупликация в очереди, ≤ 15 мин после и > 15 мин; 10 потоков с одним ключом → 1 строка | `queue.py` |
+| D3 [x] | `test_d_pick.py`: urgent > normal > low; round-robin 3 клиента (A,A,A,B,C → A,B,C,A,A) | `queue.py` |
+| D4 [x] | `test_d_requeue_cancel.py`: `requeue` с/без `attempts++`, на `max` → fallback; `cancel` из очереди → lease закрыт; `requeue_orphaned_running` по `boot_id`; `purge_expired` | `queue.py` |
+| D5 [x] | `test_d_triggers.py` (чистые функции): urgent → сразу; 4 low → нет, `wake_at` = oldest + 1800; 5 low → да; дедлайн с T_cold + T_work + margin; normal → сразу; prewarm; пустая очередь | `scheduler/triggers.py` |
 
 ### Поток E — бюджет и учёт (sonnet; ревью ×2). Владеет: `budget_manager/*`, `cost_tracker/*`, `tests/test_e_*.py`. Зависит от A, B1, C2 (`transitions` для p90)
+- [x] E-1..E-8 выполнены 2026-11-04 (отклонения — в журнале T-368).
 | Шаг | Тест | Реализация |
 |---|---|---|
 | E-1 | `test_e_estimate.py`: формула E_launch на числах замера (0,22 $/ч; 540 с; 6000/8000 ток; pp 1200, tg 78; idle 300) = 0,22/3600·(540 + 5 + 102,6 + 300) ≈ $0,0579; p90 nearest-rank; EWMA | `estimate.py` |

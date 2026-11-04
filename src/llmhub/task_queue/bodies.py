@@ -31,6 +31,10 @@ class BodyStore:
     def write_result(self, job_id: str, body: bytes) -> Path:
         return self._write(f"{job_id}.res", body)
 
+    def discard(self, job_id: str) -> None:
+        for suffix in (".req", ".meta.json", ".res"):
+            (self.root / f"{job_id}{suffix}").unlink(missing_ok=True)
+
     def read_request(self, job_id: str) -> bytes:
         return (self.root / f"{job_id}.req").read_bytes()
 

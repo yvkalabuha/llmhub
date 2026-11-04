@@ -7,12 +7,13 @@ their own. `insert_provisioning` and `try_idle_to_stopping` are always one trans
 from __future__ import annotations
 
 import sqlite3
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from typing import Any, Literal
 
 from llmhub.budget_manager.limits import Gate
+from llmhub.configuration.models import Config
 from llmhub.lifecycle_manager import leases
+from llmhub.lifecycle_manager.safety import blacklist_host, join_or_open, record_incident
 from llmhub.lifecycle_manager.states import LIVE_IN_INDEX, State, check_edge
 from llmhub.persistence.db import tx
 
@@ -28,15 +29,6 @@ _FIELDS = frozenset(
         "net_fail_since", "accrued_to", "last_error", "max_lifetime_at",
     }
 )  # fmt: skip
-
-
-@contextmanager
-def _join_or_open(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
-    if conn.in_transaction:
-        yield conn
-    else:
-        with tx(conn):
-            yield conn
 
 
 def insert_provisioning(
@@ -87,7 +79,7 @@ def set_provider_ref(
 
     A state other than PROVISIONING means the caller must destroy `ref` at once.
     """
-    with _join_or_open(conn):
+    with join_or_open(conn):
         conn.execute(
             "UPDATE instances SET provider_ref=?, host_id=?, price_usd_h=? WHERE id=?",
             (ref, host_id, price_usd_h, instance_id),
@@ -115,15 +107,22 @@ def transition(
     unknown = set(fields) - _FIELDS
     if unknown:
         raise ValueError(f"unknown instance fields: {sorted(unknown)}")
-    sets = ["state=?", "state_since=?", *(f"{k}=?" for k in fields)]
-    params: list[Any] = [dst, now, *fields.values(), instance_id, src]
-    with _join_or_open(conn):
+    params: list[Any]
+    if src == dst:  # E11 BUSY -> BUSY: no state_since reset, no transitions row
+        sets = [f"{k}=?" for k in fields] or ["state=state"]
+        params = [*fields.values(), instance_id, src]
+    else:
+        sets = ["state=?", "state_since=?", *(f"{k}=?" for k in fields)]
+        params = [dst, now, *fields.values(), instance_id, src]
+    with join_or_open(conn):
         cur = conn.execute(
             f"UPDATE instances SET {', '.join(sets)} WHERE id=? AND state=?",
             params,
         )
         if cur.rowcount != 1:
             return False
+        if src == dst:
+            return True
         conn.execute(
             "INSERT INTO transitions(instance_id, ts, from_state, to_state, reason, actor)"
             " VALUES (?,?,?,?,?,?)",
@@ -150,7 +149,8 @@ def try_idle_to_stopping(
         if inst is None or inst["state"] != State.IDLE:
             return "noop"
         queued = conn.execute(
-            "SELECT count(*) FROM jobs WHERE pool=? AND status='queued'", (inst["pool"],)
+            "SELECT count(*) FROM jobs WHERE pool=? AND status IN ('submitted','queued','running')",
+            (inst["pool"],),
         ).fetchone()[0]
         if queued or leases.live_count(conn, inst["pool"], now) > 0:
             transition(conn, instance_id, State.IDLE, State.BUSY, "E13", now, "controller",
@@ -159,3 +159,251 @@ def try_idle_to_stopping(
         ok = transition(conn, instance_id, State.IDLE, State.STOPPING, "E14", now, "controller",
                         stop_reason=reason, reason=reason)  # fmt: skip
         return "stopping" if ok else "noop"
+
+
+# --- running jobs on an instance ------------------------------------------------------------
+
+
+def requeue_running_jobs(
+    conn: sqlite3.Connection,
+    now: float,
+    *,
+    instance_id: str | None = None,
+    not_worker: str | None = None,
+    count_attempt: bool,
+) -> list[str]:
+    """Put `running` jobs back to `queued` (select by instance and/or foreign worker_id).
+
+    `mark_running` already did `attempts+1`. `count_attempt=False` undoes it and counts a
+    restart instead (a restart is not the job's fault). `count_attempt=True` keeps it; a job at
+    `max_attempts` becomes `failed` (`error_code=max_attempts`) and its implicit lease is closed.
+    Stream D's `queue.requeue` is the long-term owner of this logic (fallback_local instead of
+    failed); this is the lifecycle-side equivalent used by E15/E17 and recovery.
+    """
+    where = ["status='running'"]
+    params: list[Any] = []
+    if instance_id is not None:
+        where.append("instance_id=?")
+        params.append(instance_id)
+    if not_worker is not None:
+        where.append("worker_id IS NOT ?")
+        params.append(not_worker)
+    ids: list[str] = []
+    with join_or_open(conn):
+        rows = conn.execute(
+            f"SELECT id, attempts, max_attempts FROM jobs WHERE {' AND '.join(where)} ORDER BY id",
+            params,
+        ).fetchall()
+        for r in rows:
+            if count_attempt and r["attempts"] >= r["max_attempts"]:
+                conn.execute(
+                    "UPDATE jobs SET status='failed', error_code='max_attempts', finished_at=?"
+                    " WHERE id=?",
+                    (now, r["id"]),
+                )
+                leases.close_for_job(conn, r["id"], now)
+                continue
+            if count_attempt:
+                conn.execute(_REQUEUE_SQL.format(attempts="attempts", restarts="restarts"),
+                             (r["id"],))  # fmt: skip
+            else:
+                conn.execute(
+                    _REQUEUE_SQL.format(attempts="max(attempts-1, 0)", restarts="restarts+1"),
+                    (r["id"],),
+                )
+            ids.append(str(r["id"]))
+    return ids
+
+
+_REQUEUE_SQL = (
+    "UPDATE jobs SET status='queued', instance_id=NULL, worker_id=NULL, started_at=NULL,"
+    " worker_heartbeat_at=NULL, attempts={attempts}, restarts={restarts} WHERE id=?"
+)
+
+
+def running_count(conn: sqlite3.Connection, instance_id: str) -> int:
+    return int(
+        conn.execute(
+            "SELECT count(*) FROM jobs WHERE instance_id=? AND status='running'", (instance_id,)
+        ).fetchone()[0]
+    )
+
+
+def _queued_count(conn: sqlite3.Connection, pool: str) -> int:
+    return int(
+        conn.execute(
+            "SELECT count(*) FROM jobs WHERE pool=? AND status IN ('submitted','queued')", (pool,)
+        ).fetchone()[0]
+    )
+
+
+# --- idle decisions (E9, E12, E14, E16) -----------------------------------------------------
+
+
+def idle_stop_reason(
+    conn: sqlite3.Connection,
+    inst: sqlite3.Row,
+    now: float,
+    cfg: Config,
+    *,
+    no_launch: bool = False,
+) -> str | None:
+    """Why an IDLE instance should be stopped now (E14 triggers), or None.
+
+    The caller still passes the result through `try_idle_to_stopping`, which re-checks the
+    queue and leases in one transaction.
+    """
+    pool = inst["pool"]
+    since = float(inst["idle_since"] if inst["idle_since"] is not None else inst["state_since"])
+    if now >= float(inst["max_lifetime_at"]):
+        return "max_lifetime"
+    if no_launch:
+        return "stage_no_launch"
+    if leases.drain_requested(conn, pool, since):
+        return "drain"
+    if leases.hold_ended_since(conn, pool, since):
+        return "hold_expired"
+    if now >= since + cfg.pools[pool].idle_timeout_s:
+        return "idle_timeout"
+    return None
+
+
+def idle_due_at(inst: sqlite3.Row, cfg: Config) -> float:
+    """Wake-up time of the idle timer (idle_since + idle_timeout, or max_lifetime if sooner)."""
+    since = float(inst["idle_since"] if inst["idle_since"] is not None else inst["state_since"])
+    return min(since + cfg.pools[inst["pool"]].idle_timeout_s, float(inst["max_lifetime_at"]))
+
+
+def settle_idle(
+    conn: sqlite3.Connection,
+    inst_id: str,
+    now: float,
+    cfg: Config,
+    *,
+    no_launch: bool = False,
+) -> Literal["active", "idle", "stopping", "noop"]:
+    """READY/BUSY with no work -> IDLE (E9/E12); BUSY + stop_after_current -> STOPPING (E16);
+    IDLE with a stop reason -> STOPPING (E14, drain right after E12 in the same call)."""
+    with tx(conn):
+        inst = conn.execute("SELECT * FROM instances WHERE id=?", (inst_id,)).fetchone()
+        if inst is None:
+            return "noop"
+        state = State(inst["state"])
+        pool = inst["pool"]
+        if state == State.BUSY and inst["stop_after_current"] and not running_count(conn, inst_id):
+            ok = transition(conn, inst_id, State.BUSY, State.STOPPING, "E16", now, "controller",
+                            stop_reason=inst["stop_reason"] or "stop_after_current")  # fmt: skip
+            return "stopping" if ok else "noop"
+        if state in (State.READY, State.BUSY):
+            if (
+                running_count(conn, inst_id)
+                or _queued_count(conn, pool)
+                or leases.live_count(conn, pool, now)
+            ):
+                return "active"
+            edge = "E9" if state == State.READY else "E12"
+            if not transition(conn, inst_id, state, State.IDLE, edge, now, "controller",
+                              idle_since=now):  # fmt: skip
+                return "noop"
+        elif state != State.IDLE:
+            return "noop"
+    inst = conn.execute("SELECT * FROM instances WHERE id=?", (inst_id,)).fetchone()
+    reason = idle_stop_reason(conn, inst, now, cfg, no_launch=no_launch)
+    if reason is not None:
+        outcome = try_idle_to_stopping(conn, inst_id, now, reason)
+        if outcome == "stopping":
+            return "stopping"
+        if outcome == "busy":  # queue or lease appeared: E13
+            return "active"
+    return "idle"
+
+
+def request_stop_after_current(conn: sqlite3.Connection, instance_id: str, reason: str) -> None:
+    """BUSY instance: finish the running jobs, then stop (E16); new jobs are not handed out."""
+    with join_or_open(conn):
+        conn.execute(
+            "UPDATE instances SET stop_after_current=1, stop_reason=COALESCE(stop_reason, ?)"
+            " WHERE id=?",
+            (reason, instance_id),
+        )
+
+
+# --- loss, kill (E3/E5/E7/E10/E15/E17/E18) ---------------------------------------------------
+
+
+def mark_lost(
+    conn: sqlite3.Connection,
+    instance_id: str,
+    now: float,
+    cause: str,
+    actor: Actor = "controller",
+    *,
+    cfg: Config | None = None,
+) -> bool:
+    """The resource is gone/unreachable: go to ERROR through the edge of the current state.
+
+    BOOTING -> E5 and LOADING_MODEL -> E7 blacklist the host; READY -> E10; BUSY/IDLE -> E17
+    (running jobs are requeued with the attempt counted). The next step does ERROR -> STOPPING.
+    """
+    blacklist_s = cfg.retry.host_blacklist_s if cfg else 86400.0
+    with tx(conn):
+        inst = conn.execute("SELECT * FROM instances WHERE id=?", (instance_id,)).fetchone()
+        if inst is None:
+            return False
+        state = State(inst["state"])
+        edge = {
+            State.PROVISIONING: "E3", State.BOOTING: "E5", State.LOADING_MODEL: "E7",
+            State.READY: "E10", State.BUSY: "E17", State.IDLE: "E17",
+        }.get(state)  # fmt: skip
+        if edge is None:
+            return False
+        if not transition(conn, instance_id, state, State.ERROR, edge, now, actor,
+                          last_error=cause, reason=cause):  # fmt: skip
+            return False
+        if state in (State.BOOTING, State.LOADING_MODEL):
+            blacklist_host(conn, inst["provider"], inst["host_id"], now, blacklist_s, cause)
+        if state == State.BUSY:
+            requeue_running_jobs(conn, now, instance_id=instance_id, count_attempt=True)
+        record_incident(
+            conn, now, "instance_lost" if edge in ("E10", "E17") else "instance_error", "warning",
+            ref=instance_id, dedup_key=f"lost:{instance_id}:{edge}", details={"cause": cause},
+        )  # fmt: skip
+    return True
+
+
+def error_to_stopping(
+    conn: sqlite3.Connection, now: float, actor: Actor = "controller"
+) -> list[str]:
+    """E18: every ERROR instance goes to STOPPING in the same step."""
+    done: list[str] = []
+    with tx(conn):
+        for r in conn.execute(
+            "SELECT id FROM instances WHERE state='ERROR' ORDER BY id"
+        ).fetchall():
+            if transition(conn, r["id"], State.ERROR, State.STOPPING, "E18", now, actor,
+                          stop_reason="error"):  # fmt: skip
+                done.append(str(r["id"]))
+    return done
+
+
+def kill_to_stopping(
+    conn: sqlite3.Connection, now: float, actor: Actor = "admin", reason: str = "kill"
+) -> list[str]:
+    """Kill: every live instance -> STOPPING (E15, ERROR via E18); running jobs are requeued
+    without counting an attempt; holds are released. Returns the instance ids."""
+    done: list[str] = []
+    with tx(conn):
+        marks = ",".join("?" for _ in LIVE_IN_INDEX)
+        rows = conn.execute(
+            f"SELECT * FROM instances WHERE state IN ({marks}) AND state != 'STOPPING' ORDER BY id",
+            sorted(LIVE_IN_INDEX),
+        ).fetchall()
+        for r in rows:
+            src = State(r["state"])
+            edge = "E18" if src == State.ERROR else "E15"
+            if transition(conn, r["id"], src, State.STOPPING, edge, now, actor,
+                          stop_reason=reason, reason=reason):  # fmt: skip
+                requeue_running_jobs(conn, now, instance_id=r["id"], count_attempt=False)
+                done.append(str(r["id"]))
+        leases.release_holds(conn, None, now, reason)
+    return done
