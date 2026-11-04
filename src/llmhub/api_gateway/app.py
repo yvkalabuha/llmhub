@@ -125,7 +125,8 @@ def _supervise(rt: Runtime, stop: asyncio.Event) -> Callable[[asyncio.Task[Any]]
     return done
 
 
-def create_app(rt: Runtime, *, run_loops: bool = True) -> FastAPI:
+def create_app(rt: Runtime, *, run_loops: bool = True, docs: bool | None = None) -> FastAPI:
+    """`docs` (default `api.docs`): False drops /docs, /redoc and /openapi.json (SEC-L2)."""
     from llmhub.api_gateway import (
         routes_admin,
         routes_health,
@@ -155,7 +156,12 @@ def create_app(rt: Runtime, *, run_loops: bool = True) -> FastAPI:
                 t.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    app = FastAPI(title="llmhub", version=rt.version, lifespan=lifespan)
+    if docs is None:
+        docs = rt.cfg.api.docs
+    off: dict[str, Any] = (
+        {} if docs else {"docs_url": None, "redoc_url": None, "openapi_url": None}
+    )
+    app = FastAPI(title="llmhub", version=rt.version, lifespan=lifespan, **off)
     app.state.rt = rt
     install_handlers(app)
     for module in (routes_openai, routes_tasks, routes_leases, routes_admin, routes_health):

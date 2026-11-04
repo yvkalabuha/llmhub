@@ -1,6 +1,6 @@
 """In-process fake llama-server as an ASGI app (T-369 H1). Never listens on a real port.
 
-Endpoints: POST /v1/chat/completions, GET /health, GET /slots. Knobs are plain attributes;
+Endpoints: POST /v1/chat/completions, GET /health, GET /slots, GET /v1/models. Knobs are plain attributes;
 delays go through the injected `Clock`, so a FakeClock drives them.
 """
 
@@ -102,6 +102,8 @@ class FakeLlama:
                 await self._send(send, self.slots_status, {"error": {"message": "slots off"}})
             else:
                 await self._send(send, 200, [{"id": 0, "is_processing": self.external_busy}])
+        elif path == "/v1/models" and method == "GET":
+            await self._send(send, self.health_status, {"object": "list", "data": [{"id": "m"}]})
         elif path == "/v1/chat/completions" and method == "POST":
             await self._chat(send, parsed or {})
         else:

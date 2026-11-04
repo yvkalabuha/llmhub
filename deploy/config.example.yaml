@@ -1,0 +1,94 @@
+# llmhub server config (T-371): 65.109.95.35, API 10.8.0.1:8095 (OpenVPN only), Mock cloud.
+# Template for `deploy/render.py config`: the all-zero/numbered key hashes below are
+# placeholders replaced from `keys new` hashes (S4); window 2 adds weights.sources/sets
+# (render.py config --weights ...). It must stay valid as it is (tests load it).
+# Secrets are never here: files mounted ro, env holds only paths (*_FILE).
+data_dir: /var/lib/llmhub
+
+api:
+  host: 10.8.0.1            # never a wildcard (validator); --network host, no -p
+  port: 8095
+  docs: false               # SEC-L2: no /docs, /redoc, /openapi.json on the server
+  admin_key_sha256: "0000000000000000000000000000000000000000000000000000000000000000"
+
+providers:
+  enabled: [mock]           # T-371: Mock only; real providers need T-372 and permission
+
+local_backends:             # the existing llama-server units, used as clients (never managed)
+  qwen-35b-a3b:
+    url: http://10.8.0.1:8090/v1
+    model: qwen3.6-35b-a3b
+    ctx_tokens: 32768
+    pp_tps: 50
+    tg_tps: 9
+    api_key_file: /run/llama/api-key   # ro mount of /etc/llama/api-key, read lazily (F1)
+    probe: slots                       # GET only (F8 / Q3)
+  qwen-27b:
+    url: http://10.8.0.1:8091/v1
+    model: qwen3.8-27b
+    ctx_tokens: 32768
+    pp_tps: 9.5
+    tg_tps: 2.9
+    api_key_file: /run/llama/api-key
+    probe: slots
+  qwen-9b:
+    url: http://10.8.0.1:8092/v1
+    model: qwen3.5-9b
+    ctx_tokens: 32768
+    pp_tps: 60
+    tg_tps: 6.5
+    api_key_file: /run/llama/api-key
+    probe: slots
+
+local:
+  probe_interval_s: 30      # >= 10 (F8)
+
+models:
+  qwen-35b: {local: qwen-35b-a3b, quality_tier: 2, description: "Qwen3.6-35B-A3B (8090)"}
+  qwen-27b: {local: qwen-27b, quality_tier: 3, description: "Qwen3.8-27B (8091) / cloud-27b"}
+  qwen-9b: {local: qwen-9b, quality_tier: 1, description: "Qwen3.5-9B (8092)"}
+  qwen-27b-cloud: {quality_tier: 3, description: "cloud-27b only (e2e: never local llama)"}
+
+router:
+  auto_alias: qwen-35b
+
+pools:
+  cloud-27b:
+    provider: mock
+    gpu: RTX4090
+    vram_gb: 24
+    pp_tps: 1200
+    tg_tps: 78
+    image: llmhub-infer:mock     # Mock pods do not pull an image
+    disk_gb: 60
+    models: [qwen-27b, qwen-27b-cloud]
+
+clients:
+  voicebot:
+    key_sha256: "0000000000000000000000000000000000000000000000000000000000000001"
+    allowed_models: ["*"]
+    max_priority: urgent
+    default_priority: normal
+    cloud_allowed: false
+  gamedev:
+    key_sha256: "0000000000000000000000000000000000000000000000000000000000000002"
+    allowed_models: ["*"]
+    cloud_allowed: false
+  agents:                   # MCP llmhub_ask (S12): local models only
+    key_sha256: "0000000000000000000000000000000000000000000000000000000000000003"
+    allowed_models: ["*"]
+    default_priority: low
+    max_priority: normal
+    cloud_allowed: false
+  e2e:                      # T-371 e2e on Mock only; removed at the end of S10 (F7)
+    key_sha256: "0000000000000000000000000000000000000000000000000000000000000004"
+    allowed_models: ["*"]
+    cloud_allowed: true
+    mock_only: true
+    max_active_jobs: 4
+
+weights:
+  auth_listen: 127.0.0.1:8096
+  auth_state_dir: /var/lib/llmhub-weights-auth
+  acct_log: /var/log/llmhub/weights-acct.log
+  min_mem_available_mib: 8192   # F6: validator answers 503 low_memory below this

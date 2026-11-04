@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import time
+from datetime import UTC, datetime
 from pathlib import Path
 
 from llmhub.clock import Clock
@@ -38,3 +40,54 @@ def maybe_daily_backup(conn: sqlite3.Connection, dst_dir: Path, clock: Clock) ->
     path = backup(conn, dst_dir, clock)
     state.set(conn, "last_backup_at", repr(now), now)
     return path
+
+
+def _backup_order(p: Path) -> tuple[str, int]:
+    """state-<stamp>.db < state-<stamp>-1.db < state-<stamp>-2.db (name order breaks on -10)."""
+    stem = p.stem.removeprefix(_PREFIX)
+    base, _, n = stem.partition("-")
+    return base, int(n) if n.isdigit() else 0
+
+
+def backup_state_db(src: Path, dst_dir: Path, keep: int, now: datetime) -> Path:
+    """`llmhub backup` (T-371 A2): online copy of `src` into `dst_dir/state-<UTC stamp>.db`.
+
+    The copy goes to `*.tmp` first, must pass `integrity_check`, then is moved in place with
+    `os.replace` (mode 0640). Copies made in the same second get a `-N` suffix instead of
+    overwriting. Only `state-*.db` files are rotated (newest `keep` stay)."""
+    if keep < 1:
+        raise ValueError("keep must be >= 1")
+    src = Path(src)
+    if not src.is_file():
+        raise FileNotFoundError(str(src))
+    dst_dir = Path(dst_dir)
+    dst_dir.mkdir(parents=True, exist_ok=True, mode=0o750)
+    stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%S")
+    dst = dst_dir / f"{_PREFIX}{stamp}.db"
+    n = 0
+    while dst.exists():
+        n += 1
+        dst = dst_dir / f"{_PREFIX}{stamp}-{n}.db"
+    tmp = dst.with_name(dst.name + ".tmp")
+    # mode=rw: never create a missing source; the online backup API sees committed data only
+    source = sqlite3.connect(f"file:{src}?mode=rw", uri=True, timeout=30)
+    try:
+        out = sqlite3.connect(str(tmp))
+        try:
+            source.backup(out)
+            row = out.execute("PRAGMA integrity_check").fetchone()
+            if row is None or row[0] != "ok":
+                raise sqlite3.DatabaseError("backup copy failed integrity_check")
+        finally:
+            out.close()
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, dst)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    finally:
+        source.close()
+    copies = sorted(dst_dir.glob(f"{_PREFIX}*.db"), key=_backup_order)
+    for old in copies[: max(0, len(copies) - keep)]:
+        old.unlink()
+    return dst

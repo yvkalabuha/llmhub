@@ -13,7 +13,9 @@ Providers: only `mock` has an adapter (real adapters arrive with T-372). Mock po
 from __future__ import annotations
 
 import asyncio
+import hmac
 import logging
+import os
 import signal
 import sqlite3
 import threading
@@ -42,7 +44,12 @@ from llmhub.configuration.loader import (
 from llmhub.configuration.models import Config
 from llmhub.controller import Controller, new_boot_id
 from llmhub.cost_tracker.txutil import join_or_open, state_get, state_set
-from llmhub.local_inference.client import LocalBackendClient, api_key_from_env
+from llmhub.local_inference.client import (
+    KeySource,
+    LocalBackendClient,
+    api_key_from_env,
+    file_key_source,
+)
 from llmhub.local_inference.worker import LocalWorker
 from llmhub.model_router.views import CloudState
 from llmhub.persistence.integrity import open_state_db
@@ -103,9 +110,19 @@ def build_adapters(cfg: Config, env: Mapping[str, str], clock: Clock) -> dict[st
 
 def load_instance_secrets(cfg: Config, env: Mapping[str, str]) -> InstanceSecrets:
     hf = env.get(cfg.weights.hf_token_env) if cfg.weights.hf_token_env else None
-    return InstanceSecrets(
-        instance=load_instance_secret(env), weights=load_weights_secret(env), hf_token=hf or None
-    )
+    instance, weights = load_instance_secret(env), load_weights_secret(env)
+    if hmac.compare_digest(instance, weights):  # R8, also for the *_FILE variant
+        raise ConfigError("LLMHUB_INSTANCE_SECRET and LLMHUB_WEIGHTS_SECRET must differ")
+    return InstanceSecrets(instance=instance, weights=weights, hf_token=hf or None)
+
+
+SERVICE_UMASK = 0o027
+
+
+def apply_umask() -> int:
+    """T-371 §2.3: state.db*, bodies and backups are created 0640/0750 (group = readers such
+    as the weights validator, others nothing). Called before `build_service` opens the DB."""
+    return os.umask(SERVICE_UMASK)
 
 
 @dataclass
@@ -187,16 +204,21 @@ def build_service(
 
     backends: dict[str, LocalBackendClient] = {}
     for name, bc in cfg.local_backends.items():
-        try:
-            key = api_key_from_env(bc, env)
-        except ValueError:
-            log.warning("local backend %s: %s is not set; calling without a key",
-                        name, bc.api_key_env)  # fmt: skip
-            key = None
+        key: str | None = None
+        source: KeySource | None = None
+        if bc.api_key_file is not None:
+            source = file_key_source(bc.api_key_file)  # F1: read on first use, not here
+        else:
+            try:
+                key = api_key_from_env(bc, env)
+            except ValueError:
+                log.warning("local backend %s: %s is not set; calling without a key",
+                            name, bc.api_key_env)  # fmt: skip
         http = None if local_http is None else local_http.get(name)
         backends[name] = LocalBackendClient(
-            name, bc, key, http=http, clock=clock, probe_timeout_s=cfg.local.probe_timeout_s
-        )
+            name, bc, key, http=http, clock=clock, probe_timeout_s=cfg.local.probe_timeout_s,
+            key_source=source,
+        )  # fmt: skip
     worker = LocalWorker(
         conn, cfg, clock, bodies, backends, controller.boot_id, notify=waiter.notify
     )
@@ -255,5 +277,5 @@ async def serve(svc: Service, *, host: str | None = None, port: int | None = Non
 
 
 __all__ = [
-    "Service", "build_adapters", "build_service", "make_speed_consumer", "mtp_key", "serve",
+    "SERVICE_UMASK", "Service", "apply_umask", "build_adapters", "build_service", "make_speed_consumer", "mtp_key", "serve",
 ]  # fmt: skip

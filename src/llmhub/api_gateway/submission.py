@@ -84,11 +84,39 @@ def route_error_to_api(exc: RouteError) -> ApiError:
     )
 
 
+_ACTIVE = ("submitted", "queued", "running")
+
+
 class Submitter:
     def __init__(self, rt: Runtime) -> None:
         self.rt = rt
 
     # --- helpers ---------------------------------------------------------------
+    def _check_client_limit(self, principal: Principal, opts: RequestOptions) -> None:
+        """SEC-L4: `clients.<id>.max_active_jobs` queued+running jobs per client -> 429.
+        A repeat of an existing Idempotency-Key is never limited (it creates nothing)."""
+        cfg = self.rt.cfg
+        client = cfg.clients.get(principal.client_id)
+        if client is None:
+            return
+        marks = ",".join("?" for _ in _ACTIVE)
+        active = int(self.rt.conn.execute(
+            f"SELECT count(*) FROM jobs WHERE client_id=? AND status IN ({marks})",
+            (principal.client_id, *_ACTIVE),
+        ).fetchone()[0])  # fmt: skip
+        if active < client.max_active_jobs:
+            return
+        if opts.idem_key is not None and self.rt.conn.execute(
+            "SELECT 1 FROM jobs WHERE client_id=? AND idem_key=?",
+            (principal.client_id, opts.idem_key),
+        ).fetchone() is not None:  # fmt: skip
+            return
+        raise ApiError(
+            ErrorCode.RATE_LIMITED,
+            f"too many active jobs for this client (limit {client.max_active_jobs})",
+            retry_after_s=float(cfg.api.retry_after_min_s),
+        )
+
     def _check_lease(self, principal: Principal, lease_id: str, now: float) -> None:
         row: sqlite3.Row | None = self.rt.conn.execute(
             "SELECT client_id, closed_at, close_reason, expires_at FROM leases WHERE id=?",
@@ -128,6 +156,7 @@ class Submitter:
             raise ApiError(ErrorCode.INVALID_REQUEST, "model is required")
         if not isinstance(req.get("messages"), list) or not req["messages"]:
             raise ApiError(ErrorCode.INVALID_REQUEST, "messages must be a non-empty list")
+        self._check_client_limit(principal, opts)
         now = rt.clock.now()
         if opts.lease_id is not None:
             self._check_lease(principal, opts.lease_id, now)
@@ -218,6 +247,8 @@ class Submitter:
                 raise ApiError(
                     ErrorCode.FORBIDDEN, "client may not use the cloud", reason="cloud_not_allowed"
                 )
+        # again with no await up to submit: concurrent requests cannot overshoot the limit
+        self._check_client_limit(principal, opts)
         try:
             result = rt.controller.submit(spec, retry_failed=_retryable_failure)
         except IdempotencyConflict as exc:

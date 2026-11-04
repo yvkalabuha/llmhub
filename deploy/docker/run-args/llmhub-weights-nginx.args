@@ -1,0 +1,30 @@
+# llmhub-weights-nginx: HTTPS on @PUBLIC_IP@:9443, GGUF only; pid and temp files in /tmp
+# (tmpfs). The image entrypoint scripts are skipped (read-only rootfs).
+--name
+llmhub-weights-nginx
+@include _common.args
+--user
+64101:64101
+--group-add
+64100
+--memory
+256m
+--entrypoint
+nginx
+--health-cmd
+nginx -t -q -e stderr -c /etc/nginx-weights/nginx.conf && kill -0 "$(cat /tmp/nginx.pid)"
+-v
+/etc/llmhub/nginx-weights.conf:/etc/nginx-weights/nginx.conf:ro
+-v
+/etc/llmhub/weights:/etc/llmhub/weights:ro
+-v
+/opt/models:/opt/models:ro
+-v
+/var/log/llmhub:/var/log/llmhub
+@NGINX_IMAGE@
+-e
+stderr
+-c
+/etc/nginx-weights/nginx.conf
+-g
+daemon off;

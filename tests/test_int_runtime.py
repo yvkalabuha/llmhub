@@ -89,7 +89,7 @@ async def test_real_provider_gets_http_backend_and_is_closed(tmp_path: Path) -> 
     env = {
         **ENV,
         "LLMHUB_INSTANCE_SECRET": TEST_SECRET.decode(),
-        "LLMHUB_WEIGHTS_SECRET": TEST_SECRET.decode(),
+        "LLMHUB_WEIGHTS_SECRET": "w" * 40,  # T-371: must differ from the instance secret
     }
     svc = build_service(cfg, env, FakeClock(), adapters={"realcloud": fake_real})  # type: ignore[dict-item]
     http = svc.http_inference

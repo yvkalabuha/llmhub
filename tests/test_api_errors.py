@@ -1,4 +1,4 @@
-"""T-369 W1: error table (21 codes), OpenAI error object, handlers."""
+"""T-369 W1: error table (21 codes + T-371 rate_limited), OpenAI error object, handlers."""
 
 from __future__ import annotations
 
@@ -19,12 +19,12 @@ TABLE = {
     "queue_wait_exceeded": (503, True), "cloud_unavailable": (503, True),
     "local_unavailable": (503, True), "controller_halted": (503, False), "busy": (503, True),
     "deadline_exceeded": (504, False), "upstream_timeout": (504, True), "cancelled": (409, False),
-    "internal_error": (500, True),
+    "internal_error": (500, True), "rate_limited": (429, True),
 }  # fmt: skip
 
 
-def test_table_has_21_codes() -> None:
-    assert len(ErrorCode) == 21
+def test_table_has_22_codes() -> None:
+    assert len(ErrorCode) == 22
     assert set(TABLE) == {c.value for c in ErrorCode}
 
 

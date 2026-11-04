@@ -58,7 +58,8 @@ SCHEMAS: dict[str, Any] = {
     "Error": _obj({"error": _obj({
         "message": S,
         "type": {"type": "string", "enum": ["authentication_error", "permission_error",
-                                            "invalid_request_error", "server_error"]},
+                                            "invalid_request_error", "server_error",
+                                            "rate_limit_error"]},
         "param": {"type": "null"},
         "code": {"$ref": "#/components/schemas/ErrorCode"},
         "reason": {**NS, "description": "cause, e.g. one of the six cloud-unavailability "
@@ -74,7 +75,8 @@ SCHEMAS: dict[str, Any] = {
         "context_too_large", "model_not_available", "not_found", "idempotency_conflict",
         "task_not_ready", "lease_expired", "lease_closed", "conflict", "queue_wait_exceeded",
         "cloud_unavailable", "local_unavailable", "controller_halted", "busy",
-        "deadline_exceeded", "upstream_timeout", "cancelled", "internal_error"]},
+        "deadline_exceeded", "upstream_timeout", "cancelled", "internal_error",
+        "rate_limited"]},
     "LlmhubOptions": _obj({
         "priority": {"type": "string", "enum": ["urgent", "normal", "low"]},
         "policy": {"type": "string", "enum": ["ECONOMY", "BALANCED", "QUALITY"]},
@@ -186,6 +188,8 @@ CHAT_ERRORS = {
     "404": _err("model_not_available"),
     "409": _err("idempotency_conflict (task_id of the existing task)"),
     "413": _err("request_too_large"),
+    "429": {**_err("rate_limited: clients.<id>.max_active_jobs queued+running jobs "
+                   "(Retry-After)"), "headers": {**SHOULD_RETRY, **RETRY_AFTER}},
     "503": {**_err("queue_wait_exceeded (Retry-After, task_id; the task stays) | "
                    "cloud_unavailable (reason) | local_unavailable | controller_halted | "
                    "busy"), "headers": {**SHOULD_RETRY, **RETRY_AFTER}},
@@ -317,7 +321,7 @@ def app_paths() -> dict[str, Any]:
     from llmhub.api_gateway.app import Runtime, create_app
 
     rt = cast(Runtime, types.SimpleNamespace(version=__version__))
-    return cast(dict[str, Any], create_app(rt, run_loops=False).openapi())
+    return cast(dict[str, Any], create_app(rt, run_loops=False, docs=True).openapi())
 
 
 def build_spec() -> dict[str, Any]:

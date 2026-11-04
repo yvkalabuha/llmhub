@@ -1,11 +1,14 @@
 # Интеграция клиентов с llmhub
 
-> TL;DR: Руководство для клиентов (gameDev на C#/.NET, VoiceBot, агенты): OpenAI-совместимый `/v1/chat/completions` (+ SSE), `/v1/tasks` и `/v1/leases` по raw HTTP, коды ошибок, заголовки, таймауты, правила `data_class`; агентам Claude Code — stdio MCP-сервер `llmhub` (§8: регистрация, переменные, таймауты, что делегировать). Нормативный контракт — `docs/openapi.yaml` (генерируется `scripts/export_openapi.py`, тест сверяет с приложением) и примеры `examples/` (каждый исполняется в тестах против живого приложения).
+> TL;DR: Рабочее руководство (T-371) для клиентов gameDev (C#/.NET), VoiceBot (T-366) и агентов. Сервер — `http://10.8.0.1:8095`, только через OpenVPN 10.8.0.0/24. Есть OpenAI-совместимый `/v1/chat/completions` (+ SSE), а `/v1/tasks` и `/v1/leases` — по raw HTTP. Описаны коды ошибок (в том числе `429 rate_limited`), таймауты и `data_class`. Для агентов Claude Code есть MCP-сервер `llmhub` (§8). Нормативный контракт — `docs/openapi.yaml`; на сервере `/docs` выключен. Примеры лежат в `examples/`.
 
 ## 1. Подключение
-- Базовый URL `http://10.8.0.1:8095` (только VPN); OpenAI-клиентам — `OPENAI_BASE_URL=http://10.8.0.1:8095/v1`.
+- Базовый URL `http://10.8.0.1:8095`. Доступ только из OpenVPN 10.8.0.0/24: правило ufw на `tun0`, служба слушает только 10.8.0.1. OpenAI-клиентам: `OPENAI_BASE_URL=http://10.8.0.1:8095/v1`.
+- Контракт — `docs/openapi.yaml` из репозитория. На сервере `/docs`, `/redoc` и `/openapi.json` выключены (`api.docs: false`, флаг `serve --no-docs`) и отвечают `404`.
+- Ключи `voicebot`, `gamedev` и `agents` выдаёт оператор (runbook, «Ротация ключей»). Каждый ключ передаётся файлом `0600`, его нельзя класть в переменную окружения, в git или в лог.
 - Ключ клиента: `Authorization: Bearer lh_...`. Выдаёт администратор (`python -m llmhub keys new --name <client>` печатает ключ один раз и его sha256; в конфиге и БД — только хеш). Новый клиент подключается без перезапуска (`SIGHUP` или `POST /admin/reload_clients`); перечитывание применяет и `api.admin_key_sha256` (ротация admin-ключа). Клиент, которого удалили или у которого сняли `cloud_allowed`, сразу теряет облако — и при перечитывании, и при перезапуске службы с исправленным конфигом: его облачные задачи в очереди отменяются (`cancelled`, в `error.reason` — `cloud_not_allowed`), явные и prewarm lease закрываются (`revoked`), продление lease и новая облачная задача → `403 cloud_not_allowed` (в том числе запрос, который был в обработке в момент перечитывания). Уже выполняющаяся облачная задача дорабатывает (GPU оплачен); если её прервёт перезапуск или сбой инстанса, в облачную очередь она не вернётся, а будет отменена с тем же `cloud_not_allowed`.
-- У клиента в конфиге: `allowed_models` (псевдонимы или `*`), `max_priority`, `default_priority`, `default_policy`, `cloud_allowed` (по умолчанию `false`).
+- У клиента в конфиге: `allowed_models` (псевдонимы или `*`), `max_priority`, `default_priority`, `default_policy`, `cloud_allowed` (по умолчанию `false`), `max_active_jobs` (по умолчанию 32).
+- **Лимит** (SEC-L4): у клиента не больше `max_active_jobs` задач в очереди и в работе вместе. Следующий запрос (`/v1/chat/completions` или `/v1/tasks`) получает `429 rate_limited` с заголовком `Retry-After` (`retryable=true`, `type=rate_limit_error`). Повтор с существующим `Idempotency-Key` под лимит не попадает. openai-python сам повторяет `429` с паузой из `Retry-After`.
 - `GET /v1/models` — псевдонимы, доступные клиенту, и `auto` (поле `llmhub`: `local`, `cloud`, `ctx_tokens`).
 - `/healthz` (без ключа) — жив ли процесс; `/readyz` — жив ли цикл контроллера.
 
@@ -42,7 +45,8 @@
 
 ### Синхронное окно и таймауты клиента
 - Сервер ждёт результат до 480 с (`X-LLMHub-Wait` — меньше). Не успел → `503 queue_wait_exceeded` + `Retry-After` + `task_id`; **задача остаётся в очереди**. Повтор того же запроса (тот же `Idempotency-Key` или то же тело) присоединяется к ней.
-- Таймаут HTTP-клиента должен быть **больше 480 с**: openai-python — `timeout=600`, C# — `HttpClient.Timeout = 10 мин`, curl — `--max-time 600`. Прокси между клиентом и llmhub — `proxy_read_timeout` > 480 с и `proxy_buffering off` для SSE (T-371).
+- Таймаут HTTP-клиента должен быть **больше 480 с**: openai-python — `timeout=600`, C# — `HttpClient.Timeout = 10 мин`, curl — `--max-time 600`.
+- **Прокси перед API.** По умолчанию прокси нет: клиенты ходят напрямую на `10.8.0.1:8095`. Если прокси появится (nginx и т. п.), ему нужны `proxy_read_timeout 600s` (больше 480 с), `proxy_buffering off` (SSE и `: keep-alive` должны доходить сразу) и `proxy_request_buffering off`. Заголовки `Authorization`, `Idempotency-Key` и `X-LLMHub-*` прокси передаёт без изменений.
 - openai-python сам повторяет `409` и `5xx` (`max_retries`, по умолчанию 2), если сервер не запретил: llmhub в каждом ответе об ошибке ставит `x-should-retry: true|false` (= `error.retryable`), поэтому `409 cancelled`, `504 deadline_exceeded`, `503 controller_halted` и прочие неповторяемые ошибки SDK не повторяет. Повтор `503 queue_wait_exceeded` присоединяется к той же задаче (общее ожидание до ~24 мин). `Retry-After` до 120 с SDK выдерживает; **если `Retry-After` больше 120 с, SDK не повторяет вовсе** и сразу поднимает исключение. Сервер ставит `Retry-After` по ETA в пределах `api.retry_after_min_s`..`api.retry_after_max_s` (по умолчанию до 900 с), так что при длинной очереди повтора от SDK не будет — для долгих задач `/v1/tasks`.
 - **Разрыв соединения не отменяет задачу**: результат остаётся доступен по `task_id` (`X-LLMHub-Task` или `error.task_id`). Повтор после сетевой ошибки — с тем же `Idempotency-Key`.
 
@@ -89,6 +93,7 @@
 | `local_unavailable` | 503 | да | локальный бэкенд недоступен / попытки исчерпаны |
 | `controller_halted` | 503 | нет | служба остановлена (HALTED/KILL), локально нельзя |
 | `busy` | 503 | да (1 с) | БД занята |
+| `rate_limited` | 429 | да | у клиента уже `max_active_jobs` активных задач (`Retry-After`) |
 | `deadline_exceeded` | 504 | нет | дедлайн прошёл до старта |
 | `upstream_timeout` | 504 | да | таймаут модели после попыток |
 | `cancelled` | 409 | нет | результат отменённой задачи |
@@ -103,6 +108,20 @@
 - curl (`bash`, без `jq`): `examples/curl/01_models.sh`, `examples/curl/02_chat.sh`, `examples/curl/03_chat_stream.sh`, `examples/curl/04_task_submit_poll_result.sh`, `examples/curl/05_task_cancel.sh`, `examples/curl/06_lease_lifecycle.sh`, `examples/curl/07_idempotency.sh`, `examples/curl/08_errors.sh`, `examples/curl/09_admin_status.sh`.
 - Python: `examples/python/openai_chat.py` (openai-python: chat, stream, заголовки, ошибки, `timeout=600`), `examples/python/raw_tasks.py` (httpx: задача с `Idempotency-Key`, опрос, результат, lease с пульсом).
 - C#/.NET: `examples/csharp/LlmHubExample` (`HttpClient`: chat, задача, lease, разбор `error`; `Timeout` 10 мин). На машине разработки llmhub нет `dotnet` — тест сборки пропускается; **gameDev**: `cd examples/csharp/LlmHubExample && LLMHUB_URL=… LLMHUB_KEY=… dotnet run`. Пути и заголовки `.cs` сверяются с OpenAPI всегда.
+
+## 7a. Клиенты: gameDev (C#/.NET) и VoiceBot (T-366)
+**gameDev (C#/.NET)**
+- Рабочий образец — `examples/csharp/LlmHubExample`: chat, задача, lease, разбор `error`.
+- Нужен один `HttpClient` с `BaseAddress = http://10.8.0.1:8095/` и `Timeout = TimeSpan.FromMinutes(10)` (больше синхронного окна 480 с), а также `DefaultRequestHeaders.Authorization = Bearer <ключ gamedev>`. Ключ читается из файла 0600.
+- Длинную генерацию лучше запускать через `/v1/tasks` и опрашивать `GET /v1/tasks/{id}`, а не держать соединение 8 минут.
+- Повтор делается только при `error.retryable == true`: паузу брать из `Retry-After` / `retry_after_s`, `Idempotency-Key` оставлять тем же. Это относится и к `429 rate_limited`.
+- У клиента `gamedev` в серверном конфиге `cloud_allowed: false`: все запросы идут только на локальные модели. Облако включает заказчик, правкой конфига.
+
+**VoiceBot (T-366)**
+- Подходит openai-python (`OPENAI_BASE_URL=http://10.8.0.1:8095/v1`, ключ `voicebot`, `timeout=600`).
+- Для коротких реплик: `X-LLMHub-Priority: urgent` (у `voicebot` `max_priority: urgent`) и `X-LLMHub-Wait` меньше 480 с. На ответ `503 queue_wait_exceeded` задача не теряется: её можно забрать позже по `task_id`.
+- Данные голоса — `private` (умолчание клиента): они не уходят в облако ни при каком маршруте.
+- Если не хватает местной мощности, приходит `503 local_unavailable` (`retryable`). Бот должен показать деградацию, а не повторять запрос в цикле.
 
 ## 8. MCP для агентов (`llmhub.mcp_server`, T-373)
 Тонкий stdio MCP-сервер: агент Claude Code вызывает llmhub инструментом, не читая большие входы и не выводя большие ответы. Ходит только в `/v1/tasks*` и `/v1/models`; проверки ответа выполняет сам (Python), решения «годится/нет» модель не принимает.
@@ -122,7 +141,7 @@
 - **Запись результата**: `ok` + `output_file` → текст в файл, в ответе начало текста; без `output_file` текст больше `LLMHUB_MCP_MAX_INLINE_BYTES` → `<scratch>/<task_id>.txt`, `truncated_inline=true`. `check_failed` → текст только в `<scratch>/<task_id>.rejected.txt` (для разбора), в `output_file` не пишется. Если `output_file` не удалось записать уже после ответа (файл появился за время ожидания → `exists`, и т. п.), — `verdict=error` с кодом, `task_id`, проверками и путём `<scratch>/<task_id>.txt` в `output_file`: оплаченный ответ не теряется. После отправки задачи любая ошибка (в т. ч. `internal_error`) сохраняет `task_id`.
 - **Идемпотентность**: `Idempotency-Key = mcp-` + sha256 тела (с **содержимым** файлов, не путями) + `data_class`/`priority`/`policy`. Повтор того же вызова присоединяется к задаче (так `task_id` восстанавливается после обрыва вызова); изменённый файл по тому же пути — новая задача; `fresh=true` — новый запуск (случайный nonce: повтор вызова с `fresh=true` **не** присоединяется к прошлой задаче, её `task_id` — только из прошлого ответа). После `retryable`-провала тот же ключ запускает новую задачу, после неповторяемого возвращает ту же ошибку (§4).
 
-### Регистрация (пример; файлы `.mcp.json` правит владелец проекта)
+### Регистрация (S12 T-371; копию `.mcp.json` координатор сохраняет в `.bak-<ts>`)
 ```json
 {
   "mcpServers": {
@@ -130,6 +149,7 @@
       "type": "stdio",
       "command": "/home/user/.local/bin/uv",
       "args": ["--directory", "/var/www/llmhub", "run", "--quiet", "--extra", "mcp", "python", "-m", "llmhub.mcp_server"],
+      "timeout": 360000,
       "env": {
         "LLMHUB_URL": "http://10.8.0.1:8095",
         "LLMHUB_KEY_FILE": "/home/user/.config/llmhub/agents.key",
@@ -142,7 +162,7 @@
 ```
 gameDev — то же с `"LLMHUB_MCP_ROOTS": "/var/www/gameDev:/tmp/claude-1000"`. После установки пакета доступна и команда `llmhub-mcp` (то же, что `python -m llmhub.mcp_server`).
 - **Ключ — только файлом** (`LLMHUB_KEY_FILE`: обычный файл, не симлинк, владелец — текущий пользователь, права `600`; первая непустая строка). Переменную с самим ключом в `env` файла `.mcp.json` не писать никогда: такие файлы попадают в git. Ключ нигде не выводится (ни в ответах, ни в stderr).
-- На сервере llmhub для агентов — отдельный клиент `agents` с `cloud_allowed=false`, `max_priority=normal` (выдаёт T-371, `python -m llmhub keys new --name agents`).
+- На сервере llmhub для агентов заведён отдельный клиент `agents`: `cloud_allowed=false`, `max_priority=normal`, `default_priority: low`. Ключ создаётся на шаге S4 (`keys new --out`) и попадает в `/home/user/.config/llmhub/agents.key` (0600, на экран не выводится). `LLMHUB_MCP_ALLOW_CLOUD` не ставится.
 - `data_class`: всегда шлётся заголовок `X-LLMHub-Data-Class: private`; `cloud_allowed` — только параметром вызова **и** при `LLMHUB_MCP_ALLOW_CLOUD=1` в `env` MCP-сервера (без решения заказчика не ставить); сервер llmhub всё равно сужает по клиенту.
 - Пути — только абсолютные (cwd MCP-сервера — `/var/www/llmhub`, не проект агента), только внутри `LLMHUB_MCP_ROOTS` (+ scratch); путь нормализуется, `realpath` проверяется повторно (симлинки наружу запрещены), `..` запрещено, любой файл или каталог с точкой ниже корня (`.env`, `.git`, `.ssh`, `.claude`, …) недоступен; входы — обычные UTF-8 файлы; запись атомарная (`0600`), существующий файл — только с `overwrite=true`. Корень `/` и корни на `/proc`, `/sys`, `/dev` пропускаются (warning в stderr), пути в этих ФС отклоняются всегда (`/proc/self/environ` содержит окружение процесса). Scratch-каталог — свой (владелец — текущий пользователь, иначе `scratch_unavailable`), права приводятся к `0700`; при старте из него удаляются свои временные `.llmhub-mcp-*.tmp` старше часа (остаются после SIGKILL во время записи). Известное ограничение: жёсткая ссылка внутри корня на свой файл снаружи читается (`realpath` её не видит; создать её можно только на файл, который агент и так читает).
 - Разрешения инструментов (`mcp__llmhub__llmhub_ask` и др. в `settings.json`) — на усмотрение владельца проекта.

@@ -1,0 +1,46 @@
+# llmhub-api: controller + local worker + gateway on @API_HOST@:@API_PORT@ (VPN only).
+# One argument per line; @X@ are filled by llmhub-deploy.sh; `@include _common.args`.
+--name
+llmhub-api
+@include _common.args
+--user
+64100:64100
+--group-add
+@LLAMA_GID@
+--group-add
+64102
+--memory
+1g
+--init
+--health-cmd
+python -m llmhub healthcheck --url http://@API_HOST@:@API_PORT@/healthz
+-e
+LLMHUB_LABEL_SECRET_FILE=/run/llmhub-secrets/label
+-e
+LLMHUB_INSTANCE_SECRET_FILE=/run/llmhub-secrets/instance
+-e
+LLMHUB_WEIGHTS_SECRET_FILE=/run/llmhub-secrets/weights
+-v
+/etc/llmhub/config.yaml:/etc/llmhub/config.yaml:ro
+-v
+/etc/llmhub/secrets/label:/run/llmhub-secrets/label:ro
+-v
+/etc/llmhub/secrets/instance:/run/llmhub-secrets/instance:ro
+-v
+/etc/llmhub/secrets/weights:/run/llmhub-secrets/weights:ro
+-v
+/etc/llmhub/secrets/providers:/run/llmhub-secrets/providers:ro
+-v
+/etc/llama/api-key:/run/llama/api-key:ro
+-v
+/etc/llmhub/weights-pub:/etc/llmhub/weights-pub:ro
+-v
+/var/lib/llmhub:/var/lib/llmhub
+@IMAGE@
+python
+-m
+llmhub
+serve
+--config
+/etc/llmhub/config.yaml
+--no-docs

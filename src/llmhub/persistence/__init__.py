@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from llmhub.persistence.backup import (
         backup,
+        backup_state_db,
         maybe_daily_backup,
     )
     from llmhub.persistence.db import (
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
     )
     from llmhub.persistence.integrity import (
         OpenResult,
+        StateDbBusy,
         open_state_db,
     )
     from llmhub.persistence.state import (
@@ -35,6 +37,8 @@ _EXPORTS: dict[str, str] = {
     "tx": "db",
     "OpenResult": "integrity",
     "open_state_db": "integrity",
+    "StateDbBusy": "integrity",
+    "backup_state_db": "backup",
     "backup": "backup",
     "maybe_daily_backup": "backup",
     "ReconcileRequired": "state",
@@ -43,8 +47,10 @@ __all__ = [
     "Busy",
     "OpenResult",
     "ReconcileRequired",
+    "StateDbBusy",
     "assert_not_in_tx",
     "backup",
+    "backup_state_db",
     "connect",
     "maybe_daily_backup",
     "migrate",

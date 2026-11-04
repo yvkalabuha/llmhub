@@ -4,7 +4,7 @@
 
 | ID | Задача | Тип | Статус | Зависит |
 |---|---|---|---|---|
-| T-371 | 3d: деплой systemd на 65.109.95.35, e2e на Mock, integration.md | impl | todo | T-369, T-370 |
+| T-371 | 3d: деплой в Docker на 65.109.95.35, e2e на Mock, integration.md | impl | review (код; шаги сервера S0–S14 — координатор) | T-369, T-370 |
 | T-372 | Этап 4: spike dstack + тест RunPod ≤ $5 | test | blocked | T-371 |
 
 ## Входящие
@@ -18,3 +18,5 @@
 - 2026-11-04 от reviewer T-369: сбой `list_offers` (5xx) метится `gpu_unavailable` вместо `provider_api_error` — в `provisioner.py` записывать `last_error` через `normalize_error` и передавать его в `_reason_of` при истечении `offer_wait_s` (T-372).
 - 2026-11-04 от reviewer T-369 (SEC-L2): `/docs`, `/redoc`, `/openapi.json` доступны без ключа — флаг `serve` для их отключения (`docs_url=None` и т. д.) (T-371).
 - 2026-11-04 от reviewer T-369 (SEC-L4): лимит одновременных запросов/задач на клиента (429); `waiter._tick` — `IN (...)` пачками по 500 (> 32766 переменных ломает тик) (T-371).
+- 2026-11-04 от ворот T-371 (advocate F6/OPEN-3): `waiter._tick` — `IN (...)` пачками по 500 (> 32766 переменных ломает тик) (T-372).
+- 2026-11-04 от ворот T-371 (advocate F6/OPEN-3, R3-3 T-370): нижняя граница `retry.host_blacklist_s` (`ge=3600`) (T-372).

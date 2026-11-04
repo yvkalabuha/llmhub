@@ -1,0 +1,25 @@
+# /etc/logrotate.d/llmhub-acct (T-371 §2.7, critic F12). Accounting data of the weights
+# validator, not a journal (container logs go to journald).
+# - no copytruncate (SEC-11): the validator reads by offset of the same inode;
+# - the directory /var/log/llmhub is root:llmhub 0750 (not writable by the nginx user), so
+#   logrotate runs as root without `su`; new files are created as the owning user
+#   (llmhub-wnginx, uid 64101) with group llmhub (64100, the validator reads via the group);
+#   with `su` the postrotate script would run as that user and could not reach docker;
+# - postrotate never fails: USR1 (reopen) only when the container is running.
+/var/log/llmhub/weights-acct.log /var/log/llmhub/weights-access.log /var/log/llmhub/weights-error.log {
+    daily
+    maxsize 50M
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0640 llmhub-wnginx llmhub
+    sharedscripts
+    postrotate
+        if [ "$(docker inspect -f '{{.State.Running}}' llmhub-weights-nginx 2>/dev/null)" = "true" ]; then
+            docker kill -s USR1 llmhub-weights-nginx >/dev/null 2>&1 || true
+        fi
+        exit 0
+    endscript
+}

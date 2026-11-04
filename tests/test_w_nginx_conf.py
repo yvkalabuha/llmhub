@@ -35,7 +35,8 @@ from llmhub.weights.tokens import issue_token
 
 ROOT = Path(__file__).resolve().parent.parent
 CONF = (ROOT / "deploy" / "nginx-weights.conf").read_text(encoding="utf-8")
-IMAGE = "nginx:1.25-alpine"
+# the image pinned for the server (deploy/docker/images.env), never pulled by tests
+IMAGE = "nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10"
 SECRET = b"n" * 32
 
 
@@ -148,7 +149,7 @@ def test_log_formats_have_no_secrets() -> None:
 
 def test_required_directives() -> None:
     for need in (
-        "limit_conn w_all __SEGMENTS__;",
+        "limit_conn w_all __MAX_DL__;",
         "limit_conn w_op __SEGMENTS__;",
         "limit_rate __RATE__;",
         "auth_request /_auth;",
@@ -164,6 +165,9 @@ def test_required_directives() -> None:
         "worker_processes 1;",
         "worker_priority 10;",
         "pid __PID__;",
+        "directio 4m;",
+        "output_buffers 2 1m;",
+        "sendfile on;",
     ):
         assert need in CODE, need
 
@@ -236,12 +240,14 @@ def _free_port() -> int:
 
 
 def _render(
-    public_ip: str, port: int, *, rate: str = "80m", segments: int = 1, auth: str = "127.0.0.1:8096"
+    public_ip: str, port: int, *, rate: str = "80m", segments: int = 1,
+    auth: str = "127.0.0.1:8096", max_dl: int | None = None,
 ) -> str:
     c = CONF
     for k, v in {
         "__PUBLIC_IP__": public_ip, "__PORT__": str(port), "__RATE__": rate,
-        "__SEGMENTS__": str(segments), "__AUTH__": auth, "__MODELS__": "/models",
+        "__SEGMENTS__": str(segments), "__MAX_DL__": str(max_dl or segments),
+        "__AUTH__": auth, "__MODELS__": "/models",
         "__LOGDIR__": "/work/log", "__CERT__": "/work/cert/weights-cert.pem",
         "__KEY__": "/work/cert/weights-key.pem", "__PID__": "/work/nginx.pid",
         "__TMP__": "/work/tmp",
@@ -367,7 +373,7 @@ def rig(tmp_path: Path) -> Iterator[Callable[..., Rig]]:
         (w / "weights.conf").write_text(
             _render("127.0.0.1", r.port, rate=rate, segments=segments, auth=f"127.0.0.1:{aport}")
         )
-        name = f"w-test-{uuid.uuid4().hex[:8]}"
+        name = f"llmhub-test-w-{uuid.uuid4().hex[:8]}"
         subprocess.run(
             _run_nginx(["nginx", "-c", "/work/weights.conf", "-g", "daemon off;"], w, models,
                        ["-d", "--name", name, "--network", "host"]),

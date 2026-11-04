@@ -1,0 +1,29 @@
+# llmhub-reaper: independent watchdog; only the label secret (no instance/weights secret).
+--name
+llmhub-reaper
+@include _common.args
+--user
+64100:64100
+--memory
+1g
+--init
+--health-cmd
+python -m llmhub.reaper healthcheck --heartbeat /var/lib/llmhub/reaper.hb --max-age 90
+-e
+LLMHUB_LABEL_SECRET_FILE=/run/llmhub-secrets/label
+-v
+/etc/llmhub/config.yaml:/etc/llmhub/config.yaml:ro
+-v
+/etc/llmhub/secrets/label:/run/llmhub-secrets/label:ro
+-v
+/var/lib/llmhub:/var/lib/llmhub
+@IMAGE@
+python
+-m
+llmhub.reaper
+--config
+/etc/llmhub/config.yaml
+--loop
+15
+--heartbeat
+/var/lib/llmhub/reaper.hb

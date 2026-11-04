@@ -1,23 +1,56 @@
 """HTTP client of one local llama-server (OpenAI-compatible, non-streaming; T-369 stream H).
 
-The API key is read by the caller (`api_key_from_env`), lives in the Authorization header only
-and never in `repr`, log lines or exception text. Timeouts run on the injected `Clock`, so they
-are deterministic on a `FakeClock`.
+The API key comes from the caller (`api_key_from_env`) or, T-371 F1, lazily from a
+`KeySource` (`file_key_source(api_key_file)`): read on the first request, and again after a
+401 (key rotated) at most once per `KEY_RELOAD_MIN_S`. It lives in the Authorization header
+only and never in `repr`, log lines or exception text. Timeouts run on the injected `Clock`,
+so they are deterministic on a `FakeClock`.
+
+Background probes are GET only (F8 / Q3): `/slots`, `/health` or `/v1/models`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
-from collections.abc import Awaitable, Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from llmhub.clock import Clock
+
+log = logging.getLogger("llmhub.local")
 from llmhub.configuration.api_models import LocalBackendConfig
+from llmhub.configuration.loader import ConfigError, read_secret_file
+
+KEY_RELOAD_MIN_S = 30.0
+
+
+class KeyUnavailable(Exception):
+    """The key file cannot be read (missing, bad mode, empty); never carries the content."""
+
+
+KeySource = Callable[[], str | None]
+
+
+def file_key_source(path: Path) -> KeySource:
+    """Reads the first line of `path` on each call (regular file, no access for others)."""
+
+    def read() -> str:
+        try:
+            data = read_secret_file(Path(path)).decode()
+        except (ConfigError, UnicodeDecodeError) as exc:
+            raise KeyUnavailable(f"llama-server key unreadable at {path} ({type(exc).__name__})") from None
+        if not data:
+            raise KeyUnavailable(f"llama-server key file {path} is empty")
+        return data
+
+    return read
 
 
 class LocalError(Exception):
@@ -90,10 +123,13 @@ class LocalBackendClient:
         http: httpx.AsyncClient | None = None,
         clock: Clock,
         probe_timeout_s: float = 3.0,
+        key_source: KeySource | None = None,
     ) -> None:
         self.name = name
         self.cfg = cfg
         self._api_key = api_key
+        self._key_source = key_source
+        self._key_read_at: float | None = None  # clock time of the last key_source call
         self._clock = clock
         self._probe_timeout_s = probe_timeout_s
         self._owns_http = http is None
@@ -109,20 +145,40 @@ class LocalBackendClient:
         if self._owns_http:
             await self._http.aclose()
 
-    def _headers(self) -> dict[str, str]:
+    def _may_reload(self) -> bool:
+        if self._key_source is None:
+            return False
+        last = self._key_read_at
+        return last is None or self._clock.now() - last >= KEY_RELOAD_MIN_S
+
+    def _reload_key(self) -> bool:
+        """Call the key source (rate-limited by the caller); False when it failed."""
+        assert self._key_source is not None
+        self._key_read_at = self._clock.now()
+        try:
+            self._api_key = self._key_source()
+        except KeyUnavailable as exc:
+            self._api_key = None
+            log.warning("local backend %s: %s", self.name, exc)
+            return False
+        return True
+
+    def _headers(self, *, required: bool = False) -> dict[str, str]:
+        """Authorization header. With a key source the key is read on first use; `required`
+        (chat) turns a missing key into `local_unavailable` instead of a keyless call."""
+        if self._key_source is not None and self._api_key is None:
+            if self._may_reload():
+                self._reload_key()
+            if self._api_key is None and required:
+                raise LocalError("local_unavailable", f"{self.name}: api key unavailable")
         return {"Authorization": f"Bearer {self._api_key}"} if self._api_key else {}
 
-    async def chat(self, request: dict[str, Any], *, timeout_s: float) -> LocalChatResult:
-        payload = dict(request)
-        payload.pop("stream_options", None)
-        payload["stream"] = False
-        payload["model"] = self.cfg.model
-        t0 = self._clock.now()
+    async def _post_chat(self, payload: dict[str, Any], timeout_s: float) -> httpx.Response:
         try:
-            resp = await bounded(
+            return await bounded(
                 self._clock,
                 self._http.post(self._url + "/chat/completions", json=payload,
-                                headers=self._headers()),
+                                headers=self._headers(required=True)),
                 timeout_s,
             )  # fmt: skip
         except (TimeoutError, httpx.TimeoutException):
@@ -131,6 +187,20 @@ class LocalBackendClient:
             ) from None
         except httpx.HTTPError as exc:
             raise LocalError("local_unavailable", f"{self.name}: {type(exc).__name__}") from None
+
+    async def chat(self, request: dict[str, Any], *, timeout_s: float) -> LocalChatResult:
+        payload = dict(request)
+        payload.pop("stream_options", None)
+        payload["stream"] = False
+        payload["model"] = self.cfg.model
+        t0 = self._clock.now()
+        resp = await self._post_chat(payload, timeout_s)
+        if resp.status_code == 401 and self._may_reload() and self._reload_key():
+            # F1: the llama key was rotated - one retry with the re-read key
+            left = timeout_s - (self._clock.now() - t0)
+            if left <= 0:
+                raise LocalError("upstream_timeout", f"{self.name}: no answer in {timeout_s:g}s")
+            resp = await self._post_chat(payload, left)
         latency = max(0.0, self._clock.now() - t0)
         if resp.status_code == 400:
             text = resp.text.lower()
@@ -170,6 +240,12 @@ class LocalBackendClient:
             return None
 
     async def probe(self) -> ProbeResult:
+        """One GET: never a completion or any other method (F8)."""
+        if self.probe_mode == "models":
+            resp = await self._get("/v1/models")
+            if resp is None:
+                return ProbeResult(False, 0, None, None)
+            return ProbeResult(resp.status_code == 200, 0, None, resp.status_code)
         if self.probe_mode == "slots":
             resp = await self._get("/slots")
             if resp is None:

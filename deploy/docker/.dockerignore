@@ -1,0 +1,7 @@
+# build context = the staging dir made by build.sh (wheelhouse/ + deploy/); defence in depth
+**/.env
+**/*.key
+**/secrets
+**/*.db
+**/*.db-*
+**/__pycache__

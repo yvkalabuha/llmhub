@@ -1,0 +1,34 @@
+# llmhub-weights-auth: token validator on 127.0.0.1:8096 (weights secret only; reads state.db
+# and the accounting log read-only via group 64100).
+--name
+llmhub-weights-auth
+@include _common.args
+--user
+64102:64102
+--group-add
+64100
+--memory
+1g
+--init
+--health-cmd
+python -m llmhub healthcheck --url http://127.0.0.1:8096/metrics
+-e
+LLMHUB_WEIGHTS_SECRET_FILE=/run/llmhub-secrets/weights
+-v
+/etc/llmhub/config.yaml:/etc/llmhub/config.yaml:ro
+-v
+/etc/llmhub/secrets/weights:/run/llmhub-secrets/weights:ro
+-v
+/etc/llmhub/weights-pub:/etc/llmhub/weights-pub:ro
+-v
+/var/lib/llmhub:/var/lib/llmhub:ro
+-v
+/var/lib/llmhub-weights-auth:/var/lib/llmhub-weights-auth
+-v
+/var/log/llmhub:/var/log/llmhub:ro
+@IMAGE@
+python
+-m
+llmhub.weights.auth_app
+--config
+/etc/llmhub/config.yaml

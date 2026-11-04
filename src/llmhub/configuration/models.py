@@ -151,4 +151,10 @@ class Config(ApiSection):
                     if f.id not in src.paths:
                         raise ValueError(f"weights.sources.{src.name}: no path for file {f.id!r}")
         check_api_section(self, self.pools)
+        if self.providers.enabled != ["mock"]:
+            for cname, c in self.clients.items():
+                if c.mock_only:
+                    raise ValueError(
+                        f"clients.{cname}.mock_only: requires providers.enabled == ['mock']"
+                    )
         return self

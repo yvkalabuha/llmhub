@@ -117,6 +117,9 @@ class WeightsConfig(_Model):
     volume_cap_factor: float = Field(default=1.2, ge=1.0)  # served bytes per op <= f * sum(size)
     auth_state_dir: Path = Path("/var/lib/llmhub-weights-auth")
     acct_log: Path = Path("/var/log/llmhub/weights-acct.log")
+    # T-371 F6: the validator answers 503 low_memory below this host MemAvailable (0 = off),
+    # so a pod download never squeezes the page cache of the local llama models
+    min_mem_available_mib: int = Field(default=8192, ge=0)
 
     @field_validator("auth_listen")
     @classmethod

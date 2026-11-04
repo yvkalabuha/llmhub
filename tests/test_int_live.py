@@ -181,7 +181,7 @@ def _serve_config(tmp: Path, port: int, llama_port: int, clients: dict[str, Any]
                                    "model": "local-model", "ctx_tokens": 32768, "pp_tps": 50,
                                    "tg_tps": 5}},
         "models": {"big": {"local": "cpu"}},
-        "local": {"probe_interval_s": 1, "poll_s": 0.2},
+        "local": {"probe_interval_s": 10, "poll_s": 0.2},
         "clients": clients,
         "api": {"host": "127.0.0.1", "port": port, "admin_key_sha256": hash_key(ADMIN_KEY),
                 "wait_poll_s": 0.1},

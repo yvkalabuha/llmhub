@@ -6,11 +6,13 @@ flat names `cfg.local_backends`, `cfg.models`, `cfg.router`, ... hold. No model 
 
 from __future__ import annotations
 
+import ipaddress
 import re
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from llmhub.task_queue.models import Priority
 
@@ -30,7 +32,17 @@ class LocalBackendConfig(_Model):
     tg_tps: float = Field(gt=0)
     timeout_s: float = 3600
     api_key_env: str | None = None  # env var holding the llama-server key; never the value
-    probe: Literal["slots", "health"] = "slots"
+    # T-371 F1: file with the key (ro mount); read lazily by the API process on the first
+    # request and again after a 401 - `load_config` never opens it (the reaper has no mount)
+    api_key_file: Path | None = None
+    # background probe, always a GET (T-371 F8 / Q3): /slots, /health or /v1/models
+    probe: Literal["slots", "health", "models"] = "slots"
+
+    @model_validator(mode="after")
+    def _one_key_source(self) -> LocalBackendConfig:
+        if self.api_key_env is not None and self.api_key_file is not None:
+            raise ValueError("api_key_env and api_key_file are mutually exclusive")
+        return self
 
 
 class ModelAliasConfig(_Model):
@@ -56,7 +68,7 @@ class RouterConfig(_Model):
 
 class LocalConfig(_Model):
     concurrency: int = Field(default=1, ge=1, le=1)  # one CPU server (ADR-0138 item 2)
-    probe_interval_s: float = 30
+    probe_interval_s: float = Field(default=30, ge=10)  # F8: never hammer llama-server
     probe_timeout_s: float = 3
     ewma_alpha: float = Field(default=0.3, gt=0, le=1)
     external_busy_penalty_s: float = 120
@@ -72,10 +84,17 @@ class ClientConfig(_Model):
     default_priority: Priority = Priority.NORMAL
     default_policy: Policy = "BALANCED"
     cloud_allowed: bool = False  # data_class defaults to private
+    # SEC-L4: queued + running jobs of this client; one more submit -> 429 rate_limited
+    max_active_jobs: int = Field(default=32, ge=1, le=10000)
+    # T-371 F7: the client exists only for e2e on Mock; Config rejects it with real providers
+    mock_only: bool = False
+
+
+_WILDCARD_HOSTS = frozenset({"*", "0", "0.0.0.0", "::", "[::]"})
 
 
 class ApiConfig(_Model):
-    host: str = "127.0.0.1"
+    host: str = "127.0.0.1"  # a specific address (10.8.0.1 on the server), never a wildcard
     port: int = 8095
     admin_key_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     sync_wait_s: float = Field(default=480, gt=0, le=480)
@@ -84,6 +103,19 @@ class ApiConfig(_Model):
     max_body_bytes: int = 4_000_000
     retry_after_min_s: int = 5
     retry_after_max_s: int = 900
+    docs: bool = True  # SEC-L2: False -> no /docs, /redoc, /openapi.json (server config)
+
+    @field_validator("host")
+    @classmethod
+    def _specific_host(cls, v: str) -> str:
+        h = v.strip()
+        try:
+            unspecified = ipaddress.ip_address(h.removeprefix("[").removesuffix("]")).is_unspecified
+        except ValueError:
+            unspecified = False  # a host name: resolved by uvicorn
+        if not h or h in _WILDCARD_HOSTS or unspecified:
+            raise ValueError("api.host must be a specific address, not a wildcard")
+        return h
 
 
 class ApiSection(_Model):

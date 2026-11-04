@@ -1,7 +1,8 @@
 """`auth_request` validator for the weights nginx (T-370 stream D, plan 2a).
 
 GET /weights/auth  -> 204 | 401 (no credentials) | 403 | 503 (controller DB or validator state
-                      busy/broken: fail closed, the pod fails over to HF)
+                      busy/broken: fail closed, the pod fails over to HF; T-371 F6: host
+                      MemAvailable below `weights.min_mem_available_mib` -> `low_memory`)
 GET /metrics       -> Prometheus text with refusal counters, 127.0.0.1 only.
 The controller DB is opened read-only (mode=ro); the validator never writes to it. Logs carry
 op_id and verdict only - never the token, the URI query or the client address.
@@ -50,6 +51,23 @@ def requested_bytes(range_header: str | None, size: int) -> int:
     return max(0, end - start + 1)
 
 
+MEMINFO = Path("/proc/meminfo")
+LOW_MEMORY = "low_memory"
+
+
+def mem_available_mib(path: Path = MEMINFO) -> int | None:
+    """`MemAvailable` in MiB (in a container /proc/meminfo shows the host), None if unknown."""
+    try:
+        with open(path, encoding="ascii") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    parts = line.split()
+                    return int(parts[1]) // 1024 if len(parts) >= 2 and parts[1].isdigit() else None
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def _open_ro(db_path: Path) -> sqlite3.Connection:
     conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.3)
     conn.execute("PRAGMA busy_timeout=300")
@@ -65,9 +83,24 @@ def build_auth_app(
     acct: AcctState,
     sizes: Sizes,
     volume_cap_factor: float = 1.2,
+    min_mem_available_mib: int = 0,
+    meminfo: Path = MEMINFO,
 ) -> Starlette:
     counters: Counter[str] = Counter()
     lock = threading.Lock()
+    warned: list[bool] = []
+
+    def low_memory() -> bool:
+        """F6: a download must not push the local llama models out of the page cache."""
+        if min_mem_available_mib <= 0:
+            return False
+        avail = mem_available_mib(meminfo)
+        if avail is None:
+            if not warned:
+                warned.append(True)
+                log.warning("MemAvailable unknown (%s); memory threshold not applied", meminfo)
+            return False
+        return avail < min_mem_available_mib
 
     def state_of(op_id: str) -> str | None:
         conn = _open_ro(db_path)
@@ -96,6 +129,11 @@ def build_auth_app(
             return finish(verdict, op, 401)
         if verdict is not Verdict.OK or op is None:
             return finish(verdict, op, 403)
+        if low_memory():
+            with lock:
+                counters[LOW_MEMORY] += 1
+            log.info("op=%s verdict=%s", op, LOW_MEMORY)
+            return Response(status_code=503)
         parts = split_uri(uri)
         size, total = sizes.get(parts[1], (0, 0)) if parts else (0, 0)
         try:
@@ -178,6 +216,7 @@ def main(
         acct=AcctState(cfg.weights.auth_state_dir, cfg.weights.acct_log),
         sizes=sizes,
         volume_cap_factor=cfg.weights.volume_cap_factor,
+        min_mem_available_mib=cfg.weights.min_mem_available_mib,
     )
     if run is None:
         import uvicorn

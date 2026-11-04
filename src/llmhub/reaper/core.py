@@ -14,6 +14,11 @@ Every step is isolated (L1): an exception in one is recorded (`reaper_step_faile
 next steps still run. A KILL file / hard cap that persists runs the 45 s `kill_all` once per
 process, then one non-blocking `kill_pass` per run (L2).
 Foreign resources (no valid HMAC label) are never touched.
+
+T-371 (F4/F7): Docker does not restart an *unhealthy* container, so the process guards itself:
+`Watchdog` (a daemon thread) calls `os._exit(70)` when no pass finished for
+`stall_seconds(loop)`; every finished pass `beat()`s and rewrites the heartbeat file that the
+container healthcheck (`python -m llmhub.reaper healthcheck`) reads.
 """
 
 from __future__ import annotations
@@ -22,6 +27,8 @@ import asyncio
 import os
 import sqlite3
 import sys
+import threading
+import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,6 +63,90 @@ from llmhub.provider_adapters.guarded import CircuitBreaker, GuardedAdapter
 from llmhub.provider_adapters.labels import verify_label
 
 Actor = Literal["controller", "reaper", "admin"]
+
+STALL_FACTOR = 3
+WATCHDOG_EXIT_CODE = 70  # EX_SOFTWARE; Docker `--restart unless-stopped` starts a new one
+
+
+def stall_seconds(loop_s: float, *, kill_deadline_s: float = 45.0) -> float:
+    """No finished pass for this long = hung. At least STALL_FACTOR loops, and long enough
+    for one blocking `kill_all` (kill_deadline_s) plus two passes, so a kill is never cut."""
+    return max(STALL_FACTOR * loop_s, kill_deadline_s + 2 * loop_s)
+
+
+def write_heartbeat(path: Path) -> None:
+    """Atomic rewrite (tmp + os.replace); the mtime is the heartbeat."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(f"{time.time():.3f}\n", encoding="ascii")
+    os.replace(tmp, path)
+
+
+def heartbeat_age(path: Path, now: float) -> float | None:
+    try:
+        return max(0.0, now - os.stat(path).st_mtime)
+    except OSError:
+        return None
+
+
+class Watchdog:
+    """Dead-man switch of the reaper process: `beat()` after every pass; a daemon thread
+    exits the process with code 70 when the last beat is older than `stall_s` (a hung
+    adapter call, a stuck DB lock). It fires once."""
+
+    def __init__(
+        self,
+        stall_s: float,
+        *,
+        exit_fn: Callable[[int], object] = os._exit,
+        monotonic: Callable[[], float] = time.monotonic,
+        heartbeat: Path | None = None,
+        check_every_s: float = 1.0,
+    ) -> None:
+        self.stall_s = stall_s
+        self._exit = exit_fn
+        self._mono = monotonic
+        self.heartbeat = heartbeat
+        self._every = check_every_s
+        self._last = monotonic()
+        self._fired = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    def beat(self) -> None:
+        self._last = self._mono()
+        if self.heartbeat is not None:
+            try:
+                write_heartbeat(self.heartbeat)
+            except OSError as exc:  # the healthcheck will report it; the reaper keeps going
+                print(f"reaper: heartbeat not written ({type(exc).__name__})", file=sys.stderr)
+
+    def check(self) -> bool:
+        if self._fired:
+            return True
+        idle = self._mono() - self._last
+        if idle <= self.stall_s:
+            return False
+        self._fired = True
+        print(f"reaper: no finished pass for {idle:.0f}s > {self.stall_s:.0f}s; exit "
+              f"{WATCHDOG_EXIT_CODE}", file=sys.stderr, flush=True)  # fmt: skip
+        self._exit(WATCHDOG_EXIT_CODE)
+        return True
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._every):
+            if self.check():
+                return
+
+    def start(self) -> None:
+        self._last = self._mono()
+        self._thread = threading.Thread(target=self._run, name="reaper-watchdog", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(5)
 
 UNKNOWN_DESTROY_AFTER_S = 1800.0  # Q1: auto-destroy 30 min after detection
 UNKNOWN_RECONCILE_S = 900.0  # Q1: billing reconcile every 15 min while it lives
@@ -507,11 +598,18 @@ class Reaper:
         )  # fmt: skip
         return True
 
-    async def run_loop(self, interval_s: float, stop: asyncio.Event | None = None) -> None:
+    async def run_loop(
+        self,
+        interval_s: float,
+        stop: asyncio.Event | None = None,
+        *,
+        on_pass: Callable[[], None] | None = None,
+    ) -> None:
         """`--loop`: one pass every `interval_s` (<= 15 s, so a KILL is honoured in 60 s).
 
         A damaged DB (F-R2-4) switches the pass to `emergency_pass`; with `db_path` the
-        connection is reopened when state.db was replaced (quarantine) or after an error."""
+        connection is reopened when state.db was replaced (quarantine) or after an error.
+        `on_pass` runs after every finished pass, failed or not (watchdog beat, T-371)."""
         while stop is None or not stop.is_set():
             started = self.clock.now()
             try:
@@ -531,4 +629,6 @@ class Reaper:
                     except Exception as inner:  # noqa: BLE001 - DB busy or damaged
                         if is_corrupt(inner):
                             await self.emergency_pass(inner)
+            if on_pass is not None:
+                on_pass()
             await self.clock.sleep_until(started + interval_s)

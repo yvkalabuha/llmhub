@@ -38,6 +38,7 @@ class ErrorCode(StrEnum):
     LOCAL_UNAVAILABLE = "local_unavailable"
     CLOUD_UNAVAILABLE = "cloud_unavailable"
     BUSY = "busy"
+    RATE_LIMITED = "rate_limited"
     CONFLICT = "conflict"
     INTERNAL_ERROR = "internal_error"
 
@@ -61,6 +62,7 @@ SPEC: dict[ErrorCode, tuple[int, bool, str]] = {
     ErrorCode.LOCAL_UNAVAILABLE: (503, True, "server_error"),
     ErrorCode.CONTROLLER_HALTED: (503, False, "server_error"),
     ErrorCode.BUSY: (503, True, "server_error"),
+    ErrorCode.RATE_LIMITED: (429, True, "rate_limit_error"),
     ErrorCode.DEADLINE_EXCEEDED: (504, False, "server_error"),
     ErrorCode.UPSTREAM_TIMEOUT: (504, True, "server_error"),
     ErrorCode.CANCELLED: (409, False, "invalid_request_error"),
