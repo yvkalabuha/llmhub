@@ -1,7 +1,12 @@
 """In-process fake of the RunPod API (T-372 A5): REST v1 + GraphQL on `httpx.MockTransport`.
 
+Shapes follow the real openapi (`tests/fixtures/runpod/openapi.json`, R2-5): a pod has no
+`createdAt`; `desiredStatus` is RUNNING / EXITED / TERMINATED only (RUNNING right after POST);
+POST /pods answers 201, DELETE /pods/{id} 204; a deleted pod answers DELETE with
+`gone_delete_status` (404 or the documented 400) and GET with 404.
 A small state machine on an injected clock:
-- pods: created RUNNING (or `boot_s` in CREATED first), `cost_per_hr` = GPU price + disk;
+- pods: desiredStatus RUNNING at once; `lastStartedAt` appears after `boot_s` (image pull);
+  `cost_per_hr` = GPU price + disk (`cost_as_string`: the openapi example form "0.74");
 - `visible_after_s`: a new pod is missing from `GET /pods` and `GET /pods/{id}` this long;
 - `destroy_lag_s`: a deleted pod stays listed as EXITED this long, then 404;
 - foreign pods, network volumes and templates can be added;
@@ -81,6 +86,10 @@ class FakeRunpod:
         cost_override: float | None = None,
         name_override: str | None = None,
         paged: bool = False,
+        cost_as_string: bool = False,
+        gone_delete_status: int = 404,
+        create_answer_extra: dict[str, Any] | None = None,
+        has_spend_limit: bool = True,
     ) -> None:
         self.clock = clock
         self.price = price
@@ -93,6 +102,10 @@ class FakeRunpod:
         self.cost_override = cost_override
         self.name_override = name_override
         self.paged = paged
+        self.cost_as_string = cost_as_string
+        self.gone_delete_status = gone_delete_status
+        self.create_answer_extra = dict(create_answer_extra or {})  # fields of the new pod
+        self.has_spend_limit = has_spend_limit  # GraphQL `spendLimit` is unverified (R2-10)
         self.pods: dict[str, FakePod] = {}
         self.volumes: list[dict[str, Any]] = []
         self.templates: list[dict[str, Any]] = []
@@ -144,16 +157,13 @@ class FakeRunpod:
     # --- state -------------------------------------------------------------------
     def _status(self, p: FakePod) -> str:
         forced = self.extra_pod_fields.get(p.id, {}).get("desiredStatus")
-        now = self.clock.now()
         if p.deleted_at is not None:
             return "EXITED"
         if forced:
             return str(forced)
         if p.exited:
             return "EXITED"
-        if now < p.created_at + self.boot_s:
-            return "CREATED"
-        return "RUNNING"
+        return "RUNNING"  # desired, not actual: RUNNING from the POST on (R2-6)
 
     def _visible(self, p: FakePod) -> bool:
         now = self.clock.now()
@@ -162,11 +172,18 @@ class FakeRunpod:
         return p.deleted_at is None or now < p.deleted_at + self.destroy_lag_s
 
     def _json(self, p: FakePod) -> dict[str, Any]:
+        cost: Any = str(p.cost) if self.cost_as_string else p.cost
         d: dict[str, Any] = {
-            "id": p.id, "name": p.name, "desiredStatus": self._status(p), "costPerHr": p.cost,
-            "machineId": p.machine_id, "image": p.image, "createdAt": _iso(p.created_at),
-            "env": dict(p.env), "gpuCount": 1, "interruptible": False, "ports": ["8080/http"],
+            "id": p.id, "name": p.name, "desiredStatus": self._status(p), "costPerHr": cost,
+            "adjustedCostPerHr": cost, "machineId": p.machine_id, "image": p.image,
+            "env": dict(p.env), "gpu": {"id": GPU_ID, "count": 1},
+            "interruptible": bool(p.body.get("interruptible", False)),
+            "ports": list(p.body.get("ports", ["8080/http"])),
+            "containerDiskInGb": p.body.get("containerDiskInGb", 20),
+            "volumeInGb": p.body.get("volumeInGb", 20), "lastStatusChange": "Rented by User",
         }  # fmt: skip
+        if self.clock.now() >= p.created_at + self.boot_s:
+            d["lastStartedAt"] = _iso(p.created_at + self.boot_s)
         for k, v in self.extra_pod_fields.get(p.id, {}).items():
             if k != "desiredStatus":
                 d[k] = v
@@ -233,20 +250,24 @@ class FakeRunpod:
                           dict(body.get("env", {})), f"mach-{self._n}", body,
                           visible_at=now + self.visible_after_s)  # fmt: skip
             self.pods[pid] = pod
-            return httpx.Response(200, json=self._json(pod))
+            if self.create_answer_extra:
+                self.extra_pod_fields.setdefault(pid, {}).update(self.create_answer_extra)
+            return httpx.Response(201, json=self._json(pod))
         mm = re.fullmatch(r"/pods/([^/]+)", path)
         if mm and m in ("GET", "DELETE"):
             pod = self.pods.get(mm.group(1))
             if pod is None or not self._visible(pod):
                 if m == "DELETE" and pod is not None and pod.deleted_at is None:
                     pod.deleted_at = self.clock.now()  # invisible yet, still deletable
-                    return httpx.Response(200, json={})
+                    return httpx.Response(204)
+                if m == "DELETE":
+                    return httpx.Response(self.gone_delete_status, json={"error": "pod not found"})
                 return httpx.Response(404, json={"error": "pod not found"})
             if m == "GET":
                 return httpx.Response(200, json=self._json(pod))
             if pod.deleted_at is None:
                 pod.deleted_at = self.clock.now()
-            return httpx.Response(200, content=b"")
+            return httpx.Response(204)
         if path == "/networkvolumes" and m == "GET":
             return httpx.Response(200, json=self.volumes)
         if path == "/templates" and m == "GET":
@@ -282,11 +303,15 @@ class FakeRunpod:
             fault = self._fault("POST", "graphql:myself")
             if fault is not None:
                 return httpx.Response(fault.status, text=fault.body)
+            if "spendLimit" in query and not self.has_spend_limit:
+                return httpx.Response(200, json={"errors": [{"message": 'Cannot query field'
+                                                             ' "spendLimit" on type "User".'}]})  # fmt: skip
             spend = sum(p.cost for p in self.pods.values() if self._status(p) == "RUNNING"
                         and p.deleted_at is None)  # fmt: skip
             return httpx.Response(200, json={"data": {"myself": {
                 "clientBalance": round(self.balance0 - self.billed(), 6),
-                "currentSpendPerHr": spend, "spendLimit": 80}}})  # fmt: skip
+                "currentSpendPerHr": spend,
+                **({"spendLimit": 80} if self.has_spend_limit else {})}}})  # fmt: skip
         if "gpuTypes" in query:
             fault = self._fault("POST", "graphql:gpuTypes")
             if fault is not None:

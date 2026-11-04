@@ -1,1 +1,1 @@
-{"_source": "synthetic", "id": "abc123xyz0003", "name": "llmhub-0123456789ab-01234567", "desiredStatus": "CREATED", "costPerHr": 0.225, "machineId": null, "imageName": "x@sha256:abababababababababababababababababababababababababababababababab", "createdAt": 1793786400}
+{"_source": "synthetic", "id": "abc123xyz0003", "name": "llmhub-0123456789ab-01234567", "desiredStatus": "RUNNING", "costPerHr": "0.225", "machineId": null, "imageName": "x@sha256:abababababababababababababababababababababababababababababababab", "lastStartedAt": 1793786400}

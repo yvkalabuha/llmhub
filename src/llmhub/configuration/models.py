@@ -129,7 +129,8 @@ class RunpodConfig(_Model):
 
     cloud_type: Literal["COMMUNITY"] = "COMMUNITY"
     gpu_type_ids: dict[str, str] = {"RTX3090": "NVIDIA GeForce RTX 3090"}  # pool gpu -> id
-    allowed_cuda_versions: list[str] = ["12.8", "12.9"]  # advocate F7b (image needs >= 12.8)
+    # advocate F7b: the image needs a driver >= 12.8; every such value of the real enum (R2-4)
+    allowed_cuda_versions: list[str] = ["12.8", "12.9", "13.0"]
     price_ceiling_usd_h: float = Field(default=0.50, gt=0, le=0.50)
     max_live_pods: int = Field(default=1, ge=1, le=4)
     list_staleness_s: float = Field(default=30, ge=0, le=600)

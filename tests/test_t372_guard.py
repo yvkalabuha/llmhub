@@ -46,11 +46,16 @@ class FakeOpener:
         self.spend = 0.0
         self.calls: list[tuple[str, str, str]] = []
         self.override: dict[str, Any] = {}
+        self.delete_status: dict[str, int] = {}  # pod id -> HTTP status of its DELETE
 
-    def pod(self, pid: str, name: str, *, cost: float = 0.225, age_s: float = 60,
+    def pod(self, pid: str, name: str, *, cost: Any = 0.225, age_s: float | None = 60,
             status: str = "RUNNING") -> None:  # fmt: skip
-        self.pods.append({"id": pid, "name": name, "desiredStatus": status, "costPerHr": cost,
-                          "createdAt": _iso(T - age_s), "env": {"SECRET": "x"}})  # fmt: skip
+        """Real `Pod` shape: no `createdAt`; `lastStartedAt` absent while the image is pulled."""
+        d = {"id": pid, "name": name, "desiredStatus": status, "costPerHr": cost,
+             "env": {"SECRET": "x"}}  # fmt: skip
+        if age_s is not None:
+            d["lastStartedAt"] = _iso(T - age_s)
+        self.pods.append(d)
 
     def open(self, req: Any, timeout: float = 0) -> _Resp:
         url, method = req.full_url, req.get_method()
@@ -64,10 +69,18 @@ class FakeOpener:
                 "clientBalance": self.balance, "currentSpendPerHr": self.spend}}}).encode())
         if method == "DELETE":
             pid = path.rsplit("/", 1)[1]
+            if pid in self.delete_status:
+                raise urllib.error.HTTPError(url, self.delete_status[pid], "x", {}, None)  # type: ignore[arg-type]
             if not any(p["id"] == pid for p in self.pods):
                 raise urllib.error.HTTPError(url, 404, "nf", {}, None)  # type: ignore[arg-type]
             self.pods = [p for p in self.pods if p["id"] != pid]
             return _Resp(b"")
+        if method == "GET" and path.startswith("/pods/"):
+            pid = path.rsplit("/", 1)[1]
+            pod = next((p for p in self.pods if p["id"] == pid), None)
+            if pod is None:
+                raise urllib.error.HTTPError(url, 404, "nf", {}, None)  # type: ignore[arg-type]
+            return _Resp(json.dumps(pod).encode())
         data = {"/pods": self.pods, "/networkvolumes": self.volumes, "/templates": self.templates,
                 "/containerregistryauth": [], "/endpoints": [],
                 "/billing/pods": [{"amount": 0.1, "time": _iso(T), "podId": "p1",
@@ -124,18 +137,18 @@ def test_snapshot_uses_bearer_and_keeps_no_env(env: tuple[FakeOpener, Path]) -> 
     op.pod("abc", "my-jupyter")
     snap = json.loads(_before(op, tmp).read_text())
     assert snap["pods"] == [{"id": "abc", "name": "my-jupyter", "status": "RUNNING",
-                             "cost": 0.225, "created_at": T - 60}]  # fmt: skip
+                             "cost": 0.225, "started_at": T - 60}]  # fmt: skip
+    assert snap["errors"] == []
     assert all(h == f"Bearer {RO}" for _, _, h in op.calls)
     assert all(RO not in u for _, u, _ in op.calls)
     assert (tmp / "before.json").stat().st_mode & 0o077 == 0
 
 
 @pytest.mark.parametrize("bad", [
-    {"/pods": {"data": []}}, {"/pods": [{"id": "a", "name": "x", "desiredStatus": "RUNNING"}]},
-    {"/pods": [{"id": "a", "name": "x", "desiredStatus": "RUNNING", "costPerHr": "0.2",
-                "createdAt": "2026-11-04T00:00:00Z"}]},
+    {"/pods": {"data": []}}, {"/pods": [{"id": "a", "name": "x"}]},
+    {"/pods": [{"id": "a", "name": "x", "desiredStatus": "RUNNING", "costPerHr": "cheap"}]},
     {"/pods": [{"id": "a", "name": "x", "desiredStatus": "RUNNING", "costPerHr": 0.2,
-                "createdAt": "yesterday"}]},
+                "lastStartedAt": "yesterday"}]},
     {"/networkvolumes": [{"name": "x"}]}, {"/pods": b"<html>"},
 ])  # fmt: skip
 def test_unexpected_shape_is_exit_4(env: tuple[FakeOpener, Path], bad: dict[str, Any],
@@ -262,3 +275,169 @@ def test_record_allowlist(env: tuple[FakeOpener, Path]) -> None:
     assert "env" not in item and "publicIp" not in item and item["id"] == "p1"
     bill = json.loads((tmp / "rec" / "billing.json").read_text())
     assert "secretField" not in bill["items"][0]
+
+
+# ------------------------------------------------------------------ T-372 fix round 1
+@pytest.mark.parametrize("cost", ["0.22", 0.22, None])
+def test_cost_number_string_or_absent(env: tuple[FakeOpener, Path], cost: Any) -> None:
+    """REV-S5/R2-9: openapi `costPerHr` is a number with the example "0.74"."""
+    op, tmp = env
+    op.pod("p1", "x", cost=cost)
+    snap = json.loads(_before(op, tmp).read_text())
+    assert snap["pods"][0]["cost"] == (None if cost is None else 0.22)
+
+
+def test_bad_optional_field_still_deletes_then_stops(env: tuple[FakeOpener, Path],
+                                                     capsys: pytest.CaptureFixture[str]) -> None:  # fmt: skip
+    """REV-S1: a bad `costPerHr`/`lastStartedAt` never blocks the delete path; exit 4 after."""
+    op, tmp = env
+    before = _before(op, tmp)
+    op.pod("n1", OURS, cost="??")
+    op.pod("n2", OURS2, age_s=None)
+    op.pods[1]["lastStartedAt"] = "not a time"
+    assert _auto(tmp, before) == 6  # pods>1 fired; both deleted despite the bad fields
+    assert sorted(op.deletes()) == ["n1", "n2"]
+    assert "STOP: parse error: pod.costPerHr" in capsys.readouterr().out
+    op.pod("n3", OURS, cost="??")  # no threshold: the parse error alone is a STOP
+    assert _auto(tmp, before) == 4 and sorted(op.deletes()) == ["n1", "n2"]
+
+
+def test_account_failure_is_soft(env: tuple[FakeOpener, Path]) -> None:
+    """GraphQL down: the pod checks still run (pods>1 deletes), then STOP."""
+    op, tmp = env
+    before = _before(op, tmp)
+    op.override = {g.GRAPHQL.replace(g.REST, ""): b"<html>"}
+    op.pod("n1", OURS)
+    assert _auto(tmp, before) == 4 and op.deletes() == []
+    op.pod("n2", OURS2)
+    assert _auto(tmp, before) == 6 and sorted(op.deletes()) == ["n1", "n2"]
+
+
+def test_age_from_first_seen_survives_restart(env: tuple[FakeOpener, Path],
+                                              monkeypatch: pytest.MonkeyPatch) -> None:  # fmt: skip
+    """REV-S2: age = now - min(first seen, lastStartedAt); a restart resets lastStartedAt."""
+    op, tmp = env
+    before = _before(op, tmp)
+    op.pod("n1", OURS, age_s=10)
+    assert _auto(tmp, before) == 0
+    seen = json.loads((tmp / "state" / "first_seen.json").read_text())
+    assert seen == {"n1": T} and (tmp / "state" / "first_seen.json").stat().st_mode & 0o077 == 0
+    monkeypatch.setattr(g, "NOW", lambda: T + 74 * 60)
+    op.pods[0]["lastStartedAt"] = _iso(T + 73 * 60)  # restarted: lastStartedAt is young
+    assert _auto(tmp, before) == 0
+    monkeypatch.setattr(g, "NOW", lambda: T + 76 * 60)
+    assert _auto(tmp, before) == 6 and op.deletes() == ["n1"]
+
+
+def test_unreadable_state_resets_and_stops_after_checks(env: tuple[FakeOpener, Path],
+                                                        capsys: pytest.CaptureFixture[str]) -> None:  # fmt: skip
+    op, tmp = env
+    before = _before(op, tmp)
+    (tmp / "state").mkdir()
+    (tmp / "state" / "first_seen.json").write_text("{broken")
+    op.pod("n1", OURS)
+    op.pod("n2", OURS2)
+    assert _auto(tmp, before) == 6  # pods>1 still deleted
+    assert sorted(op.deletes()) == ["n1", "n2"]
+    assert "STOP: guard state reset" in capsys.readouterr().out
+    (tmp / "state" / "first_seen.json").write_text("[1]")
+    op.pod("n3", OURS)
+    assert _auto(tmp, before) == 4  # nothing fired: the reset alone is a STOP
+    assert json.loads((tmp / "state" / "first_seen.json").read_text()) == {"n3": T}
+
+
+def test_auto_destroy_needs_state_dir(env: tuple[FakeOpener, Path]) -> None:
+    op, tmp = env
+    before = _before(op, tmp)
+    assert g.main(["watch", "--key-file", str(tmp / "ro"), "--before", str(before), "--once",
+                   "--auto-destroy", "--rw-key-file", str(tmp / "rw")]) == 2  # fmt: skip
+
+
+def test_destroy_continues_after_a_failure(env: tuple[FakeOpener, Path],
+                                           capsys: pytest.CaptureFixture[str]) -> None:  # fmt: skip
+    """REV-S8: one failed DELETE does not stop the others; all failures are reported."""
+    op, tmp = env
+    before = _before(op, tmp)
+    op.pod("a1", OURS)
+    op.pod("a2", OURS2)
+    op.delete_status["a1"] = 500
+    assert _auto(tmp, before) == 7
+    assert op.deletes() == ["a1", "a2"] and [p["id"] for p in op.pods] == ["a1"]
+    out = capsys.readouterr().out
+    assert "destroy pod a1" in out and "FAILED" in out and "destroyed pod a2" in out
+    args = ["destroy-leftovers", "--key-file", str(tmp / "rw"), "--before", str(before), "--yes"]
+    op.pod("a3", OURS2)
+    assert g.main(args) == 7 and op.deletes()[-2:] == ["a1", "a3"]
+
+
+@pytest.mark.parametrize(("status", "exists", "code"), [(400, False, 0), (404, False, 0),
+                                                        (400, True, 7)])  # fmt: skip
+def test_delete_400_checked_with_get(env: tuple[FakeOpener, Path], status: int, exists: bool,
+                                     code: int, capsys: pytest.CaptureFixture[str]) -> None:  # fmt: skip
+    """REV-S4/R2-7: DELETE -> 400 (documented) or 404 is gone only if GET /pods/{id} is 404."""
+    op, tmp = env
+    before = _before(op, tmp)
+    op.pod("g1", OURS)
+    op.delete_status["g1"] = status
+    if not exists:
+        op.pods.clear()
+        op.override = {"/pods": [{"id": "g1", "name": OURS, "desiredStatus": "RUNNING"}]}
+    args = ["destroy-leftovers", "--key-file", str(tmp / "rw"), "--before", str(before), "--yes"]
+    assert g.main(args) == code
+    if code == 0:
+        assert "destroyed pod g1" in capsys.readouterr().out
+
+
+def test_guard_expires(env: tuple[FakeOpener, Path], monkeypatch: pytest.MonkeyPatch,
+                       capsys: pytest.CaptureFixture[str]) -> None:  # fmt: skip
+    """REV-S9b: after --until (default before.taken_at + 24 h) the guard only reports."""
+    op, tmp = env
+    before = _before(op, tmp)
+    op.pod("n1", OURS, age_s=99 * 60)
+    until = dt.datetime.fromtimestamp(T - 1, dt.UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    assert g.main(["watch", "--key-file", str(tmp / "ro"), "--before", str(before), "--once",
+                   "--state-dir", str(tmp / "state"), "--auto-destroy", "--rw-key-file",
+                   str(tmp / "rw"), "--until", until]) == 6  # fmt: skip
+    assert op.deletes() == [] and "report only" in capsys.readouterr().out
+    monkeypatch.setattr(g, "NOW", lambda: T + 24 * 3600 + 1)  # default expiry
+    assert _auto(tmp, before) == 6 and op.deletes() == []
+    monkeypatch.setattr(g, "NOW", lambda: T + 600)
+    assert _auto(tmp, before) == 6 and op.deletes() == ["n1"]
+
+
+def test_bad_until_is_usage_error(env: tuple[FakeOpener, Path]) -> None:
+    op, tmp = env
+    before = _before(op, tmp)
+    assert _watch(tmp, before, "--until", "tomorrow") == 2
+
+
+@pytest.mark.parametrize("content", [None, "{not json", '{"pods": []}'])
+def test_watch_without_before_is_a_loud_stop(env: tuple[FakeOpener, Path], content: str | None,
+                                             capsys: pytest.CaptureFixture[str]) -> None:  # fmt: skip
+    """REV-S9a: a lost before.json must not switch auto-destroy off silently."""
+    _, tmp = env
+    before = tmp / "before.json"
+    if content is not None:
+        before.write_text(content)
+    assert _auto(tmp, before) == 8
+    out, err = capsys.readouterr()
+    assert "STOP: no usable before snapshot" in out and "NOT watching" in err
+
+
+def test_opener_has_no_proxy_and_no_redirect() -> None:
+    """REV-S7: the module opener refuses redirects and ignores *_proxy variables."""
+    handlers = g.OPENER.handlers
+    assert any(isinstance(h, g._NoRedirect) for h in handlers)
+    assert not any(type(h).__name__ == "HTTPRedirectHandler" for h in handlers)
+    proxy = [h for h in handlers if type(h).__name__ == "ProxyHandler"]
+    assert all(getattr(h, "proxies", None) == {} for h in proxy)  # no env proxy handler
+
+
+def test_systemd_unit_sets_state_dir_and_expiry() -> None:
+    """REV-S9: the timer's guard expires (GUARD_UNTIL = test end + 6 h) and keeps its state."""
+    unit = (ROOT / "deploy" / "workstation" / "llmhub-runpod-guard.service").read_text()
+    exec_start = next(x for x in unit.splitlines() if x.startswith("ExecStart="))
+    assert "--auto-destroy" in exec_start and "--until ${GUARD_UNTIL}" in exec_start
+    assert "--state-dir " in exec_start and "--before ${GUARD_BEFORE}" in exec_start
+    env = (ROOT / "deploy" / "workstation" / "guard.env.example").read_text()
+    assert "GUARD_UNTIL=" in env and "+ 6 h" in env

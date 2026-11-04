@@ -15,6 +15,7 @@ from llmhub.configuration.models import Config
 from llmhub.controller import Controller
 from llmhub.provider_adapters.base import (
     Capability,
+    CreatedResourceRejected,
     DestroyResult,
     OfferQuery,
     ProviderError,
@@ -51,7 +52,7 @@ async def test_create_body_and_resource() -> None:
     assert body["name"] == label and body["imageName"] == spec.image
     assert body["cloudType"] == "COMMUNITY" and body["computeType"] == "GPU"
     assert body["gpuTypeIds"] == [GPU_ID] and body["gpuCount"] == 1
-    assert body["allowedCudaVersions"] == ["12.8", "12.9"]
+    assert body["allowedCudaVersions"] == ["12.8", "12.9", "13.0"]
     assert body["volumeInGb"] == 0 and body["containerDiskInGb"] == 40
     assert body["interruptible"] is False and body["ports"] == ["8080/http"]
     assert body["env"]["LLMHUB_API_KEY"] == "pod-secret-1"  # secrets reach the pod only
@@ -169,15 +170,34 @@ async def test_list_failure_refuses_create(fault: str) -> None:
     assert not ei.value.err.outcome_unknown and fake.posts() == 0
 
 
-@pytest.mark.parametrize(("over", "what"), [({"name_override": "llmhub-other"}, "name"),
-                                            ({"cost_override": 0.45}, "price")])  # fmt: skip
-async def test_mismatch_after_create_deletes_pod(over: dict[str, object], what: str) -> None:
+@pytest.mark.parametrize(("over", "what"), [
+    ({"name_override": "llmhub-other"}, "name"), ({"cost_override": 0.45}, "price"),
+    ({"create_answer_extra": {"volumeInGb": 20}}, "volumeInGb"),
+    ({"create_answer_extra": {"interruptible": True}}, "interruptible"),
+    ({"create_answer_extra": {"networkVolume": {"id": "nv1"}}}, "networkVolume"),
+])  # fmt: skip
+async def test_mismatch_after_create_is_rejected_with_ref(over: dict[str, object], what: str
+                                                          ) -> None:  # fmt: skip
+    """REV-S10: the adapter does not delete; the caller stores the ref, then destroys it."""
     fake, _ = _setup(**over)
-    with pytest.raises(ProviderError) as ei:
+    with pytest.raises(CreatedResourceRejected) as ei:
         await make_adapter(fake).create(make_spec(), _label())
-    assert ei.value.err.outcome_unknown and what in ei.value.err.message
-    assert "accepted" in ei.value.err.message
-    assert fake.posts() == 1 and fake.live_pods() == []
+    assert ei.value.err.outcome_unknown and what in ei.value.err.message and what in ei.value.what
+    (pod,) = fake.live_pods()
+    assert ei.value.resource.ref == pod.id and fake.posts() == 1
+
+
+async def test_absent_money_fields_are_not_a_mismatch() -> None:
+    """The body set volumeInGb 0 / interruptible false; an answer without them is accepted."""
+    fake, _ = _setup(create_answer_extra={"volumeInGb": None, "interruptible": None})
+    res = await make_adapter(fake).create(make_spec(), _label())
+    assert res.ref and fake.posts() == 1
+
+
+async def test_cost_as_string_is_accepted() -> None:
+    fake, _ = _setup(cost_as_string=True)
+    res = await make_adapter(fake).create(make_spec(), _label())
+    assert res.price_usd_h == 0.225
 
 
 async def test_destroy_pods_only() -> None:

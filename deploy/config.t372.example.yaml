@@ -21,7 +21,7 @@ providers:
   runpod:
     cloud_type: COMMUNITY
     gpu_type_ids: {RTX3090: "NVIDIA GeForce RTX 3090"}
-    allowed_cuda_versions: ["12.8", "12.9"]
+    allowed_cuda_versions: ["12.8", "12.9", "13.0"]
     price_ceiling_usd_h: 0.50
     max_live_pods: 1
     list_staleness_s: 30      # replace with the value measured in L2b

@@ -18,6 +18,7 @@ import os
 import sqlite3
 import stat
 import sys
+import time
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -248,6 +249,7 @@ def _healthcheck(args: argparse.Namespace) -> int:
 # ------------------------------------------------------------------ T-372 live-test helpers
 RUNPOD_TRANSPORT: Any = None  # test seam: httpx transport of the RunPod adapter
 WEIGHTS_TRANSPORT: Any = None  # test seam: httpx transport of weights-token-check
+WEIGHTS_NOW: Any = time.time  # test seam: the clock of weights-token-check
 
 
 def _db(cfg: Config) -> sqlite3.Connection:
@@ -353,6 +355,7 @@ def _lifecycle_probe(args: argparse.Namespace) -> int:
                 conn, adapter, secret, SystemClock(), cfg, image=args.image,
                 gpu_type_id=rp.gpu_type_ids[args.gpu], disk_gb=args.disk_gb,
                 max_price_usd_h=args.max_price, max_s=args.max_s, poll_s=args.poll_s,
+                hold_s=args.hold_s,
             )  # fmt: skip
         finally:
             await aclose_adapters({"runpod": adapter})
@@ -402,6 +405,7 @@ def _weights_token_check(args: argparse.Namespace) -> int:
     from llmhub.tools.t372_ops import (
         OpsError,
         default_weights_url,
+        expected_weights_verdict,
         weights_status,
         weights_token_for,
     )
@@ -409,21 +413,30 @@ def _weights_token_check(args: argparse.Namespace) -> int:
     cfg = _load(args)
     conn = _db(cfg)
     try:
-        token = weights_token_for(conn, cfg, load_weights_secret(os.environ), args.op)
+        secret = load_weights_secret(os.environ)
+        token = weights_token_for(conn, cfg, secret, args.op)
         url, ca = default_weights_url(cfg, args.op)
+        if args.url:
+            url = args.url
+        now = float(WEIGHTS_NOW())
+        expected = expected_weights_verdict(conn, secret, token, url, now)
     except OpsError as exc:
         raise _ops_error(exc) from None
     except ConfigError as exc:
         raise AdminCliError(f"config error: {exc}", exit_code=2) from None
     finally:
         conn.close()
-    if args.url:
-        url = args.url
+    checked_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - 1))
     try:
         status = weights_status(url, token, ca, transport=WEIGHTS_TRANSPORT)
     except httpx.HTTPError as exc:
         raise AdminCliError(f"weights request: {type(exc).__name__}") from None
-    _print({"op": args.op, "http_status": status})
+    # R2-8: a 403 is also ip_mismatch / path_not_allowed / volume_cap; the proof of a revoked
+    # token is the weights-auth log line `op=<op> verdict=revoked` after `checked_at`
+    _print({"op": args.op, "http_status": status, "checked_at": checked_at,
+            "expected_verdict": expected,
+            "proof": f"docker logs llmhub-weights-auth --since {checked_at} 2>&1"
+                     f" | grep 'op={args.op} verdict='  # must be verdict=revoked"})  # fmt: skip
     return 0
 
 
@@ -479,6 +492,8 @@ def add_commands(sub: Any) -> None:
     lp.add_argument("--max-price", type=float, default=0.30)
     lp.add_argument("--max-s", type=float, default=480.0)
     lp.add_argument("--poll-s", type=float, default=5.0)
+    lp.add_argument("--hold-s", type=float, default=150.0,
+                    help="keep the pod this long after create (guard watch + record, R2-6)")
     ss = sub.add_parser("scan-secrets", help="count secrets of an op in stdin (T-372)")
     ss.add_argument("--op", required=True)
     wt = sub.add_parser("weights-token-check", help="HTTP status for an op's token (T-372)")

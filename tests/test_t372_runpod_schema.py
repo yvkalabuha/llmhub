@@ -43,7 +43,8 @@ POD = {"$ref": "#/components/schemas/Pod"}
 SYNTH: dict[str, Any] = {
     "openapi": "3.0.3",
     "components": {"schemas": {
-        "Pod": _obj("id", "name", "costPerHr", "machineId", "image", "createdAt",
+        "Pod": _obj("id", "name", "costPerHr", "machineId", "image", "lastStartedAt",
+                    "volumeInGb", "interruptible", "networkVolume",
                     desiredStatus={"type": "string", "enum": ["RUNNING", "EXITED", "TERMINATED"]}),
         "PodCreateInput": {"allOf": [_obj(
             "name", "imageName", "gpuTypeIds", "gpuCount", "containerDiskInGb", "volumeInGb",
@@ -51,7 +52,7 @@ SYNTH: dict[str, Any] = {
             cloudType={"type": "string", "enum": ["SECURE", "COMMUNITY"]},
             computeType={"type": "string", "enum": ["GPU", "CPU"]},
             allowedCudaVersions={"type": "array", "items": {"type": "string",
-                                 "enum": ["12.4", "12.8", "12.9"]}},
+                                 "enum": ["12.4", "12.8", "12.9", "13.0"]}},
         )]},
     }},
     "paths": {
@@ -77,6 +78,7 @@ SYNTH: dict[str, Any] = {
 
 def test_synthetic_document_passes() -> None:
     assert rsc.check(SYNTH) == []
+    assert "createdAt" not in rsc.POD_FIELDS + rsc.POD_OPTIONAL_FIELDS  # not in the real Pod
 
 
 def test_checker_lists_every_body_field_the_adapter_sends() -> None:
@@ -104,6 +106,10 @@ def _mutate(path: list[str], value: Any = None, *, delete: bool = False) -> dict
                   "allowedCudaVersions"], delete=True), "allowedCudaVersions"),
         (_mutate(["components", "schemas", "Pod", "properties", "costPerHr"], delete=True),
          "costPerHr"),
+        (_mutate(["components", "schemas", "Pod", "properties", "lastStartedAt"], delete=True),
+         "lastStartedAt"),
+        (_mutate(["components", "schemas", "Pod", "properties", "volumeInGb"], delete=True),
+         "volumeInGb"),
         (_mutate(["components", "schemas", "Pod", "properties", "desiredStatus"],
                  {"type": "string", "enum": ["RUNNING", "STARTING"]}), "STARTING"),
         (_mutate(["paths", "/pods", "get", "responses"], _ok(_obj("data", "nextCursor"))),

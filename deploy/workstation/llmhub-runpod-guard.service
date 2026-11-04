@@ -7,7 +7,9 @@ Description=llmhub T-372 RunPod guard (watch --once --auto-destroy)
 [Service]
 Type=oneshot
 EnvironmentFile=%h/.config/llmhub-guard/guard.env
-ExecStart=/usr/bin/python3 -I %h/.local/lib/llmhub-guard/runpod_guard.py watch --once --auto-destroy --key-file ${GUARD_RO_KEY_FILE} --rw-key-file ${GUARD_RW_KEY_FILE} --before ${GUARD_BEFORE} --state-dir %h/.local/state/llmhub-guard
-# exit 5/6 = STOP condition of the test (journalctl --user -u llmhub-runpod-guard)
+ExecStart=/usr/bin/python3 -I %h/.local/lib/llmhub-guard/runpod_guard.py watch --once --auto-destroy --key-file ${GUARD_RO_KEY_FILE} --rw-key-file ${GUARD_RW_KEY_FILE} --before ${GUARD_BEFORE} --state-dir %h/.local/state/llmhub-guard --until ${GUARD_UNTIL}
+# exit 4/5/6/7/8 = STOP condition of the test (journalctl --user -u llmhub-runpod-guard);
+# 8 = before.json missing/unreadable: the guard is NOT watching. After GUARD_UNTIL (test end
+# + 6 h) the guard only reports, it never deletes again (REV-S9).
 SuccessExitStatus=0
 Nice=10

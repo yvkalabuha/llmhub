@@ -6,12 +6,15 @@ Safety rules (each one has a test in tests/test_t372_runpod_adapter.py):
    price is <= min(spec.max_price_usd_h, price_ceiling_usd_h), and fewer than `max_live_pods`
    `llmhub-*` pods exist in ANY status except TERMINATED (EXITED/CREATED/RESTARTING count,
    critic F6). A failed pre-check (including a failed listing) is a definite refusal
-   (`outcome_unknown=False`). After a 2xx with another name or a price above the ceiling the
-   pod is deleted at once and the error is `outcome_unknown=True`.
+   (`outcome_unknown=False`). After a 2xx the answer is checked (REV-S10): name == label,
+   `costPerHr` <= ceiling, `volumeInGb` 0, not `interruptible`, no network volume. A mismatch
+   raises `CreatedResourceRejected` WITHOUT deleting: the caller stores the ref in the DB,
+   records a critical incident and destroys it (a foreign-named pod is found by nothing else).
 2. `list_owned` = pods + network volumes (`vol:`) + templates (`tpl:`) with the prefix; any
    failed list or page raises: never a partial list, never `[]` on failure.
-3. `destroy` deletes pods only (2xx -> ACCEPTED, 404 -> ALREADY_GONE); `vol:`/`tpl:` refs are
-   refused without an HTTP call (F4: we never create them, so they are a stop condition).
+3. `destroy` deletes pods only (2xx -> ACCEPTED; 400/404 and `GET` says gone or TERMINATED ->
+   ALREADY_GONE, REV-S4); `vol:`/`tpl:` refs are refused without an HTTP call (F4: we never
+   create them, so they are a stop condition).
 4. The pod `env` is never parsed or kept (C11); errors carry no body and no key.
 """
 
@@ -27,6 +30,7 @@ from llmhub.provider_adapters.base import (
     Balance,
     BillingRecord,
     Capability,
+    CreatedResourceRejected,
     DestroyResult,
     InstanceSpec,
     NormalizedError,
@@ -74,6 +78,24 @@ def pod_endpoint(pod: PodInfo, port: int) -> str:
 def is_live(pod: PodInfo) -> bool:
     """Counts against `max_live_pods`: every status except TERMINATED (critic F6)."""
     return pod.desired_status.upper() != "TERMINATED"
+
+
+def created_mismatch(pod: PodInfo, label: str, ceiling: float) -> str | None:
+    """What makes a just-created pod unacceptable (REV-S10), or None. A field missing from the
+    answer is not a mismatch (the body set it); a contrary value is."""
+    if pod.name != label:
+        return "name"
+    if pod.odd_fields:
+        return "type of " + ",".join(pod.odd_fields)
+    if pod.cost_per_hr is None or pod.cost_per_hr > ceiling:
+        return f"price {pod.cost_per_hr}"
+    if pod.volume_in_gb not in (None, 0):
+        return f"volumeInGb {pod.volume_in_gb:g}"
+    if pod.interruptible is True:
+        return "interruptible"
+    if pod.network_volume_id is not None:
+        return "networkVolume"
+    return None
 
 
 def spec_port(spec: InstanceSpec) -> int:
@@ -279,28 +301,15 @@ class RunpodAdapter:
             pod = await self.api.create_pod(body)
         except RunpodHttpError as exc:
             raise ProviderError(normalize_runpod_error(exc)) from None
-        bad_name = pod.name != label
-        bad_price = pod.cost_per_hr is None or pod.cost_per_hr > ceiling
-        if bad_name or bad_price:
-            what = "name" if bad_name else f"price {pod.cost_per_hr}"
-            deleted = await self._delete_quietly(pod.id)
-            log.error("runpod: created pod %s has unexpected %s; deleted=%s", pod.id, what, deleted)
-            raise ProviderError(_err(
+        what = created_mismatch(pod, label, ceiling)
+        if what is not None:
+            log.error("runpod: created pod %s has unexpected %s; the caller destroys it",
+                      pod.id, what)  # fmt: skip
+            raise CreatedResourceRejected(_err(
                 UnavailableReason.DEPLOYMENT_ERROR,
-                f"created pod {pod.id} has unexpected {what}; destroy "
-                + ("accepted" if deleted else "FAILED"),
-                unknown=True,
-            ))  # fmt: skip
+                f"created pod {pod.id} has unexpected {what}; destroy it", unknown=True,
+            ), self._pod(pod), what)  # fmt: skip
         return self._pod(pod)
-
-    async def _delete_quietly(self, pod_id: str) -> bool:
-        for _ in range(2):
-            try:
-                await self.api.delete_pod(pod_id)
-                return True
-            except RunpodHttpError:
-                continue
-        return False
 
     async def get(self, ref: str) -> RemoteResource | None:
         if ref.startswith((REF_VOLUME, REF_TEMPLATE)):

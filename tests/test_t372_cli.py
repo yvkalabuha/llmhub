@@ -128,10 +128,10 @@ def test_lifecycle_probe_cli(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
     _env(tmp_path, monkeypatch)
     p = _config(tmp_path)
     code, out, err = _run(["lifecycle-probe", "--config", str(p), "--image", SMALL,
-                           "--poll-s", "0.01", "--max-s", "60"], capsys)  # fmt: skip
+                           "--poll-s", "0.01", "--max-s", "60", "--hold-s", "0"], capsys)  # fmt: skip
     assert code == 0, (out, err)
     assert out["zero"] and out["name_ok"] and out["destroyed"] and out["ref"]
-    assert out["cost_per_hr"] == 0.225 and out["running_s"] is not None
+    assert out["cost_per_hr"] == 0.225 and out["desired_running_s"] is not None
     (body,) = fake.created_bodies
     assert body["dockerStartCmd"] == ["sleep", "600"] and body["imageName"] == SMALL
     assert fake.live_pods() == []
@@ -158,7 +158,7 @@ async def test_lifecycle_probe_measures_visibility_lag_and_staleness(tmp_path: P
 
 async def test_lifecycle_probe_destroys_on_timeout(tmp_path: Path) -> None:
     clock = AutoClock()
-    fake = FakeRunpod(clock, boot_s=10_000)  # never RUNNING
+    fake = FakeRunpod(clock, visible_after_s=10_000)  # never listed: never seen RUNNING
     adapter = RunpodAdapter(fake.api(), runpod_cfg(list_staleness_s=0), clock, disk_gb_hint=20)
     conn = connect(tmp_path / "s.db")
     migrate(conn)
@@ -240,8 +240,13 @@ def test_weights_token_check(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
         return httpx.Response(403)
 
     monkeypatch.setattr(admin_cli, "WEIGHTS_TRANSPORT", httpx.MockTransport(handler))
+    monkeypatch.setattr(admin_cli, "WEIGHTS_NOW", lambda: now + 60)
     code, out, err = _run(["weights-token-check", "--config", str(p), "--op", op], capsys)
-    assert code == 0, err and out == {"op": op, "http_status": 403}
+    assert code == 0, err
+    assert out["op"] == op and out["http_status"] == 403
+    # R2-8: 403 alone is not proof; the DB verdict and the weights-auth log line are shown
+    assert out["expected_verdict"] == "revoked"
+    assert f"op={op} verdict=" in out["proof"] and out["checked_at"] in out["proof"]
     (req,) = seen
     assert str(req.url) == f"https://203.0.113.7:9443/w/{op}/q/model.gguf"
     token = req.headers["authorization"].removeprefix("Bearer ")

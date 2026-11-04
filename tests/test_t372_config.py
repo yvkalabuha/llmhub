@@ -57,7 +57,7 @@ def test_valid_runpod_config(tmp_path: Path) -> None:
     rp = cfg.providers.runpod
     assert rp is not None and rp.cloud_type == "COMMUNITY"
     assert rp.gpu_type_ids == {"RTX3090": "NVIDIA GeForce RTX 3090"}
-    assert rp.allowed_cuda_versions == ["12.8", "12.9"]
+    assert rp.allowed_cuda_versions == ["12.8", "12.9", "13.0"]
     assert (rp.price_ceiling_usd_h, rp.max_live_pods, rp.list_staleness_s) == (0.50, 1, 30)
     assert rp.call_timeout_s == 20 and rp.container_disk_usd_gb_month == 0.10
 

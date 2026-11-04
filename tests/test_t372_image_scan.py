@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import tarfile
@@ -31,7 +32,8 @@ def _layer(files: Mapping[str, str | None], *, gz: bool = False) -> bytes:
     return buf.getvalue()
 
 
-def _image(tmp: Path, layers: list[bytes], config: dict[str, object] | None = None) -> Path:
+def _image(tmp: Path, layers: list[bytes], config: dict[str, object] | None = None,
+           *, blob_names: list[str] | None = None) -> Path:  # fmt: skip
     cfg = config or {"config": {"Env": ["PATH=/usr/bin"]}, "history": [{"created_by": "RUN x"}]}
     out = tmp / "image.tar"
     with tarfile.open(out, "w") as t:
@@ -43,7 +45,7 @@ def _image(tmp: Path, layers: list[bytes], config: dict[str, object] | None = No
         add("blobs/sha256/cfg0000000000000000", json.dumps(cfg).encode())
         names = []
         for i, data in enumerate(layers):
-            n = f"blobs/sha256/layer{i:016d}"
+            n = blob_names[i] if blob_names else f"blobs/sha256/layer{i:016d}"
             add(n, data)
             names.append(n)
         add("manifest.json", json.dumps([{"Config": "blobs/sha256/cfg0000000000000000",
@@ -140,11 +142,62 @@ def test_publish_script_order() -> None:
         assert bad not in text
 
 
-def test_allowlist_is_exact_and_small(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    assert scan.ALLOW == (("usr/lib/x86_64-linux-gnu/libgnutls.so.30", "private_key"),)
-    ok = _image(tmp_path, [_layer({"usr/lib/x86_64-linux-gnu/libgnutls.so.30.37.1": PEM})])
-    assert _run(ok, capsys)[0] == 0
-    other = _image(tmp_path, [_layer({"usr/lib/x86_64-linux-gnu/libgnutls.so.30.37.1": HF,
-                                      "usr/lib/x86_64-linux-gnu/libother.so": PEM})])  # fmt: skip
-    code, out = _run(other, capsys)
-    assert code == 1 and "libgnutls.so.30.37.1: hf_token" in out and "libother.so" in out
+GNUTLS = "usr/lib/x86_64-linux-gnu/libgnutls.so.30.37.1"
+
+
+def _blob(data: bytes) -> str:
+    return "blobs/sha256/" + hashlib.sha256(data).hexdigest()
+
+
+def test_allowlist_is_exact_and_small() -> None:
+    """Customer decision 2026-11-04: accepted on condition REV-S6 (exact path + layer)."""
+    (a,) = scan.ALLOW
+    assert (a.path, a.rule) == (GNUTLS, "private_key") and a.reason
+    assert a.layers == {
+        "sha256:5a7813e071bfadf18aaa6ca8318be4824a9b6297b3240f2cc84c1db6f4113040",
+        "sha256:4b7c01ed0534d4f9be9cf97d068da1598c6c20b26cb6134fad066defdb6d541d"}
+
+
+@pytest.fixture
+def allow_layer(monkeypatch: pytest.MonkeyPatch) -> bytes:
+    """A synthetic layer with the GnuTLS file, allowlisted by its own digest."""
+    data = _layer({GNUTLS: PEM})
+    digest = "sha256:" + hashlib.sha256(data).hexdigest()
+    monkeypatch.setattr(scan, "ALLOW", (scan.Allow(GNUTLS, "private_key", frozenset({digest}),
+                                                   "test vectors"),))  # fmt: skip
+    return data
+
+
+def test_allowed_hit_is_reported(tmp_path: Path, capsys: pytest.CaptureFixture[str],
+                                 allow_layer: bytes) -> None:  # fmt: skip
+    img = _image(tmp_path, [allow_layer], blob_names=[_blob(allow_layer)])
+    rep = tmp_path / "scan.txt"
+    assert scan.main([str(img), "--report", str(rep)]) == 0
+    text = rep.read_text()
+    assert "allowed: layer 0 " in text and f"{GNUTLS}: private_key (test vectors)" in text
+    assert text.rstrip().endswith("verdict: clean")
+    capsys.readouterr()
+
+
+def test_allowlist_needs_the_layer_and_the_exact_path(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str], allow_layer: bytes) -> None:  # fmt: skip
+    planted = _layer({GNUTLS + ".planted": PEM})
+    img = _image(tmp_path, [planted], blob_names=[_blob(planted)])
+    assert _run(img, capsys)[0] == 1  # another file name
+    other = _layer({GNUTLS: PEM, "etc/x": "y"})
+    img = _image(tmp_path, [other], blob_names=[_blob(other)])
+    code, out = _run(img, capsys)
+    assert code == 1 and f"{GNUTLS}: private_key" in out  # same path, another layer
+    img = _image(tmp_path, [allow_layer], blob_names=["blobs/sha256/layer0000000000000000"])
+    assert _run(img, capsys)[0] == 1  # no content address: no exemption
+    mixed = _layer({GNUTLS: PEM + HF, "usr/lib/x86_64-linux-gnu/libother.so": PEM})
+    code, out = _run(_image(tmp_path, [mixed], blob_names=[_blob(mixed)]), capsys)
+    assert code == 1 and f"{GNUTLS}: hf_token" in out and "libother.so" in out
+
+
+def test_allowlisted_layer_with_a_forged_digest_is_an_error(
+        tmp_path: Path, capsys: pytest.CaptureFixture[str], allow_layer: bytes) -> None:  # fmt: skip
+    forged = _layer({GNUTLS: PEM, "root/.ssh/stolen": PEM})
+    img = _image(tmp_path, [forged], blob_names=[_blob(allow_layer)])
+    assert scan.main([str(img)]) == 2
+    capsys.readouterr()

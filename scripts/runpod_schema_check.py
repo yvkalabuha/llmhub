@@ -24,7 +24,10 @@ CREATE_FIELDS = (
     "containerDiskInGb", "volumeInGb", "ports", "interruptible", "allowedCudaVersions", "env",
     "dockerStartCmd",
 )  # fmt: skip
-POD_FIELDS = ("id", "name", "desiredStatus", "costPerHr", "machineId", "createdAt")
+# the real Pod has no `createdAt` (R2-0/REV-A1); `lastStartedAt` (the time source) and the
+# money fields checked after create (REV-S10) must exist in the schema, but a pod may omit them
+POD_FIELDS = ("id", "name", "desiredStatus", "costPerHr", "machineId")
+POD_OPTIONAL_FIELDS = ("lastStartedAt", "volumeInGb", "interruptible", "networkVolume")
 POD_IMAGE_FIELDS = ("image", "imageName")  # one of them
 NAMED_FIELDS = ("id", "name")
 BILLING_FIELDS = ("amount", "time", "podId")
@@ -34,7 +37,7 @@ KNOWN_STATUSES = {"RUNNING", "CREATED", "RESTARTING", "EXITED", "TERMINATED"}
 ENUMS = {
     "cloudType": {"COMMUNITY"},
     "computeType": {"GPU"},
-    "allowedCudaVersions": {"12.8", "12.9"},
+    "allowedCudaVersions": {"12.8", "12.9", "13.0"},
 }
 POD_ITEM = re.compile(r"^/pods/\{[^}/]+\}$")
 
@@ -150,7 +153,7 @@ def check(doc: Mapping[str, Any]) -> list[str]:
     pod_schema = s.response(s.op(item_path, "get")) if item_path else None
     for where, schema in (("GET /pods/{id}", pod_schema), ("POST /pods", s.response(create))):
         pprops = s.props(schema)
-        missing(f"{where} answer", pprops, POD_FIELDS)
+        missing(f"{where} answer", pprops, POD_FIELDS + POD_OPTIONAL_FIELDS)
         if not any(f in pprops for f in POD_IMAGE_FIELDS):
             problems.append(f"{where} answer: neither 'image' nor 'imageName'")
         if "desiredStatus" in pprops:

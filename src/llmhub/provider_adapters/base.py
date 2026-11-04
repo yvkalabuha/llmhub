@@ -133,6 +133,21 @@ class ProviderError(Exception):
         self.err = err
 
 
+class CreatedResourceRejected(ProviderError):
+    """`create` got a 2xx, but the created resource is not what was asked for (other name,
+    price above the ceiling, a volume, interruptible, a network volume: T-372 REV-S10).
+
+    The adapter does NOT delete it: the caller first stores `resource.ref` in the DB (a pod
+    with a foreign name is invisible to the label lookup and to the guard), records a
+    critical incident, then destroys it. `err.outcome_unknown` is True for callers that only
+    know `ProviderError`."""
+
+    def __init__(self, err: NormalizedError, resource: RemoteResource, what: str) -> None:
+        super().__init__(err)
+        self.resource = resource
+        self.what = what
+
+
 class ProviderAdapter(Protocol):
     name: str
     capabilities: Capability

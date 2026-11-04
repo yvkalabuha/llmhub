@@ -41,14 +41,42 @@ def test_parse_running_pod_drops_env() -> None:
 def test_parse_exited_and_pending() -> None:
     ex = parse_pod(_fix("pod_exited.json"), P)
     assert ex.desired_status == "EXITED" and ex.created_at == parse_time("2026-11-04T10:00:00.123Z")
-    pe = parse_pod(_fix("pod_pending.json"), P)
+    pe = parse_pod(_fix("pod_pending.json"), P)  # costPerHr as a numeric string (openapi example)
     assert pe.machine_id is None and pe.image is not None and pe.created_at == 1793786400.0
+    assert pe.cost_per_hr == 0.225
+
+
+def test_parse_money_fields_and_missing_start() -> None:
+    """R2-3/R2-9/REV-S10: created_at = lastStartedAt (absent while pulling), costPerHr may be
+    a numeric string, the create-check fields are parsed."""
+    raw = {**_fix("pod_running.json"), "networkVolume": {"id": "nv1", "size": 10}}
+    del raw["lastStartedAt"]
+    pod = parse_pod(raw, P)
+    assert pod.created_at is None and pod.volume_in_gb == 0 and pod.interruptible is False
+    assert pod.network_volume_id == "nv1"
+    bare = parse_pod({"id": "x1", "name": "n", "desiredStatus": "RUNNING", "lastStartedAt": ""},
+                     P)  # fmt: skip
+    assert bare.created_at is None and bare.cost_per_hr is None and bare.volume_in_gb is None
+    assert parse_pod({**raw, "networkVolume": {}}, P).network_volume_id is None
+
+
+@pytest.mark.parametrize("patch", [{"volumeInGb": "0"}, {"interruptible": "no"},
+                                   {"networkVolume": 5}, {"networkVolume": {"id": 7}}])  # fmt: skip
+def test_odd_money_field_types_never_blind_the_list(patch: dict[str, Any]) -> None:
+    """A foreign pod with an odd field must not break `list_pods`; after OUR create the same
+    oddity is a mismatch (`created_mismatch`)."""
+    from llmhub.provider_adapters.runpod import created_mismatch
+
+    pod = parse_pod({**_fix("pod_running.json"), **patch}, P)
+    assert pod.odd_fields == (next(iter(patch)),)
+    assert created_mismatch(pod, pod.name, 0.3) == f"type of {next(iter(patch))}"
 
 
 @pytest.mark.parametrize(
     "patch",
-    [{"id": 5}, {"id": ""}, {"name": None}, {"desiredStatus": 1}, {"costPerHr": "0.2"},
-     {"costPerHr": True}, {"createdAt": "yesterday"}, {"machineId": 3}],
+    [{"id": 5}, {"id": ""}, {"name": None}, {"desiredStatus": 1}, {"costPerHr": "cheap"},
+     {"costPerHr": True}, {"costPerHr": "nan"}, {"lastStartedAt": "yesterday"},
+     {"machineId": 3}],
 )  # fmt: skip
 def test_parse_unexpected_shape(patch: dict[str, Any]) -> None:
     raw = {**_fix("pod_running.json"), **patch}

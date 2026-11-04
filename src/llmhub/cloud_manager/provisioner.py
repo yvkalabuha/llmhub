@@ -14,6 +14,9 @@ Rules (plan sections 3.4, 3.9, 7.3, gates 2026-11-04):
   runs out the row fails with that reason (`provider_api_error`), "no offer" stays
   `gpu_unavailable` (T-372 C1);
 - a pod placed on a blacklisted host is destroyed and retried (T-372 C3);
+- a 2xx create whose resource is not what was asked for (`CreatedResourceRejected`: other
+  name, price, volume, interruptible) is stored on the row FIRST, then a critical incident,
+  then destroyed; the row fails (T-372 REV-S10);
 - E2 right after create once `get(ref)` shows the resource (PENDING/RUNNING; the boot is
   then timed by BOOTING, E5). A row that keeps a ref without E2 (restart, ghost) polls `get`
   until RUNNING; a ghost ref (`get` = None while another resource carries the label) moves the
@@ -50,6 +53,7 @@ from llmhub.lifecycle_manager.states import State
 from llmhub.lifecycle_manager.teardown import adopt_ref_or_destroy
 from llmhub.persistence.db import assert_not_in_tx, tx
 from llmhub.provider_adapters.base import (
+    CreatedResourceRejected,
     InstanceSpec,
     NormalizedError,
     Offer,
@@ -234,6 +238,8 @@ async def _do_create(
     iid = inst["id"]
     try:
         res = await adapter.create(spec, inst["label"])
+    except CreatedResourceRejected as exc:
+        return await reject_created(conn, adapter, iid, exc, now_fn)
     except Exception as exc:  # noqa: BLE001 - adapters may raise anything
         err = exc.err if isinstance(exc, ProviderError) else adapter.normalize_error(exc)
         return _create_failed(conn, inst, err, host_id, cfg, now_fn())
@@ -251,6 +257,51 @@ async def _do_create(
                        "controller", endpoint=seen.endpoint)  # fmt: skip
             delete_key(conn, _exclude_key(iid))
     return CreateOutcome.CREATED
+
+
+CREATED_REJECTED = "created_resource_rejected"
+
+
+async def reject_created(
+    conn: sqlite3.Connection,
+    adapter: ProviderAdapter,
+    iid: str,
+    exc: CreatedResourceRejected,
+    now_fn: Callable[[], float],
+) -> CreateOutcome:
+    """REV-S10: the ref goes to the DB before anything else (a pod with a foreign name is
+    invisible to the label lookup), then a critical incident, then destroy (2 tries). The row
+    fails either way; teardown keeps destroying the stored ref until zero."""
+    assert_not_in_tx()
+    res = exc.resource
+    now = now_fn()
+    with tx(conn):
+        row = conn.execute("SELECT state, provider_ref FROM instances WHERE id=?",
+                           (iid,)).fetchone()  # fmt: skip
+        if row is not None and (row["state"] == State.PROVISIONING.value
+                                or row["provider_ref"] is None):  # fmt: skip
+            machine.set_provider_ref(conn, iid, res.ref, res.host_id, res.price_usd_h, now)
+        record_incident(
+            conn, now, CREATED_REJECTED, "critical", ref=iid,
+            dedup_key=f"{CREATED_REJECTED}:{res.ref}",
+            details={"provider_ref": res.ref, "label": res.label[:80], "what": exc.what[:80]},
+        )  # fmt: skip
+    destroyed = False
+    for _ in range(2):
+        try:
+            await adapter.destroy(res.ref)
+            destroyed = True
+            break
+        except Exception:  # noqa: BLE001, S112 - one more try, then teardown keeps the ref
+            continue
+    if not destroyed:
+        record_incident(
+            conn, now_fn(), "created_resource_destroy_failed", "critical", ref=iid,
+            dedup_key=f"created_resource_destroy_failed:{res.ref}",
+            details={"provider_ref": res.ref},
+        )  # fmt: skip
+    _fail_provisioning(conn, iid, now_fn(), CREATED_REJECTED)
+    return CreateOutcome.FAILED
 
 
 def _create_failed(

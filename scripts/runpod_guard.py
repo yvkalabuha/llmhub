@@ -8,19 +8,29 @@ sent only as `Authorization: Bearer`; they never reach stdout, stderr or any fil
     runpod_guard.py snapshot --key-file RO --out before.json
     runpod_guard.py diff before.json after.json
     runpod_guard.py record --key-file RO --dir tests/fixtures/runpod/recorded
-    runpod_guard.py watch --key-file RO --before before.json [--once]
-                          [--auto-destroy --rw-key-file RW] [--state-dir DIR]
+    runpod_guard.py watch --key-file RO --before before.json [--once] [--state-dir DIR]
+                          [--auto-destroy --rw-key-file RW --state-dir DIR [--until TIME]]
     runpod_guard.py destroy-leftovers --key-file RW --before before.json [--yes]
 
 Auto-destroy deletes ONLY pods that are not in the "before" snapshot and whose name matches the
 llmhub label `^llmhub-[0-9a-f]{12}-[0-9a-f]{8}$`, and only when a threshold fires: such a pod is
 older than 75 min, `currentSpendPerHr` > 0.30, or more than one live llmhub pod exists. Then all
-of them are deleted. Volumes, templates, registry auths and endpoints are only reported.
-Every delete is a line in `<state-dir>/actions.log` (no keys).
+of them are deleted (a failed DELETE does not stop the others). Volumes, templates, registry
+auths and endpoints are only reported. Every delete is a line in `<state-dir>/actions.log`.
 
-Exit codes: 0 ok; 2 usage/key file; 3 new llmhub pods in diff; 4 parse error (unexpected
-answer: STOP the test); 5 a new volume/template/registry auth/endpoint (STOP); 6 auto-destroy
-fired (STOP); 7 API error.
+Robustness (T-372 review REV-S1/S2/S5/S9, R2-1): the delete path needs only `id`, `name` and
+`desiredStatus` of a pod; `costPerHr` (number or numeric string) and `lastStartedAt` are
+optional, a bad value is a STOP (exit 4) reported AFTER the checks and deletes, never a reason
+to skip them. The pod age is `now - min(first seen, lastStartedAt)`; the first-seen times live
+in `<state-dir>/first_seen.json` (0600), so `--state-dir` is required with `--auto-destroy`; an
+unreadable state file is reset (STOP, exit 4). The guard expires: after `--until` (ISO-8601 or
+epoch s; default `before.taken_at + 24 h`) it only reports. Without a readable `before.json`
+it refuses to run (exit 8): auto-destroy would be off, so that is a STOP too.
+
+Exit codes: 0 ok; 2 usage/key file; 3 new llmhub pods in diff; 4 parse error or guard state
+reset (unexpected answer: STOP the test); 5 a new volume/template/registry auth/endpoint
+(STOP); 6 a threshold fired (STOP); 7 API error, also a failed DELETE (STOP); 8 no usable
+before snapshot: the guard is not watching (STOP).
 """
 
 from __future__ import annotations
@@ -28,6 +38,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import json
+import math
 import os
 import re
 import stat
@@ -45,7 +56,20 @@ MAX_AGE_S = 75 * 60
 MAX_SPEND_H = 0.30
 MAX_PODS = 1
 TIMEOUT_S = 20
-OPENER: Any = urllib.request.build_opener()  # test seam
+DEFAULT_TTL_S = 24 * 3600  # --until default: before.taken_at + 24 h (REV-S9)
+FIRST_SEEN = "first_seen.json"
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """REV-S7: never follow a redirect (urllib would forward the Bearer key to the new host)."""
+
+    def redirect_request(self, req: Any, fp: Any, code: int, msg: str, headers: Any,
+                         newurl: str) -> None:  # fmt: skip
+        raise urllib.error.HTTPError(req.full_url, code, "redirect refused", headers, fp)
+
+
+# no proxy from the environment, no redirects (the adapter: follow_redirects/trust_env False)
+OPENER: Any = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect())
 NOW = time.time  # test seam
 EXTRA_KINDS = {  # kind -> REST path (reported only, never deleted)
     "volumes": "/networkvolumes",
@@ -55,8 +79,8 @@ EXTRA_KINDS = {  # kind -> REST path (reported only, never deleted)
 }
 ALLOW = {  # `record`: only these fields are written (critic F7)
     "pods": ("id", "name", "desiredStatus", "costPerHr", "machineId", "image", "imageName",
-             "createdAt", "gpuCount", "interruptible", "ports", "containerDiskInGb",
-             "volumeInGb", "lastStatusChange"),
+             "lastStartedAt", "adjustedCostPerHr", "gpuCount", "interruptible", "ports",
+             "containerDiskInGb", "volumeInGb", "lastStatusChange"),
     "networkvolumes": ("id", "name", "size", "dataCenterId"),
     "templates": ("id", "name", "imageName", "isPublic", "isServerless"),
     "billing": ("amount", "time", "podId", "diskSpaceBilledGb"),
@@ -64,9 +88,10 @@ ALLOW = {  # `record`: only these fields are written (critic F7)
 
 
 class GuardError(Exception):
-    def __init__(self, code: int, message: str) -> None:
+    def __init__(self, code: int, message: str, status: int | None = None) -> None:
         super().__init__(message)
         self.code = code
+        self.status = status  # HTTP status of an API error
 
 
 def parse_error(what: str) -> GuardError:
@@ -103,7 +128,7 @@ def http_json(method: str, url: str, key: str, body: Any = None) -> Any:
     except urllib.error.HTTPError as exc:
         if method == "DELETE" and exc.code == 404:
             return None
-        raise GuardError(7, f"{method} {_path(url)} -> HTTP {exc.code}") from None
+        raise GuardError(7, f"{method} {_path(url)} -> HTTP {exc.code}", exc.code) from None
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         raise GuardError(7, f"{method} {_path(url)} -> {type(exc).__name__}") from None
     if not raw:
@@ -153,19 +178,60 @@ def _time(v: Any, where: str) -> float:
     raise parse_error(where)
 
 
-def parse_pods(raw: Any) -> list[dict[str, Any]]:
+def _cost(v: Any) -> float | None:
+    """`costPerHr`: openapi says number, its example is the string "0.74" (REV-S5)."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        try:
+            v = float(v.strip())
+        except ValueError:
+            raise parse_error("pod.costPerHr") from None
+    if isinstance(v, bool) or not isinstance(v, int | float) or not math.isfinite(v):
+        raise parse_error("pod.costPerHr")
+    return float(v)
+
+
+def parse_pods_min(raw: Any) -> list[dict[str, Any]]:
+    """Only what a deletion needs: `id`, `name`, `desiredStatus` (REV-S1). Extra fields of
+    any shape never block it."""
     if not isinstance(raw, list):
         raise parse_error("pods: not a list")
     out = []
     for item in raw:
         if not isinstance(item, dict):
             raise parse_error("pods[]")
-        out.append({
-            "id": _str(item, "id", "pod"), "name": _str(item, "name", "pod"),
-            "status": _str(item, "desiredStatus", "pod"), "cost": _num(item, "costPerHr", "pod"),
-            "created_at": _time(item.get("createdAt"), "pod.createdAt"),
-        })  # fmt: skip
+        out.append({"id": _str(item, "id", "pod"), "name": _str(item, "name", "pod"),
+                     "status": _str(item, "desiredStatus", "pod")})  # fmt: skip
     return out
+
+
+def parse_pods_soft(raw: Any) -> tuple[list[dict[str, Any]], list[str]]:
+    """`parse_pods_min` + optional `cost` and `started_at`; a bad optional value becomes None
+    and an error line (the caller STOPs after its checks), never an exception."""
+    pods = parse_pods_min(raw)
+    errors: list[str] = []
+    for pod, item in zip(pods, raw, strict=True):
+        try:
+            pod["cost"] = _cost(item.get("costPerHr"))
+        except GuardError as exc:
+            pod["cost"] = None
+            errors.append(f"{exc} ({pod['id']})")
+        started = item.get("lastStartedAt") or None  # absent while the image is pulled
+        try:
+            pod["started_at"] = None if started is None else _time(started, "pod.lastStartedAt")
+        except GuardError as exc:
+            pod["started_at"] = None
+            errors.append(f"{exc} ({pod['id']})")
+    return pods, errors
+
+
+def parse_pods(raw: Any) -> list[dict[str, Any]]:
+    """Strict form of `parse_pods_soft` (tests, `record`): any bad optional value raises."""
+    pods, errors = parse_pods_soft(raw)
+    if errors:
+        raise parse_error(errors[0].removeprefix("parse error: "))
+    return pods
 
 
 def parse_named(raw: Any, kind: str) -> list[dict[str, Any]]:
@@ -194,13 +260,24 @@ def fetch_account(key: str) -> tuple[float, float]:
 
 
 def take_snapshot(key: str) -> dict[str, Any]:
-    balance, spend = fetch_account(key)
-    snap: dict[str, Any] = {
-        "taken_at": NOW(), "balance": balance, "spend_per_hr": spend,
-        "pods": parse_pods(http_json("GET", REST + "/pods", key)),
-    }  # fmt: skip
+    """Pods first (a failure there is fatal: nothing can be decided); the account and the
+    report-only kinds are soft: a failure is an entry of `errors` (STOP after the checks)."""
+    pods, errors = parse_pods_soft(http_json("GET", REST + "/pods", key))
+    balance: float | None = None
+    spend: float | None = None
+    try:
+        balance, spend = fetch_account(key)
+    except GuardError as exc:
+        errors.append(f"account: {exc}")
+    snap: dict[str, Any] = {"taken_at": NOW(), "balance": balance, "spend_per_hr": spend,
+                            "pods": pods}  # fmt: skip
     for kind, path in EXTRA_KINDS.items():
-        snap[kind] = parse_named(http_json("GET", REST + path, key), kind)
+        try:
+            snap[kind] = parse_named(http_json("GET", REST + path, key), kind)
+        except GuardError as exc:
+            snap[kind] = []
+            errors.append(f"{kind}: {exc}")
+    snap["errors"] = errors
     return snap
 
 
@@ -215,8 +292,10 @@ def diff(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
         ai, bi = _ids(a, kind), _ids(b, kind)
         out["new"][kind] = [x for x in b.get(kind, []) if x["id"] not in ai]
         out["gone"][kind] = [x for x in a.get(kind, []) if x["id"] not in bi]
-    out["balance_delta_cents"] = round((float(b["balance"]) - float(a["balance"])) * 100)
-    out["spend_per_hr"] = float(b["spend_per_hr"])
+    known = a.get("balance") is not None and b.get("balance") is not None
+    out["balance_delta_cents"] = (round((float(b["balance"]) - float(a["balance"])) * 100)
+                                  if known else None)  # fmt: skip
+    out["spend_per_hr"] = None if b.get("spend_per_hr") is None else float(b["spend_per_hr"])
     return out
 
 
@@ -235,13 +314,23 @@ def candidates(before: dict[str, Any], now_snap: dict[str, Any]) -> list[dict[st
             and p["status"].upper() != "TERMINATED"]  # fmt: skip
 
 
-def triggers(before: dict[str, Any], now_snap: dict[str, Any], now: float) -> list[str]:
+def pod_age(p: dict[str, Any], now: float, first_seen: dict[str, float] | None) -> float | None:
+    """`now - min(first seen, lastStartedAt)` (REV-S2): a pod that still pulls its image has
+    no `lastStartedAt` (it bills already), a restart resets it; the first sight never moves."""
+    times = [t for t in ((first_seen or {}).get(p["id"]), p.get("started_at")) if t is not None]
+    return now - min(times) if times else None
+
+
+def triggers(before: dict[str, Any], now_snap: dict[str, Any], now: float,
+             first_seen: dict[str, float] | None = None) -> list[str]:  # fmt: skip
     live = [p for p in now_snap["pods"] if LABEL.match(p["name"])
             and p["status"].upper() != "TERMINATED"]  # fmt: skip
     out = []
-    if any(now - p["created_at"] > MAX_AGE_S for p in candidates(before, now_snap)):
+    ages = [pod_age(p, now, first_seen) for p in candidates(before, now_snap)]
+    if any(a is not None and a > MAX_AGE_S for a in ages):
         out.append("age>75min")
-    if float(now_snap["spend_per_hr"]) > MAX_SPEND_H:
+    spend = now_snap.get("spend_per_hr")
+    if spend is not None and float(spend) > MAX_SPEND_H:
         out.append(f"spend>{MAX_SPEND_H}")
     if len(live) > MAX_PODS:
         out.append(f"pods>{MAX_PODS}")
@@ -257,16 +346,42 @@ def _log_action(state_dir: Path | None, text: str) -> None:
         f.write(f"{stamp} {text}\n")
 
 
-def destroy(pods: list[dict[str, Any]], rw_key: str, state_dir: Path | None, why: str) -> int:
+def delete_pod(pod_id: str, rw_key: str) -> str:
+    """"deleted" or "gone". RunPod documents DELETE /pods/{id} -> 204/400/401 (no 404): a 400
+    or 404 is checked with GET /pods/{id}, whose 404 means gone (REV-S4/R2-7)."""
+    try:
+        http_json("DELETE", f"{REST}/pods/{pod_id}", rw_key)
+        return "deleted"
+    except GuardError as exc:
+        if exc.status not in (400, 404):
+            raise
+        try:
+            http_json("GET", f"{REST}/pods/{pod_id}", rw_key)
+        except GuardError as get_exc:
+            if get_exc.status == 404:
+                return "gone"
+        raise
+
+
+def destroy(pods: list[dict[str, Any]], rw_key: str, state_dir: Path | None, why: str
+            ) -> tuple[int, list[str]]:  # fmt: skip
+    """Delete every pod (REV-S8: one failure never stops the others) -> (done, failures)."""
     n = 0
+    failed: list[str] = []
     for p in pods:
         if not LABEL.match(p["name"]):  # belt and braces: never a foreign pod
             continue
-        http_json("DELETE", f"{REST}/pods/{p['id']}", rw_key)
-        _log_action(state_dir, f"destroy pod {p['id']} {p['name']} ({why})")
-        print(f"destroyed pod {p['id']} {p['name']} ({why})")
+        try:
+            result = delete_pod(p["id"], rw_key)
+        except GuardError as exc:
+            failed.append(p["id"])
+            _log_action(state_dir, f"destroy pod {p['id']} {p['name']} FAILED: {exc} ({why})")
+            print(f"STOP: destroy pod {p['id']} {p['name']} FAILED: {exc} ({why})")
+            continue
+        _log_action(state_dir, f"destroy pod {p['id']} {p['name']} {result} ({why})")
+        print(f"destroyed pod {p['id']} {p['name']} {result} ({why})")
         n += 1
-    return n
+    return n, failed
 
 
 def load_snapshot(path: str) -> dict[str, Any]:
@@ -279,8 +394,31 @@ def load_snapshot(path: str) -> dict[str, Any]:
     return snap
 
 
+def load_first_seen(state_dir: Path) -> tuple[dict[str, float], bool]:
+    """-> (first-seen times, reset). A missing file is the first pass; an unreadable or
+    malformed one is reset to empty (every pod is seen "now") and reported as a STOP."""
+    path = state_dir / FIRST_SEEN
+    if not path.exists():
+        return {}, False
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}, True
+    if not isinstance(doc, dict) or not all(
+            isinstance(k, str) and isinstance(v, int | float) and not isinstance(v, bool)
+            for k, v in doc.items()):  # fmt: skip
+        return {}, True
+    return {k: float(v) for k, v in doc.items()}, False
+
+
+def update_first_seen(seen: dict[str, float], pods: list[dict[str, Any]], now: float
+                      ) -> dict[str, float]:  # fmt: skip
+    """Keep the first sight of every pod listed now; forget pods that are gone."""
+    return {p["id"]: seen.get(p["id"], now) for p in pods}
+
+
 def _write_json(path: Path, doc: Any) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     tmp = path.with_name(path.name + ".tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -289,13 +427,24 @@ def _write_json(path: Path, doc: Any) -> None:
 
 
 # ------------------------------------------------------------------ commands
+def _fmt(v: float | None, spec: str) -> str:
+    return "?" if v is None else format(v, spec)
+
+
+def _report_errors(errors: list[str]) -> None:
+    for e in errors:
+        print(f"error: {e}", file=sys.stderr)
+        print(f"STOP: {e}")
+
+
 def cmd_snapshot(a: argparse.Namespace) -> int:
     snap = take_snapshot(read_key(a.key_file))
     _write_json(Path(a.out), snap)
     print(f"snapshot: pods={len(snap['pods'])} volumes={len(snap['volumes'])} "
-          f"templates={len(snap['templates'])} balance={snap['balance']:.2f} "
-          f"spend/h={snap['spend_per_hr']:.3f}")  # fmt: skip
-    return 0
+          f"templates={len(snap['templates'])} balance={_fmt(snap['balance'], '.2f')} "
+          f"spend/h={_fmt(snap['spend_per_hr'], '.3f')}")  # fmt: skip
+    _report_errors(snap["errors"])
+    return 4 if snap["errors"] else 0
 
 
 def _print_diff(d: dict[str, Any]) -> None:
@@ -303,7 +452,8 @@ def _print_diff(d: dict[str, Any]) -> None:
         for kind, items in d[side].items():
             for x in items:
                 print(f"{side} {kind} {x['id']} {x.get('name', '')}")
-    print(f"balance_delta_cents={d['balance_delta_cents']} spend_per_hr={d['spend_per_hr']:.3f}")
+    print(f"balance_delta_cents={d['balance_delta_cents']} "
+          f"spend_per_hr={_fmt(d['spend_per_hr'], '.3f')}")
 
 
 def cmd_diff(a: argparse.Namespace) -> int:
@@ -340,54 +490,107 @@ def cmd_record(a: argparse.Namespace) -> int:
     return 0
 
 
+def parse_until(text: str) -> float:
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    try:
+        return _time(text, "--until")
+    except GuardError:
+        raise GuardError(2, f"--until {text!r}: not ISO-8601 or epoch seconds") from None
+
+
+def _no_before(path: str, why: str) -> GuardError:
+    msg = (f"STOP: no usable before snapshot {path} ({why}): the guard is NOT watching, "
+           "auto-destroy is off")  # fmt: skip
+    print(msg, flush=True)
+    return GuardError(8, msg)
+
+
+def watch_pass(key: str, rw: str | None, before: dict[str, Any], state: Path | None,
+               until: float) -> int:
+    """One pass: snapshot, report, thresholds, deletes; STOP codes only after the deletes."""
+    snap = take_snapshot(key)
+    now = NOW()
+    d = diff(before, snap)
+    seen: dict[str, float] = {}
+    reset = False
+    if state is not None:
+        seen, reset = load_first_seen(state)
+        seen = update_first_seen(seen, snap["pods"], now)
+        _write_json(state / FIRST_SEEN, seen)
+    ours = [p for p in snap["pods"] if LABEL.match(p["name"])]
+    stamp = dt.datetime.fromtimestamp(now, dt.UTC).strftime("%H:%M:%SZ")
+    extra = sum(len(d["new"][k]) for k in EXTRA_KINDS)
+    print(f"{stamp} llmhub_pods={len(ours)} spend/h={_fmt(snap['spend_per_hr'], '.3f')} "
+          f"balance_delta_cents={d['balance_delta_cents']} new_other={extra}", flush=True)  # fmt: skip
+    for k in EXTRA_KINDS:
+        for x in d["new"][k]:
+            print(f"STOP: new {k} {x['id']} {x['name']} (reported, not deleted)")
+    fired = triggers(before, snap, now, seen if state is not None else None)
+    failed: list[str] = []
+    if fired:
+        print(f"STOP: threshold {','.join(fired)}")
+        todo = candidates(before, snap)
+        if rw is not None and todo and now >= until:
+            print(f"guard expired at {until:.0f}: report only, {len(todo)} pod(s) NOT deleted")
+        elif rw is not None and todo:
+            _, failed = destroy(todo, rw, state, ",".join(fired))
+    if reset:
+        print("STOP: guard state reset (first_seen.json unreadable; ages restart now)")
+    _report_errors(snap["errors"])
+    if failed:
+        return 7
+    if fired:
+        return 6
+    if extra:
+        return 5
+    return 4 if reset or snap["errors"] else 0
+
+
 def cmd_watch(a: argparse.Namespace) -> int:
     key = read_key(a.key_file)
     rw = read_key(a.rw_key_file) if a.auto_destroy else None
     if a.auto_destroy and rw is None:
         raise GuardError(2, "--auto-destroy needs --rw-key-file")
-    before = load_snapshot(a.before)
+    try:
+        before = load_snapshot(a.before)
+    except GuardError as exc:
+        raise _no_before(a.before, str(exc)) from None
     state = Path(a.state_dir) if a.state_dir else None
+    if a.until is not None:
+        until = parse_until(a.until)
+    else:
+        taken = before.get("taken_at")
+        if not isinstance(taken, int | float) or isinstance(taken, bool):
+            raise _no_before(a.before, "no taken_at")
+        until = float(taken) + DEFAULT_TTL_S
+    if rw is not None and NOW() >= until:
+        print(f"guard expired at {until:.0f}: report only")
     while True:
-        snap = take_snapshot(key)
-        d = diff(before, snap)
-        now = NOW()
-        ours = [p for p in snap["pods"] if LABEL.match(p["name"])]
-        stamp = dt.datetime.fromtimestamp(now, dt.UTC).strftime("%H:%M:%SZ")
-        extra = sum(len(d["new"][k]) for k in EXTRA_KINDS)
-        print(f"{stamp} llmhub_pods={len(ours)} spend/h={snap['spend_per_hr']:.3f} "
-              f"balance_delta_cents={d['balance_delta_cents']} new_other={extra}", flush=True)  # fmt: skip
-        code = 0
-        if extra:
-            for k in EXTRA_KINDS:
-                for x in d["new"][k]:
-                    print(f"STOP: new {k} {x['id']} {x['name']} (reported, not deleted)")
-            code = 5
-        fired = triggers(before, snap, now)
-        if fired:
-            print(f"STOP: threshold {','.join(fired)}")
-            if rw is not None:
-                todo = candidates(before, snap)
-                if todo:
-                    destroy(todo, rw, state, ",".join(fired))
-                    code = 6
-            code = code or 6
+        code = watch_pass(key, rw, before, state, until)
         if a.once or code:
             return code
         time.sleep(60)
 
 
 def cmd_destroy_leftovers(a: argparse.Namespace) -> int:
+    """Emergency path: only `id`/`name`/`desiredStatus` of `GET /pods` are needed (REV-S1);
+    the account, the other kinds and the optional pod fields are not even read."""
     rw = read_key(a.key_file)
     before = load_snapshot(a.before)
-    todo = candidates(before, take_snapshot(rw))
+    todo = candidates(before, {"pods": parse_pods_min(http_json("GET", REST + "/pods", rw))})
     if not a.yes:
         for p in todo:
             print(f"would destroy pod {p['id']} {p['name']}")
         print(f"dry run: {len(todo)} pod(s); add --yes")
         return 0
-    n = destroy(todo, rw, Path(a.state_dir) if a.state_dir else None, "destroy-leftovers")
-    print(f"destroyed {n} pod(s)")
-    return 0
+    n, failed = destroy(todo, rw, Path(a.state_dir) if a.state_dir else None,
+                        "destroy-leftovers")  # fmt: skip
+    print(f"destroyed {n} pod(s)" + (f"; FAILED {len(failed)}: {' '.join(failed)}" if failed
+                                     else ""))  # fmt: skip
+    return 7 if failed else 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -409,6 +612,8 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--auto-destroy", action="store_true")
     w.add_argument("--rw-key-file", default=None)
     w.add_argument("--state-dir", default=None)
+    w.add_argument("--until", default=None,
+                   help="after this time (ISO-8601 or epoch s) only report, never delete")
     x = sub.add_parser("destroy-leftovers")
     x.add_argument("--key-file", required=True)
     x.add_argument("--before", required=True)
@@ -417,6 +622,9 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     if a.cmd == "watch" and a.auto_destroy and not a.rw_key_file:
         print("error: --auto-destroy needs --rw-key-file", file=sys.stderr)
+        return 2
+    if a.cmd == "watch" and a.auto_destroy and not a.state_dir:
+        print("error: --auto-destroy needs --state-dir (pod ages persist there)", file=sys.stderr)
         return 2
     fn = {"snapshot": cmd_snapshot, "diff": cmd_diff, "record": cmd_record, "watch": cmd_watch,
           "destroy-leftovers": cmd_destroy_leftovers}[a.cmd]  # fmt: skip

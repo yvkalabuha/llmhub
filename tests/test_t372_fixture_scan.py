@@ -55,10 +55,14 @@ def test_guard_units() -> None:
 
 
 def test_guard_env_has_paths_only() -> None:
+    """Paths, plus the expiry time GUARD_UNTIL (REV-S9); never a key value."""
     for line in (WS / "guard.env.example").read_text().splitlines():
         if not line or line.startswith("#"):
             continue
         name, _, value = line.partition("=")
+        if name == "GUARD_UNTIL":
+            assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ", value), line
+            continue
         assert name.startswith("GUARD_") and value.startswith("/"), line
         assert not re.search(r"rpa_|ghp_|hf_|sk-", value)
 

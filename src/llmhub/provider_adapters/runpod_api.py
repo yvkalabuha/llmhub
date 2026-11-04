@@ -69,7 +69,14 @@ class PodInfo:
     cost_per_hr: float | None
     machine_id: str | None
     image: str | None
-    created_at: float | None  # env is never kept (C11)
+    created_at: float | None  # `lastStartedAt` (the real Pod has no createdAt, R2-3)
+    # money fields of the answer, checked after create (REV-S10); None = not in the answer
+    volume_in_gb: float | None = None
+    interruptible: bool | None = None
+    network_volume_id: str | None = None
+    # those of the three above with an unexpected type: never a parse error (a foreign pod
+    # must not blind `list_pods`), but a mismatch for a pod we just created
+    odd_fields: tuple[str, ...] = ()  # env is never kept (C11)
 
 
 @dataclass(frozen=True)
@@ -170,6 +177,20 @@ class _Parser:
             raise self.fail(key)
         return float(v)
 
+    def money(self, d: Mapping[str, Any], key: str) -> float | None:
+        """Optional number; a numeric string is accepted (openapi `costPerHr`: type number,
+        format currency, example "0.74"; REV-S5/R2-9)."""
+        v = d.get(key)
+        if isinstance(v, str):
+            try:
+                f = float(v.strip())
+            except ValueError:
+                raise self.fail(key) from None
+            if not math.isfinite(f):
+                raise self.fail(key)
+            return f
+        return self.number(d, key, optional=True)
+
     def req_num(self, d: Mapping[str, Any], key: str) -> float:
         v = self.number(d, key)
         assert v is not None
@@ -221,14 +242,37 @@ def parse_pod(raw: Any, p: _Parser) -> PodInfo:
     image = p.string(d, "image", optional=True)
     if image is None:
         image = p.string(d, "imageName", optional=True)
+    started = d.get("lastStartedAt")
+    odd: list[str] = []
+    vol = d.get("volumeInGb")
+    if vol is not None and (isinstance(vol, bool) or not isinstance(vol, int | float)):
+        odd.append("volumeInGb")
+        vol = None
+    flag = d.get("interruptible")
+    if flag is not None and not isinstance(flag, bool):
+        odd.append("interruptible")
+        flag = None
+    nv = d.get("networkVolume")
+    nv_id: str | None = None
+    if isinstance(nv, dict):  # an object with an id = a network volume is attached
+        raw_id = nv.get("id")
+        nv_id = raw_id if isinstance(raw_id, str) and raw_id else None
+        if raw_id is not None and not isinstance(raw_id, str):
+            odd.append("networkVolume")
+    elif nv is not None:
+        odd.append("networkVolume")
     return PodInfo(
         id=pod_id,
         name=p.req_str(d, "name"),
         desired_status=p.req_str(d, "desiredStatus"),
-        cost_per_hr=p.number(d, "costPerHr", optional=True),
+        cost_per_hr=p.money(d, "costPerHr"),
         machine_id=p.string(d, "machineId", optional=True),
         image=image,
-        created_at=p.timestamp(d, "createdAt"),
+        created_at=None if started in (None, "") else p.timestamp(d, "lastStartedAt"),
+        volume_in_gb=None if vol is None else float(vol),
+        interruptible=flag,
+        network_volume_id=nv_id,
+        odd_fields=tuple(odd),
     )
 
 
@@ -367,8 +411,18 @@ class RunpodApi:
         return [parse_pod(x, p) for x in await self._list("/pods", "/pods")]
 
     async def get_pod(self, pod_id: str) -> PodInfo | None:
-        raw = await self._rest("GET", f"/pods/{_seg(pod_id, 'GET')}", "/pods/{id}",
-                               allow_404=True)  # fmt: skip
+        """None = no such pod. The openapi documents 400 and 404 for GET /pods/{id}: a 400 is
+        checked against the full list (R2-7): not listed -> None, else the 400 is raised."""
+        try:
+            raw = await self._rest("GET", f"/pods/{_seg(pod_id, 'GET')}", "/pods/{id}",
+                                   allow_404=True)  # fmt: skip
+        except RunpodHttpError as exc:
+            if exc.status != 400 or isinstance(exc, RunpodParseError):
+                raise
+            listed = next((x for x in await self.list_pods() if x.id == pod_id), None)
+            if listed is None:
+                return None
+            raise
         return None if raw is None else parse_pod(raw, _Parser("GET", "/pods/{id}"))
 
     async def create_pod(self, body: Mapping[str, Any]) -> PodInfo:
@@ -376,9 +430,19 @@ class RunpodApi:
         return parse_pod(raw, _Parser("POST", "/pods"))
 
     async def delete_pod(self, pod_id: str) -> bool:
-        raw = await self._rest("DELETE", f"/pods/{_seg(pod_id, 'DELETE')}", "/pods/{id}",
-                               allow_404=True)  # fmt: skip
-        return raw is not None
+        """True = accepted, False = already gone. The openapi documents DELETE /pods/{id} ->
+        204/400/401 (no 404): a 400 (or 404) is checked with `get_pod` (REV-S4/R2-7); gone
+        or TERMINATED -> False, otherwise the original error is raised."""
+        try:
+            await self._rest("DELETE", f"/pods/{_seg(pod_id, 'DELETE')}", "/pods/{id}")
+        except RunpodHttpError as exc:
+            if exc.status not in (400, 404) or isinstance(exc, RunpodParseError):
+                raise
+            pod = await self.get_pod(pod_id)
+            if pod is None or pod.desired_status.upper() == "TERMINATED":
+                return False
+            raise
+        return True
 
     # --- read-only views (report only; never created or deleted, F4) ------------
     async def list_network_volumes(self) -> list[NamedRef]:
@@ -415,9 +479,18 @@ class RunpodApi:
         return out
 
     async def myself(self) -> AccountInfo:
-        data = await self._graphql(
-            "query { myself { clientBalance currentSpendPerHr spendLimit } }", "graphql:myself"
-        )
+        """GraphQL is not in the openapi (R2-10, verified only in L1). `spendLimit` may not
+        exist: a GraphQL error asks again without it (`spend_limit=None`)."""
+        try:
+            data = await self._graphql(
+                "query { myself { clientBalance currentSpendPerHr spendLimit } }",
+                "graphql:myself",
+            )
+        except RunpodHttpError as exc:
+            if exc.status != 200 or isinstance(exc, RunpodParseError):
+                raise
+            data = await self._graphql("query { myself { clientBalance currentSpendPerHr } }",
+                                       "graphql:myself")  # fmt: skip
         p = _Parser("POST", "graphql:myself")
         me = p.obj(data.get("myself"), "myself")
         return AccountInfo(
