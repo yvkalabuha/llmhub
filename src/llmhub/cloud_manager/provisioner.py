@@ -19,6 +19,7 @@ Provider calls never run inside a DB transaction.
 from __future__ import annotations
 
 import enum
+import hashlib
 import json
 import sqlite3
 from collections.abc import Callable, Coroutine
@@ -353,8 +354,74 @@ SLOW_MIN_S = 60.0  # no early E7 during the first minute of LOADING_MODEL
 # pod reports byte counts, so a short dip (chunk retry, CDN pause) cannot kill a pod that fits.
 SLOW_CONFIRM_S = 30.0
 _DOWNLOAD_PHASES = frozenset({"downloading", "verifying", "loading"})
-# F6: pod failure reasons that point at our config/sources, not at the host -> no blacklist
-_CONFIG_REASONS = frozenset({"exhausted", "sha_mismatch", "size_mismatch"})
+# F6 / R2-1: per-source reasons that point at our config/sources, not at the host. `exhausted`
+# (every source failed) is a config error only when EVERY per-source cause is one of these;
+# otherwise (network, slow, 5xx, unknown, no causes reported) the host is blacklisted.
+_CONFIG_REASONS = frozenset({"sha_mismatch", "size_mismatch", "http_4xx"})
+WEIGHTS_HOLD_PREFIX = "weights_hold:"
+
+
+def is_config_failure(reason: str, causes: tuple[str, ...]) -> bool:
+    """Pod `failed` -> True when the weights config/sources are at fault (R2-1)."""
+    if reason in _CONFIG_REASONS:
+        return True
+    return reason == "exhausted" and bool(causes) and set(causes) <= _CONFIG_REASONS
+
+
+def weights_fingerprint(cfg: Config, pool: str) -> str:
+    """Hash of the pool's weight set + the source chain: a config change voids the hold."""
+    pc = cfg.pools.get(pool)
+    wset = None if pc is None or pc.weights is None else cfg.weights.sets.get(pc.weights)
+    blob = json.dumps(
+        {
+            "set": None if wset is None else wset.model_dump(mode="json"),
+            "sources": [s.model_dump(mode="json") for s in cfg.weights.sources],
+        },
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(blob.encode()).hexdigest()[:16]
+
+
+def _hold_key(pool: str) -> str:
+    return f"{WEIGHTS_HOLD_PREFIX}{pool}"
+
+
+def set_weights_hold(
+    conn: sqlite3.Connection, pool: str, now: float, cfg: Config, cause: str
+) -> float:
+    """Hold the pool's launches after a weights config error (R2-1); returns `until`."""
+    until = now + cfg.retry.host_blacklist_s
+    value = {"until": until, "fp": weights_fingerprint(cfg, pool), "cause": cause[:80]}
+    set_key(conn, _hold_key(pool), json.dumps(value, sort_keys=True), now)
+    return until
+
+
+def weights_hold_until(
+    conn: sqlite3.Connection, pool: str, now: float, cfg: Config
+) -> float | None:
+    """`until` of a live hold; None when there is none, it expired, or the config changed
+    (an expired/void key is left for `clear_weights_hold`/the next hold to overwrite)."""
+    raw = get_key(conn, _hold_key(pool))
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+        until = float(value["until"])
+        fp = str(value["fp"])
+    except (ValueError, KeyError, TypeError):
+        return None  # unreadable -> no hold (fail open is safe: one launch, then a new hold)
+    if now >= until or fp != weights_fingerprint(cfg, pool):
+        return None
+    return until
+
+
+def clear_weights_hold(conn: sqlite3.Connection, pool: str) -> bool:
+    """Admin: lift the hold. True when a key was removed."""
+    with tx(conn):
+        had = get_key(conn, _hold_key(pool)) is not None
+        delete_key(conn, _hold_key(pool))
+    return had
 
 
 def _progress_key(iid: str) -> str:
@@ -371,10 +438,13 @@ def _clear_load_keys(conn: sqlite3.Connection, iid: str) -> None:
 
 
 def _weights_error(conn: sqlite3.Connection, inst: sqlite3.Row, now: float, cfg: Config,
-                   cause: str, *, host_fault: bool = True) -> None:  # fmt: skip
+                   cause: str, *, host_fault: bool = True,
+                   causes: tuple[str, ...] = ()) -> None:  # fmt: skip
     """Early E7 (LOADING_MODEL -> ERROR) without waiting for `loading_model_s`.
 
-    `host_fault=False` (config/source errors, F6): no host blacklist, a high incident instead.
+    `host_fault=False` (config/source errors, F6/R2-1): no host blacklist; the pool is held
+    (`weights_hold:<pool>`, no paid launch until it expires, the config changes or an admin
+    clears it) and a critical incident is recorded.
     """
     with tx(conn):
         if transition(conn, inst["id"], State.LOADING_MODEL, State.ERROR, "E7", now,
@@ -383,10 +453,12 @@ def _weights_error(conn: sqlite3.Connection, inst: sqlite3.Row, now: float, cfg:
                 blacklist_host(conn, inst["provider"], inst["host_id"], now,
                                cfg.retry.host_blacklist_s, cause)  # fmt: skip
             else:
+                until = set_weights_hold(conn, inst["pool"], now, cfg, cause)
                 record_incident(
-                    conn, now, "weights_config", "high", ref=inst["id"],
+                    conn, now, "weights_config", "critical", ref=inst["id"],
                     dedup_key=f"weights_config:{inst['pool']}:{int(now // 3600)}",
-                    details={"cause": cause},
+                    details={"cause": cause, "causes": list(causes), "hold_until": until,
+                             "pool": inst["pool"]},
                 )  # fmt: skip
             _clear_load_keys(conn, inst["id"])
 
@@ -437,12 +509,16 @@ async def _load_progress(
     if st.status == "failed":
         reason = st.reason or "unknown"
         _weights_error(conn, inst, now, cfg, f"weights_failed:{reason}"[:80],
-                       host_fault=reason not in _CONFIG_REASONS)  # fmt: skip
+                       host_fault=not is_config_failure(reason, st.causes),
+                       causes=st.causes)  # fmt: skip
         return True
     slow = _too_slow(st, inst, now, cfg)
     raw = get_key(conn, _slow_key(iid))
     slow_since = (float(raw) if raw is not None else now) if slow else None
     with tx(conn):
+        cur = conn.execute("SELECT state FROM instances WHERE id=?", (iid,)).fetchone()
+        if cur is None or cur["state"] != State.LOADING_MODEL:
+            return True  # left LOADING_MODEL during the poll: transition() dropped the keys
         set_key(conn, _progress_key(iid), json.dumps(st.to_json_dict(), sort_keys=True), now)
         if slow_since is None:
             delete_key(conn, _slow_key(iid))

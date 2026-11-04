@@ -21,6 +21,7 @@ class MockInferenceKnobs:
     hang_load: bool = False
     # load_status (LoadStatusSource, T-370): failure reason, fixed ETA, fallback sources left
     load_fail: str | None = None
+    load_causes: tuple[str, ...] = ()  # per-source reasons reported with load_fail (R2-1)
     load_eta_s: float | None = None  # None -> remaining load_s (unknown while hang_load)
     load_sources_left: int = 1
 
@@ -72,7 +73,7 @@ class MockInference:
             return None
         k = self.knobs
         if k.load_fail is not None:
-            return LoadStatus(status="failed", reason=k.load_fail)
+            return LoadStatus(status="failed", reason=k.load_fail, causes=k.load_causes)
         left = since + k.load_s - self.clock.now()
         if not k.hang_load and left <= 0:
             return LoadStatus(status="ok")

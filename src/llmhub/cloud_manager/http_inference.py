@@ -36,6 +36,7 @@ import hashlib
 import json
 import logging
 import math
+import re
 import sqlite3
 import ssl
 from collections.abc import Callable, Mapping
@@ -145,6 +146,7 @@ def parse_timings(body: Mapping[str, Any] | object) -> Timings | None:
 
 # --- streaming ---------------------------------------------------------------------------
 _STREAM_OPTS = {"include_usage": True}
+_SSE_EOL = re.compile(r"\r\n|\r|\n")
 
 
 def force_stream(body: bytes) -> bytes:
@@ -198,7 +200,9 @@ def assemble_sse(content: bytes) -> tuple[dict[str, Any] | None, bool]:
     done = False
     finished = False
     seen = False
-    for raw_line in text.splitlines():
+    # SSE lines end with CRLF/LF/CR only; str.splitlines() would also split on U+2028/U+2029/
+    # U+0085, which llama-server's JSON leaves raw inside strings (review r2)
+    for raw_line in _SSE_EOL.split(text):
         line = raw_line.strip()
         if line.startswith("error:"):
             err = _json(line[6:].strip().encode())
@@ -258,6 +262,34 @@ def assemble_sse(content: bytes) -> tuple[dict[str, Any] | None, bool]:
         out_choices.append(cur)
     out["choices"] = out_choices
     return out, done or finished
+
+
+CHARS_PER_TOKEN = 4.0  # rough estimate for answers without usage/timings (R2-7)
+
+
+def _estimate_tokens_out(data: Mapping[str, Any], max_tokens: int) -> int:
+    """ceil(answer chars / CHARS_PER_TOKEN), at least 1 for a non-empty answer, at most
+    `max_tokens` (when positive). Counts content, reasoning and tool call names/arguments."""
+    chars = 0
+    choices = data.get("choices")
+    for ch in choices if isinstance(choices, list) else []:
+        msg = ch.get("message") if isinstance(ch, dict) else None
+        if not isinstance(msg, dict):
+            continue
+        for k in ("content", "reasoning_content"):
+            v = msg.get(k)
+            if isinstance(v, str):
+                chars += len(v)
+        tools = msg.get("tool_calls")
+        for tc in tools if isinstance(tools, list) else []:
+            fn = tc.get("function") if isinstance(tc, dict) else None
+            if isinstance(fn, dict):
+                for k in ("name", "arguments"):
+                    v = fn.get(k)
+                    if isinstance(v, str):
+                        chars += len(v)
+    est = math.ceil(chars / CHARS_PER_TOKEN)
+    return min(est, max_tokens) if max_tokens > 0 else est
 
 
 # --- backend -------------------------------------------------------------------------------
@@ -621,7 +653,11 @@ class HttpInferenceBackend:
                 return int(pin), int(pout)
         if t is not None:
             return t.prompt_n, t.predicted_n
-        return job.tokens_in, 0
+        # R2-7: no usage and no timings (e.g. the stream ended after finish_reason, before the
+        # usage chunk): estimate from the answer length instead of billing 0 output tokens
+        est = _estimate_tokens_out(data, job.max_tokens)
+        log.warning("answer without usage/timings: tokens_out estimated as %d", est)
+        return job.tokens_in, est
 
     async def aclose(self) -> None:
         clients = [c for _, c in self._clients.values()]

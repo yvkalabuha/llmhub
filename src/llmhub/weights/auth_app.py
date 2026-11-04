@@ -104,8 +104,10 @@ def build_auth_app(
             if size <= 0:
                 return finish(Verdict.PATH, op, 403)
             # If-Range (SEC-1): on a validator mismatch nginx ignores Range and sends 200 with
-            # the whole file, so any If-Range is charged as the whole file.
-            if h.get("x-if-range", "").strip():
+            # the whole file, so any If-Range is charged as the whole file. An EMPTY If-Range
+            # does the same (review r2): its presence is seen in the original headers, which
+            # nginx forwards to the auth subrequest (proxy_pass_request_headers is on).
+            if "if-range" in h or h.get("x-if-range", "").strip():
                 need = size
             else:
                 need = requested_bytes(h.get("x-range"), size)

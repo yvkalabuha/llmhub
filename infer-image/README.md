@@ -22,7 +22,7 @@
 
 ## Семантика фронта
 - `GET /ping` → 204 без ключа (BOOTING → LOADING_MODEL).
-- `GET /health` (ключ): 503 `{"status":"loading", phase, file, source, done, total, mb_s, failovers, eta_s, sources_left}`; 503 `phase=llama_load`; 200 `{"status":"ok"}` только когда llama-server ответил 200; 500 `{"status":"failed","reason"}` (`weights`, `deadline`, `llama_exited`, `internal`) — процесс жив, перезапусков нет.
+- `GET /health` (ключ): 503 `{"status":"loading", phase, file, source, done, total, mb_s, failovers, eta_s, sources_left}`; 503 `phase=llama_load`; 200 `{"status":"ok"}` только когда llama-server ответил 200; 500 `{"status":"failed","reason"[,"causes"]}` (`exhausted`, `disk`, `deadline`, `llama_exited`, `internal`) — процесс жив, перезапусков нет. При `exhausted` поле `causes` — отсортированные причины отказа источников (`sha_mismatch`, `size_mismatch`, `http_4xx`, `http_5xx`, `network`, `slow`); контроллер считает сбой ошибкой конфига (без чёрного списка хоста, удержание пула) только если все причины из первых трёх.
 - `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, `/props` (ключ; путь проверяется до нормализации — `.`/`..`, `%2f`, `%5c`, пустые сегменты → 404, SEC-7) → потоковый прокси на `127.0.0.1:8081`; до READY — 503 `{"error":"not ready"}`; во время единственного перезапуска llama — 503 `{"error":"restarting"}` (контроллер: `NetworkLost` с ограничением, F9); llama недоступна — 502 `{"error":"upstream unavailable"}`.
 - Контроллер всегда шлёт поду `stream: true` и сам собирает SSE в один `chat.completion` (F1): байты идут всё время генерации, пауза `read_s` осмысленна, лимит прокси ~100 с (524) не срабатывает.
 

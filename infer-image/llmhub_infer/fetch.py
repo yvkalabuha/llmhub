@@ -35,12 +35,14 @@ _REDIRECTS = (301, 302, 303, 307, 308)
 
 
 class FetchError(Exception):
-    """Download failed. `.reason`: http_4xx|http_5xx|network|slow|sha_mismatch|size_mismatch|
-    disk|exhausted|deadline."""
+    """Download failed. `.reason`: http_4xx|http_5xx|rate_limited|network|slow|sha_mismatch|size_mismatch|
+    disk|exhausted|deadline. `.causes`: for `exhausted`, the sorted distinct per-source
+    failover reasons (review r2, R2-1: the controller tells config errors from host faults)."""
 
-    def __init__(self, reason: str, detail: str = "") -> None:
+    def __init__(self, reason: str, detail: str = "", causes: tuple[str, ...] = ()) -> None:
         super().__init__(f"{reason}: {detail}" if detail else reason)
         self.reason = reason
+        self.causes = causes
 
 
 class _Fail(Exception):
@@ -250,7 +252,8 @@ class Fetcher:
             self._src += 1
             self._bps = 0.0
             self._emit(force=True)
-        raise FetchError("exhausted")
+        causes = tuple(sorted({x["reason"] for x in self._failovers}))
+        raise FetchError("exhausted", causes=causes)
 
     def _missing_bytes(self, spec: FileSpec) -> int:
         """Bytes still to download. A segmented `.part` is sparse at full size, so the done
@@ -361,6 +364,8 @@ class Fetcher:
         code = resp.status_code
         if code >= 500:
             return _Fail("http_5xx", True)
+        if code in (408, 429):  # transient (timeout / rate limit), never a config error that holds the pool
+            return _Fail("rate_limited", True)
         if code >= 400 or code < 200 or code >= 300:
             return _Fail("http_4xx" if code >= 400 else "network", False)
         return None

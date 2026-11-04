@@ -328,7 +328,7 @@ async def _orchestrate(
         state.fail("deadline")
         return
     except FetchError as e:
-        state.fail(e.reason)
+        state.fail(e.reason, e.causes)
         return
     except Exception:  # noqa: BLE001 - never leak details; the pod stays up reporting failure
         state.fail("internal")

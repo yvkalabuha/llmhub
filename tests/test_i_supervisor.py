@@ -264,6 +264,7 @@ async def test_weights_exhausted_failed_but_alive(tmp_path: Path) -> None:
 
         r = await until(failed)
         assert r.json()["status"] == "failed"
+        assert r.json()["causes"] == ["http_4xx"]  # R2-1: per-source reasons reach /health
         await asyncio.sleep(0.3)
         assert pod.task is not None and not pod.task.done()
         assert (await c.get(pod.url("/ping"))).status_code == 204

@@ -198,7 +198,8 @@ async def test_run_tokens_from_timings_without_usage(env: Env) -> None:
     assert (res.tokens_in, res.tokens_out) == (1200, 78)
     env.fake.chat = chat_body(usage=False, timings=False)
     res = await env.backend.run(EP, job())
-    assert (res.tokens_in, res.tokens_out) == (100, 0)
+    # fix round 2 (R2-7): no usage/timings -> estimated from the answer length, not 0
+    assert (res.tokens_in, res.tokens_out) == (100, 1)
 
 
 async def test_run_llama_400_is_error_result(env: Env) -> None:

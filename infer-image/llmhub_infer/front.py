@@ -52,6 +52,7 @@ class PodState:
     source_names: tuple[str, ...] = ()
     phase: str = "loading"
     reason: str | None = None
+    causes: tuple[str, ...] = ()  # per-source failover reasons of a failed download (R2-1)
     progress: dict[str, Any] = field(default_factory=dict)
     restarting: bool = False
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
@@ -91,10 +92,18 @@ class PodState:
         with self._lock:
             return self.restarting and self.phase != "failed"
 
-    def fail(self, reason: str) -> None:
+    def fail(self, reason: str, causes: tuple[str, ...] = ()) -> None:
         with self._lock:
             self.phase = "failed"
             self.reason = reason
+            self.causes = tuple(causes)
+
+    def failed_body(self) -> dict[str, Any]:
+        with self._lock:
+            body: dict[str, Any] = {"status": "failed", "reason": self.reason}
+            if self.causes:
+                body["causes"] = list(self.causes)
+            return body
 
     def snapshot(self) -> tuple[str, str | None, dict[str, Any]]:
         with self._lock:
@@ -164,9 +173,9 @@ def build_app(
     async def health(request: Request) -> Response:
         if not authorized(request):
             return unauthorized()
-        phase, reason, progress = state.snapshot()
+        phase, _reason, progress = state.snapshot()
         if phase == "failed":
-            return JSONResponse({"status": "failed", "reason": reason}, status_code=500)
+            return JSONResponse(state.failed_body(), status_code=500)
         if phase == "loading":
             return JSONResponse(_loading_body(state, progress), status_code=503)
         try:

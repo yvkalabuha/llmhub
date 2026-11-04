@@ -31,7 +31,11 @@ from llmhub.cloud_manager.inference import (
 )
 from llmhub.cloud_manager.instance_env import MaterialFn
 from llmhub.cloud_manager.pools import PoolRuntime
-from llmhub.cloud_manager.provisioner import provision_step
+from llmhub.cloud_manager.provisioner import (
+    clear_weights_hold,
+    provision_step,
+    weights_hold_until,
+)
 from llmhub.configuration.models import Config
 from llmhub.cost_tracker import ledger
 from llmhub.cost_tracker.reconcile import (
@@ -82,6 +86,9 @@ MAX_FAILED_CYCLES = 3  # consecutive failed launch cycles of a pool before local
 # -> the instance is treated as lost (ERROR, host not blacklisted: mark_lost from READY/BUSY).
 NETWORK_LOST_FREE = 1
 NETWORK_LOST_INSTANCE_MAX = 3
+# R2-5: the in-memory NetworkLost counters are pruned every step (rows of instances that left
+# READY/BUSY/IDLE, jobs that are no longer queued/running in a pool) and hard-capped.
+NETWORK_LOST_MAX_ENTRIES = 4096
 INF = float("inf")
 
 
@@ -246,6 +253,7 @@ class Controller:
             self._purge_at = now
         timeouts.apply_timeouts(self.conn, now, self.cfg)
         await self._check_alive(now)
+        self._prune_netlost()
         self._before_error_to_stopping(now)
         machine.error_to_stopping(self.conn, now)
         teardown.mark_leaks(self.conn, now, self.cfg, "controller")
@@ -659,6 +667,13 @@ class Controller:
         prewarm = leases.live_count(self.conn, pool.name, now, [LeaseKind.PREWARM]) > 0
         if not jobs and not prewarm:
             return INF
+        held = weights_hold_until(self.conn, pool.name, now, self.cfg)
+        if held is not None:  # R2-1: weights config error -> no paid launch, local at once
+            if not jobs:
+                return held
+            with tx(self.conn):
+                self._fallback_pool(pool.name, UnavailableReason.DEPLOYMENT_ERROR, now)
+            return now
         t_cold = t_cold_p90(self.conn, pool.name, pool.cold_start_s_default)
         decision = launch_trigger(
             jobs, now, self.cfg.queue, t_cold, lambda j: work_seconds(j, pool), prewarm
@@ -811,6 +826,42 @@ class Controller:
         except Busy:  # R1-10: the result is on disk; the next step writes the completion
             self._pending_done[job["id"]] = (iid, result, cost, now, str(path))
 
+    def _prune_netlost(self) -> None:
+        """R2-5: drop counters of instances that no longer serve and of jobs that finished,
+        were cancelled or went to local fallback; then cap the size (oldest first)."""
+        if not self._netlost_job and not self._netlost_inst:
+            return
+        iids = sorted({*self._netlost_inst, *(k[1] for k in self._netlost_job)})
+        jids = sorted({k[0] for k in self._netlost_job})
+        live_i: set[str] = set()
+        for i in range(0, len(iids), 500):
+            chunk = iids[i : i + 500]
+            live_i |= {
+                r[0] for r in self.conn.execute(
+                    f"SELECT id FROM instances WHERE id IN ({','.join('?' * len(chunk))})"
+                    " AND state IN ('READY','BUSY','IDLE')",
+                    chunk,
+                ).fetchall()
+            }  # fmt: skip
+        live_j: set[str] = set()
+        for i in range(0, len(jids), 500):
+            chunk = jids[i : i + 500]
+            live_j |= {
+                r[0] for r in self.conn.execute(
+                    f"SELECT id FROM jobs WHERE id IN ({','.join('?' * len(chunk))})"
+                    " AND status IN ('queued','running') AND pool IS NOT NULL",
+                    chunk,
+                ).fetchall()
+            }  # fmt: skip
+        for iid in [i for i in self._netlost_inst if i not in live_i]:
+            del self._netlost_inst[iid]
+        for k in [k for k in self._netlost_job if k[1] not in live_i or k[0] not in live_j]:
+            del self._netlost_job[k]
+        while len(self._netlost_job) > NETWORK_LOST_MAX_ENTRIES:
+            del self._netlost_job[next(iter(self._netlost_job))]
+        while len(self._netlost_inst) > NETWORK_LOST_MAX_ENTRIES:
+            del self._netlost_inst[next(iter(self._netlost_inst))]
+
     def _forget_netlost(self, job_id: str) -> None:
         for k in [k for k in self._netlost_job if k[0] == job_id]:
             del self._netlost_job[k]
@@ -920,6 +971,13 @@ class Controller:
             )  # fmt: skip
         self._wake.set()
         return lease_id
+
+    def clear_weights_hold(self, pool: str) -> bool:
+        """Admin: lift the `weights_hold:<pool>` launch hold set by a weights config error
+        (R2-1) after the config/sources were fixed. True when a hold was removed."""
+        removed = clear_weights_hold(self.conn, pool)
+        self._wake.set()
+        return removed
 
     def release(self, pool: str) -> None:
         now = self.clock.now()

@@ -307,14 +307,17 @@ async def test_mark_lost_from_loading_clears_progress_keys(tmp_path: Path) -> No
 
 # --- F6 -------------------------------------------------------------------------------------
 @pytest.mark.parametrize(
-    ("reason", "blacklisted"),
-    [("exhausted", False), ("sha_mismatch", False), ("size_mismatch", False),
-     ("disk", True), ("deadline", True)],
+    ("reason", "causes", "blacklisted"),
+    [("exhausted", ("sha_mismatch",), False), ("exhausted", ("http_4xx", "size_mismatch"), False),
+     ("sha_mismatch", (), False), ("size_mismatch", (), False),
+     # fix round 2 (R2-1): `exhausted` without causes or with any non-config cause -> host
+     ("exhausted", (), True), ("exhausted", ("network", "sha_mismatch"), True),
+     ("disk", (), True), ("deadline", (), True)],
 )  # fmt: skip
 async def test_config_failures_do_not_blacklist_host(
-    tmp_path: Path, reason: str, blacklisted: bool
+    tmp_path: Path, reason: str, causes: tuple[str, ...], blacklisted: bool
 ) -> None:
-    knobs = MockInferenceKnobs(load_fail=reason)
+    knobs = MockInferenceKnobs(load_fail=reason, load_causes=causes)
     h = make_h(tmp_path, knobs=knobs)
     h.submit(make_job(0))
     await h.run_until(h.clock.now() + 60)

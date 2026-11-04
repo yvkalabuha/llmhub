@@ -14,6 +14,7 @@ from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 LoadStatusKind = Literal["loading", "ok", "failed"]
 _STATUSES: frozenset[str] = frozenset({"loading", "ok", "failed"})
+MAX_CAUSES = 16  # bounded: the body comes from a rented pod
 
 
 @dataclass(frozen=True)
@@ -27,6 +28,8 @@ class LoadStatus:
     reason: str | None = None
     eta_s: float | None = None  # None = unknown
     sources_left: int | None = None  # None = unknown
+    # `failed` + `exhausted`: distinct per-source failover reasons (R2-1); () = not reported
+    causes: tuple[str, ...] = ()
 
     def to_json_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -46,6 +49,13 @@ def _num(v: object) -> float | None:
 
 def _str(v: object, limit: int = 64) -> str | None:
     return v[:limit] if isinstance(v, str) else None
+
+
+def _causes(v: object) -> tuple[str, ...]:
+    if not isinstance(v, list):
+        return ()
+    items = cast(list[object], v)
+    return tuple(sorted({x[:32] for x in items[:MAX_CAUSES] if isinstance(x, str) and x}))
 
 
 def parse_load_status(body: object) -> LoadStatus | None:
@@ -71,4 +81,5 @@ def parse_load_status(body: object) -> LoadStatus | None:
         reason=_str(body.get("reason")),
         eta_s=_num(body.get("eta_s")),
         sources_left=None if left is None else int(left),
+        causes=_causes(body.get("causes")),
     )
