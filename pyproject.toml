@@ -1,0 +1,31 @@
+[project]
+name = "llmhub"
+dynamic = ["version"]
+description = "Hybrid LLM dispatcher: local llama-server plus on-demand cloud GPU (ADR-0138)"
+requires-python = ">=3.12"
+dependencies = ["fastapi", "uvicorn", "httpx", "pydantic>=2", "pyyaml"]
+
+[dependency-groups]
+dev = ["pytest", "pytest-asyncio", "ruff", "pyright[nodejs]", "types-pyyaml"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "src/llmhub/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/llmhub"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+src = ["src", "tests"]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
