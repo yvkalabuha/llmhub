@@ -5,7 +5,7 @@
 - Проект: llmhub
 - Тип: impl
 - Агент: analyst → implementer → reviewer
-- Статус: review
+- Статус: done
 - План: tasks/plans/T-373-plan.md
 - Приоритет: P2
 - Зависит от: T-369
@@ -258,3 +258,4 @@
 - `uv run pytest -q -p no:cacheprovider tests/test_m_*.py tests/test_review_t373_*.py` → 398 passed
 - `uv run pytest -q -p no:cacheprovider -m "not slow and not docker"` → 2914 passed, 110 deselected (101 с)
 - `uv run pytest -q -p no:cacheprovider` (полный, slow + docker) → **3023 passed, 1 skipped** (331 с), xfail нет.
+- 2026-11-04 (координатор): раунд 2 проверен (fast 2914 passed, ruff/pyright чисто); ревью 3 цикла + 2 раунда — принято, done.
