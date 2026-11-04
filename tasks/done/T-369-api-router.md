@@ -5,7 +5,7 @@
 - Проект: llmhub
 - Тип: impl
 - Агент: analyst → implementer → reviewer
-- Статус: review
+- Статус: done
 - План: tasks/plans/T-369-plan.md
 - Приоритет: P1
 - Зависит от: T-368
@@ -269,3 +269,4 @@ src не правился. Новые тесты: `tests/test_review_t369_r3_rev
 - `uv run ruff check src tests scripts` → All checks passed; `uv run pyright` → 0 errors.
 - Быстрый набор `uv run pytest -q -p no:cacheprovider -m "not slow and not docker"` → 2517 passed, 0 failed.
 - Полный `uv run pytest -q -p no:cacheprovider -rs -m "slow or docker or not slow"` → 2625 passed, 1 skipped (dotnet SDK не установлен), 294 с.
+- 2026-11-04 (координатор): раунд 2 проверен (fast 2517 passed, ruff чисто); ревью 3 цикла + 2 раунда исправлений — принято, done.

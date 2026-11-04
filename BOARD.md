@@ -4,7 +4,6 @@
 
 | ID | Задача | Тип | Статус | Зависит |
 |---|---|---|---|---|
-| T-369 | 3b: API (OpenAI+tasks+leases+admin), router, адаптер llama-server | impl | review | T-368 |
 | T-371 | 3d: деплой systemd на 65.109.95.35, e2e на Mock, integration.md | impl | todo | T-369, T-370 |
 | T-372 | Этап 4: spike dstack + тест RunPod ≤ $5 | test | blocked | T-371 |
 | T-373 | MCP-сервер llmhub_ask для агентов (тонкий клиент /v1/tasks) | impl | todo | T-369 |
