@@ -40,7 +40,8 @@ async def test_status_sections(env: ApiEnv) -> None:
     assert r.status_code == 200
     s = r.json()
     assert s["halted"] is False and s["safe_mode"] is False and s["kill_file"] is False
-    assert set(s["pools"]["p1"]) == {"instance", "queue", "leases"}
+    assert set(s["pools"]["p1"]) == {"instance", "queue", "leases", "capacity_wait"}
+    assert s["pools"]["p1"]["capacity_wait"] is None
     assert s["local"]["backends"]["cpu"]["available"] is True
     assert s["local"]["queue"].get("queued", 0) >= 1
     assert s["budget"]["stage"] == "NORMAL" and "month" in s["budget"] and "day" in s["budget"]

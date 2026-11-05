@@ -20,12 +20,18 @@ Rules (plan sections 3.4, 3.9, 7.3, gates 2026-11-04):
 - E2 right after create once `get(ref)` shows the resource (PENDING/RUNNING; the boot is
   then timed by BOOTING, E5). A row that keeps a ref without E2 (restart, ghost) polls `get`
   until RUNNING; a ghost ref (`get` = None while another resource carries the label) moves the
-  row to that resource.
+  row to that resource;
+- capacity wait (T-372 L2b): when every suitable offer got a definite "no capacity" in this
+  row, the POOL waits `retry.capacity_backoff_s` (2 -> 5 -> 10 min, the last repeats, +-jitter)
+  before the next create round (`capacity_wait:<pool>`; a created resource resets it); while a
+  provider rate-limit hold or a spent POST budget is in the shared state (`rest_rate:<provider>`)
+  no create round starts at all. Both still end in E3 at `offer_wait_s`.
 Provider calls never run inside a DB transaction.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import enum
 import hashlib
 import json
@@ -52,6 +58,7 @@ from llmhub.lifecycle_manager.safety import (
 from llmhub.lifecycle_manager.states import State
 from llmhub.lifecycle_manager.teardown import adopt_ref_or_destroy
 from llmhub.persistence.db import assert_not_in_tx, tx
+from llmhub.provider_adapters import rate_limit
 from llmhub.provider_adapters.base import (
     CreatedResourceRejected,
     InstanceSpec,
@@ -145,6 +152,78 @@ def fail_create_unknown(conn: sqlite3.Connection, inst: sqlite3.Row, now: float,
                  "grace_s": cfg.timeouts.create_visibility_grace_s},
     )  # fmt: skip
     return True
+
+
+CAPACITY_WAIT_PREFIX = "capacity_wait:"
+
+
+def _capacity_key(pool: str) -> str:
+    return f"{CAPACITY_WAIT_PREFIX}{pool}"
+
+
+def _load_capacity_wait(conn: sqlite3.Connection, pool: str) -> dict[str, float] | None:
+    raw = get_key(conn, _capacity_key(pool))
+    if raw is None:
+        return None
+    try:
+        value = json.loads(raw)
+        return {"round": float(value["round"]), "until": float(value["until"]),
+                "since": float(value["since"])}  # fmt: skip
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def capacity_backoff_s(cfg: Config, pool: str, round_no: int, since: float) -> float:
+    """Wait before create round `round_no + 1`: `capacity_backoff_s[round_no - 1]` (the last
+    value repeats) times 1 +- `capacity_backoff_jitter` (deterministic per pool/round/start,
+    so two pools never retry in lockstep and tests stay exact)."""
+    steps = cfg.retry.capacity_backoff_s
+    base = float(steps[min(max(round_no, 1), len(steps)) - 1])
+    digest = hashlib.sha256(f"{pool}:{round_no}:{since:.3f}".encode()).digest()
+    u = int.from_bytes(digest[:4], "big") / 0xFFFFFFFF * 2.0 - 1.0  # [-1, 1]
+    return max(1.0, base * (1.0 + cfg.retry.capacity_backoff_jitter * u))
+
+
+def start_capacity_wait(conn: sqlite3.Connection, pool: str, iid: str, now: float, cfg: Config
+                        ) -> float:  # fmt: skip
+    """Every offer got a definite no-capacity: the next round waits; the row's excluded
+    hosts are cleared so the next round may try them again. Returns `until`. A wait that
+    ended long ago (more than twice the longest step) starts over at round 1."""
+    prev = _load_capacity_wait(conn, pool)
+    longest = max(cfg.retry.capacity_backoff_s)
+    if prev is not None and now - prev["until"] <= 2 * longest:
+        round_no, since = int(prev["round"]) + 1, prev["since"]
+    else:
+        round_no, since = 1, now
+    until = now + capacity_backoff_s(cfg, pool, round_no, since)
+    with tx(conn):
+        set_key(conn, _capacity_key(pool),
+                json.dumps({"round": round_no, "until": until, "since": since}), now)  # fmt: skip
+        delete_key(conn, _exclude_key(iid))
+        conn.execute("UPDATE instances SET last_error=? WHERE id=?",
+                     (f"capacity_wait round {round_no}", iid))  # fmt: skip
+    return until
+
+
+def capacity_wait_until(conn: sqlite3.Connection, pool: str, now: float) -> float | None:
+    cw = _load_capacity_wait(conn, pool)
+    if cw is None or now >= cw["until"]:
+        return None
+    return cw["until"]
+
+
+def capacity_wait_view(conn: sqlite3.Connection, pool: str, now: float) -> dict[str, Any] | None:
+    """/admin/status: the pool's capacity wait (None = none recorded)."""
+    cw = _load_capacity_wait(conn, pool)
+    if cw is None:
+        return None
+    return {"round": int(cw["round"]), "waiting": now < cw["until"], "until": cw["until"],
+            "since": cw["since"]}  # fmt: skip
+
+
+def clear_capacity_wait(conn: sqlite3.Connection, pool: str) -> None:
+    with tx(conn):
+        delete_key(conn, _capacity_key(pool))
 
 
 def _pending_gone_key(instance_id: str) -> str:
@@ -245,6 +324,7 @@ async def _do_create(
         return _create_failed(conn, inst, err, host_id, cfg, now_fn())
     if not await adopt_ref_or_destroy(conn, adapter, iid, res, now_fn()):
         return CreateOutcome.FAILED
+    clear_capacity_wait(conn, inst["pool"])
     if res.offer_id is not None and res.offer_id != spec.offer_id:
         _record_created_offer(conn, iid, res)
     if res.host_id and res.host_id in blacklisted_hosts(conn, inst["provider"], now_fn()):
@@ -342,7 +422,9 @@ def _create_failed(
     if handle_provider_error(conn, inst["provider"], err, now):  # balance / quota: no retries
         _fail_provisioning(conn, iid, now, str(err.reason))
         return CreateOutcome.BLOCKED
-    refund = err.message == _CIRCUIT_OPEN
+    # a rate-limited refusal (429 or the provider's own limiter) sent nothing that counted:
+    # the shared hold (`rest_rate:<provider>`) paces the next round, not `create_max_attempts`
+    refund = err.message == _CIRCUIT_OPEN or err.rate_limited
     with tx(conn):
         if err.reason == UnavailableReason.GPU_UNAVAILABLE:
             hosts = sorted(_excluded(conn, iid) | {host_id})
@@ -379,6 +461,21 @@ async def _start_create(
             _fail_provisioning(conn, inst["id"], now, str(UnavailableReason.PROVIDER_API_ERROR))
             return CreateOutcome.FAILED
         return CreateOutcome.RETRY_LATER
+    blocked = rate_limit.create_blocked(conn, pool.provider, now)
+    if blocked is not None:  # the provider's REST is rate-limited: no round, no listing
+        if now >= offer_deadline:
+            _fail_provisioning(conn, inst["id"], now, str(UnavailableReason.PROVIDER_API_ERROR))
+            return CreateOutcome.FAILED
+        if inst["last_error"] != blocked[1]:
+            with tx(conn):
+                conn.execute("UPDATE instances SET last_error=? WHERE id=?",
+                             (blocked[1], inst["id"]))  # fmt: skip
+        return CreateOutcome.RETRY_LATER
+    if capacity_wait_until(conn, pool.name, now) is not None:
+        if now >= offer_deadline:
+            _fail_provisioning(conn, inst["id"], now, str(UnavailableReason.GPU_UNAVAILABLE))
+            return CreateOutcome.FAILED
+        return CreateOutcome.NO_OFFER
     try:
         if not await _wait_pending_gone(conn, adapter, inst, now):
             return CreateOutcome.RETRY_LATER
@@ -410,8 +507,13 @@ async def _start_create(
             )  # fmt: skip
             _fail_provisioning(conn, inst["id"], now, "instance_material")
             return CreateOutcome.FAILED
-    offer: Offer | None = select_offer(offers, query, blacklisted_hosts(conn, pool.provider, now))
+    banned = blacklisted_hosts(conn, pool.provider, now)
+    offer: Offer | None = select_offer(offers, query, banned)
     if offer is None:
+        if offers and query.exclude_hosts and select_offer(
+            offers, dataclasses.replace(query, exclude_hosts=frozenset()), banned
+        ) is not None:  # every suitable offer got a definite no-capacity in this row
+            start_capacity_wait(conn, pool.name, inst["id"], now, cfg)
         if now >= offer_deadline:
             cause = (UnavailableReason.GPU_UNAVAILABLE if listing_error is None
                      else listing_error.reason)  # fmt: skip

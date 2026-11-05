@@ -50,6 +50,7 @@ def build_runpod(
     *,
     transport: httpx.AsyncBaseTransport | None = None,
 ) -> ProviderAdapter:
+    from llmhub.provider_adapters.rate_limit import RestLimiter
     from llmhub.provider_adapters.runpod import DEFAULT_PORT, RunpodAdapter
     from llmhub.provider_adapters.runpod_api import RunpodApi
 
@@ -63,7 +64,9 @@ def build_runpod(
     if len(ports) > 1:
         raise ConfigError("pools: runpod pools must share one infer port")
     port = ports.pop() if ports else DEFAULT_PORT
-    api = RunpodApi(key, transport=transport, timeout_s=rp.call_timeout_s)
+    limiter = RestLimiter(clock.now, hold_s=rp.rest_hold_s,
+                          post_budget_per_hour=rp.post_budget_per_hour)  # fmt: skip
+    api = RunpodApi(key, transport=transport, timeout_s=rp.call_timeout_s, limiter=limiter)
     return RunpodAdapter(api, rp, clock, disk_gb_hint=disk, port=port)
 
 

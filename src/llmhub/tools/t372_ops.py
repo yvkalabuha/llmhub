@@ -7,7 +7,13 @@
   reserved pool `_probe` (so the reaper never sees an unknown resource), create -> visible ->
   desiredStatus RUNNING -> held `hold_s` (R2-6: the real desiredStatus is RUNNING right after
   POST; the hold lets `guard watch --once` and `guard record` see a real pod) -> destroy
-  (always, in `finally`, the known ref first, R2-2) -> zero; prints timings only;
+  (always, in `finally`, the known ref first, R2-2) -> zero; prints timings only. A definite
+  refusal without a ref (no capacity, no stock, rate limit, pre-check: no pod can exist) moves
+  the row straight to STOPPED with `zero_confirmed_at` (L2b 2026-11-05: an ERROR row without a
+  ref blocked the next probe on UNIQUE(pool) until the lifetime fuse); an older ERROR row
+  without a ref and without an unknown outcome is cleared the same way after the grace and one
+  empty label listing; a row with a ref or an unknown outcome stays to the controller (strict).
+  The REST limiter state (`rest_rate:runpod`) is read before and written after the probe;
 - `scan_secrets`: count secret-looking strings of one op (pod logs on stdin);
 - `weights_token_check`: the HTTP status the weights server gives the op's token now and the
   verdict the DB implies; the proof of `revoked` is the weights-auth log line (R2-8).
@@ -28,6 +34,7 @@ from typing import Any
 from llmhub.clock import Clock
 from llmhub.configuration.models import PROBE_POOL, Config
 from llmhub.persistence.db import tx
+from llmhub.provider_adapters import rate_limit
 from llmhub.provider_adapters.base import (
     CreatedResourceRejected,
     InstanceSpec,
@@ -158,6 +165,87 @@ class ProbeReport:
     attempts: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
 
 
+def _finish_without_pod(conn: sqlite3.Connection, iid: str, now: float, reason: str) -> None:
+    """PROVISIONING|ERROR -> ERROR -> STOPPING -> PENDING_DELETE -> STOPPED in ONE transaction,
+    `zero_confirmed_at = now`, then the shared E20 hook (ledger, reservations). Only for a row
+    that cannot have a pod (a definite refusal, or a cleared old row). Raises OpsError when a
+    transition is lost (another actor moved the row): nothing is changed then."""
+    from llmhub.lifecycle_manager.machine import transition
+    from llmhub.lifecycle_manager.states import State
+    from llmhub.lifecycle_manager.teardown import on_stopped
+
+    class _Lost(Exception):
+        pass
+
+    try:
+        with tx(conn):
+            row = conn.execute("SELECT state, provider_ref FROM instances WHERE id=?",
+                               (iid,)).fetchone()  # fmt: skip
+            if row is None or row["provider_ref"] is not None:
+                raise _Lost
+            steps: list[tuple[State, State, str, dict[str, Any]]] = [
+                (State.ERROR, State.STOPPING, "E18",
+                 {"stop_reason": reason, "destroy_requested_at": now}),
+                (State.STOPPING, State.PENDING_DELETE, "E19", {"destroy_accepted_at": now}),
+                (State.PENDING_DELETE, State.STOPPED, "E20", {"zero_confirmed_at": now}),
+            ]  # fmt: skip
+            if row["state"] == State.PROVISIONING.value:
+                steps.insert(0, (State.PROVISIONING, State.ERROR, "E3", {"last_error": reason}))
+            for src, dst, edge, fields in steps:
+                if not transition(conn, iid, src, dst, edge, now, "admin", reason=reason,
+                                  **fields):  # fmt: skip
+                    raise _Lost
+            stopped = conn.execute("SELECT * FROM instances WHERE id=?", (iid,)).fetchone()
+            on_stopped(conn, stopped, now)
+    except _Lost:
+        raise OpsError(f"probe row {iid} changed meanwhile; left to the controller") from None
+
+
+async def _clear_old_probe_row(conn: sqlite3.Connection, adapter: Any, cfg: Config,
+                               now: float) -> str | None:  # fmt: skip
+    """A live `_probe` row of an earlier probe blocks UNIQUE(pool). Clear it only when no pod
+    can exist: ERROR, no ref, no unknown outcome, the create grace is over and the label lists
+    nothing. Anything else -> OpsError (strict: the controller confirms zero). Returns a
+    note, or None when there was no row."""
+    from llmhub.lifecycle_manager.states import LIVE_IN_INDEX, State
+    from llmhub.lifecycle_manager.teardown import no_ref_wait_until
+
+    live = sorted(LIVE_IN_INDEX)
+    row = conn.execute(
+        f"SELECT * FROM instances WHERE pool=? AND state IN ({','.join('?' for _ in live)})",
+        (PROBE_POOL, *live),
+    ).fetchone()
+    if row is None:
+        return None
+    iid = row["id"]
+    if row["state"] != State.ERROR.value:
+        raise OpsError(f"probe row {iid} is {row['state']}: another probe runs (or crashed);"
+                       " the controller ends it")  # fmt: skip
+    if row["provider_ref"] is not None:
+        raise OpsError(f"probe row {iid} keeps pod {row['provider_ref']}: the controller"
+                       " confirms zero first")  # fmt: skip
+    if row["create_unknown"]:
+        raise OpsError(f"probe row {iid}: create outcome unknown; the controller confirms zero")
+    wait = no_ref_wait_until(row, cfg)
+    if now < wait:
+        raise OpsError(f"probe row {iid}: create grace until {wait:.0f}; try again later")
+    label = row["label"]
+    try:
+        owned = [r for r in await adapter.list_owned(label) if r.label == label]
+    except ProviderError as exc:
+        raise OpsError(f"probe row {iid}: label check failed ({exc.err.message})") from None
+    if owned:
+        raise OpsError(f"probe row {iid}: {len(owned)} resource(s) still carry its label;"
+                       " the controller destroys them")  # fmt: skip
+    _finish_without_pod(conn, iid, now, "probe_row_cleared")
+    return f"old probe row {iid} (ERROR, no ref, label empty) moved to STOPPED"
+
+
+def _limiter(adapter: Any) -> rate_limit.RestLimiter | None:
+    lim = getattr(adapter, "rest_limiter", None)
+    return lim if isinstance(lim, rate_limit.RestLimiter) else None
+
+
 def _insert_probe_row(conn: sqlite3.Connection, provider: str, op_id: str, label: str,
                       now: float, max_s: float) -> str:  # fmt: skip
     iid = f"inst-{op_id}"
@@ -204,11 +292,47 @@ async def lifecycle_probe(
         raise OpsError("--hold-s must be >= 0")
     if max_s > cfg.timeouts.provisioning_s - 60:
         raise OpsError("--max-s must stay 60 s below timeouts.provisioning_s")
+    limiter = _limiter(adapter)
+    if limiter is not None:
+        rate_limit.absorb_only(conn, adapter.name, limiter)
+        if limiter.held(clock.now()):
+            raise OpsError(f"{adapter.name} REST is rate-limited until {limiter.hold_until:.0f}"
+                           f" ({limiter.hold_cause}); no probe")  # fmt: skip
+    try:
+        return await _probe(conn, adapter, secret, clock, cfg, image=image,
+                            gpu_type_id=gpu_type_id, disk_gb=disk_gb,
+                            max_price_usd_h=max_price_usd_h, max_s=max_s, poll_s=poll_s,
+                            hold_s=hold_s, start_cmd=start_cmd)  # fmt: skip
+    finally:
+        if limiter is not None:
+            rate_limit.sync(conn, adapter.name, limiter, clock.now())
+
+
+async def _probe(
+    conn: sqlite3.Connection,
+    adapter: Any,
+    secret: bytes,
+    clock: Clock,
+    cfg: Config,
+    *,
+    image: str,
+    gpu_type_id: str,
+    disk_gb: int,
+    max_price_usd_h: float,
+    max_s: float,
+    poll_s: float,
+    hold_s: float,
+    start_cmd: Sequence[str],
+) -> ProbeReport:
+    old_note = await _clear_old_probe_row(conn, adapter, cfg, clock.now())
     op_id = new_op_id()
     label = make_label(op_id, secret)
     t0 = clock.now()
     iid = _insert_probe_row(conn, adapter.name, op_id, label, t0, max_s)
     rep = ProbeReport(label=label, instance_id=iid)
+    if old_note is not None:
+        rep.notes.append(old_note)
+    refused = False
     spec = InstanceSpec(
         pool=PROBE_POOL, offer_id=gpu_type_id, image=image, disk_gb=disk_gb,
         max_price_usd_h=max_price_usd_h, max_lifetime_s=int(max_s),
@@ -229,8 +353,11 @@ async def lifecycle_probe(
             rep.error = exc.err.message
             if exc.err.outcome_unknown:
                 rep.notes.append("create outcome unknown: looking the label up")
+                with tx(conn):  # strict from now on: the controller must confirm zero
+                    conn.execute("UPDATE instances SET create_unknown=1 WHERE id=?", (iid,))
                 res = None
             else:
+                refused = True  # definite: no POST took effect, no pod can exist
                 return rep
         rep.create_s = round(clock.now() - t0, 1)
         t_created = clock.now()
@@ -248,6 +375,11 @@ async def lifecycle_probe(
                 rep.visible_s = round(clock.now() - t0, 1)
                 if rep.ref is None:
                     rep.ref = owned[0].ref
+                    with tx(conn):  # the row keeps the found pod (strict teardown)
+                        conn.execute("UPDATE instances SET provider_ref=?, host_id=?,"
+                                     " price_usd_h=? WHERE id=? AND provider_ref IS NULL",
+                                     (owned[0].ref, owned[0].host_id, owned[0].price_usd_h,
+                                      iid))  # fmt: skip
             mine = next((r for r in owned if r.ref == rep.ref), None)
             if (mine is not None and mine.status == RemoteStatus.RUNNING
                     and rep.desired_running_s is None):  # fmt: skip
@@ -260,7 +392,12 @@ async def lifecycle_probe(
                              else "max-s reached before the end of the hold")  # fmt: skip
         rep.held_s = round(clock.now() - t_created, 1)
     finally:
-        await _probe_teardown(conn, adapter, rep, clock, label, poll_s)
+        if refused and rep.ref is None:
+            _finish_without_pod(conn, iid, clock.now(), "probe_refused")
+            rep.zero = True
+            rep.notes.append("definite refusal: no pod can exist; row STOPPED without listing")
+        else:
+            await _probe_teardown(conn, adapter, rep, clock, label, poll_s)
     return rep
 
 

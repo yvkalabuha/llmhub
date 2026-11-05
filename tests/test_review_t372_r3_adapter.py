@@ -33,7 +33,8 @@ def _real_graphql(query: str) -> dict[str, Any]:
         return {"data": {"myself": {"clientBalance": 19.8420546925, "currentSpendPerHr": 0,
                                     "spendLimit": 80}}}  # fmt: skip
     gid = re.search(r'id: "([^"]+)"', query)
-    assert gid is not None
+    if gid is None:  # the stock pre-check (all types): L1 answered null for every type
+        return {"data": {"gpuTypes": [{"id": GPU_ID, "lowestPrice": {"stockStatus": None}}]}}
     low: dict[str, Any] = {}
     m = re.search(r"lowestPrice\(input: *\{([^}]*)\}\)", query)
     if m is not None:

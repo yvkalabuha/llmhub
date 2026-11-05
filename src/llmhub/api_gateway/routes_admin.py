@@ -12,6 +12,7 @@ from llmhub.api_gateway.auth import require_admin, runtime
 from llmhub.api_gateway.common import read_object
 from llmhub.api_gateway.errors import ApiError, ErrorCode
 from llmhub.budget_manager import limits
+from llmhub.cloud_manager.provisioner import capacity_wait_view
 from llmhub.configuration.loader import ConfigError
 from llmhub.controller import HoldExceedsSessionBudget, HoldRejected, KillFilePresent
 from llmhub.killswitch import check_kill_file
@@ -19,6 +20,7 @@ from llmhub.lifecycle_manager import leases
 from llmhub.lifecycle_manager.machine import live_instance
 from llmhub.persistence import state as cstate
 from llmhub.persistence.state import ReconcileRequired
+from llmhub.provider_adapters.rate_limit import status_view
 
 router = APIRouter(prefix="/admin", dependencies=[Depends(require_admin)])
 
@@ -64,6 +66,7 @@ async def status(request: Request) -> JSONResponse:
                 "price_usd_h": inst["price_usd_h"], "state_since": inst["state_since"]},
             "queue": queue,
             "leases": leases.live_count(rt.conn, name, now),
+            "capacity_wait": capacity_wait_view(rt.conn, name, now),
         }  # fmt: skip
     local: dict[str, Any] = {}
     for name, st in rt.worker.stats.items():
@@ -94,11 +97,14 @@ async def status(request: Request) -> JSONResponse:
             },
             "local": {"backends": local, "queue": {r["status"]: r["n"] for r in local_queue}},
             "budget": _budget(request),
-            "providers": _rows(
-                request,
-                "SELECT provider, enabled, blocked_reason, circuit_state,"
-                " last_balance_usd FROM provider_accounts ORDER BY provider",
-            ),
+            "providers": [
+                {**r, "rest": status_view(rt.conn, str(r["provider"]), now)}
+                for r in _rows(
+                    request,
+                    "SELECT provider, enabled, blocked_reason, circuit_state,"
+                    " last_balance_usd FROM provider_accounts ORDER BY provider",
+                )
+            ],
             "incidents": _rows(
                 request,
                 "SELECT id, ts, kind, severity, ref FROM incidents WHERE resolved_at"

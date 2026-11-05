@@ -314,19 +314,31 @@ def _ledger_exclude(args: argparse.Namespace) -> int:
 def _provider_check(args: argparse.Namespace) -> int:
     import time
 
+    from llmhub.provider_adapters import rate_limit
     from llmhub.provider_adapters.factory import aclose_adapters
     from llmhub.tools.t372_ops import provider_check
 
     cfg = _load(args)
     adapter = _adapter(cfg, args.provider)
+    limiter = getattr(adapter, "rest_limiter", None)
+    has_db = (cfg.data_dir / "state.db").is_file()
+    conn = _db(cfg) if has_db and isinstance(limiter, rate_limit.RestLimiter) else None
 
     async def go() -> dict[str, Any]:
         try:
+            if conn is not None and isinstance(limiter, rate_limit.RestLimiter):
+                rate_limit.absorb_only(conn, args.provider, limiter)  # respect a shared hold
             return await provider_check(adapter, cfg, time.time())
         finally:
+            if conn is not None and isinstance(limiter, rate_limit.RestLimiter):
+                rate_limit.sync(conn, args.provider, limiter, time.time())
             await aclose_adapters({args.provider: adapter})
 
-    _print(_run_async(go()))
+    try:
+        _print(_run_async(go()))
+    finally:
+        if conn is not None:
+            conn.close()
     return 0
 
 

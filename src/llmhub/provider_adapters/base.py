@@ -128,6 +128,9 @@ class NormalizedError:
     retry_after_s: float | None
     http_status: int | None
     message: str  # no secrets, no request text
+    # a rate limit refused the call (HTTP 429 or a local refusal of the provider's limiter):
+    # nothing happened, retrying before `retry_after_s` only extends the limit
+    rate_limited: bool = False
 
 
 class ProviderError(Exception):

@@ -51,7 +51,8 @@ def test_guard_units() -> None:
     assert "watch --once --auto-destroy" in exec_line and "python3 -I" in exec_line
     assert "Type=oneshot" in svc and "EnvironmentFile=%h/.config/llmhub-guard/guard.env" in svc
     timer = (WS / "llmhub-runpod-guard.timer").read_text()
-    assert "OnBootSec=60" in timer and "OnUnitActiveSec=60" in timer
+    # 120 s since 2026-11-05: RunPod REST has an hourly rate limit (429 at 60 s polling)
+    assert "OnBootSec=60" in timer and "OnUnitActiveSec=120" in timer.splitlines()
 
 
 def test_guard_env_has_paths_only() -> None:

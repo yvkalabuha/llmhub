@@ -25,6 +25,8 @@ from typing import Any
 
 import httpx
 
+from llmhub.provider_adapters.rate_limit import RATE_LIMITED, RestLimiter
+
 REST_BASE = "https://rest.runpod.io/v1"
 GRAPHQL_URL = "https://api.runpod.io/graphql"
 MAX_PAGES = 50
@@ -131,7 +133,11 @@ def classify(text: str, *, status: int | None = None) -> str | None:
     """Short error code from a response text (the text itself is never kept).
     L2b: the real `POST /pods` without capacity answers 500 with JSON
     `{"error": "create pod: There are no instances currently available", ...}`: a definite
-    refusal (`no_capacity`); only that exact pair, any other 5xx stays an unknown outcome."""
+    refusal (`no_capacity`); only that exact pair, any other 5xx stays an unknown outcome.
+    A 429 (`{"error": "rate limit exceeded for the hour window", "status": 429}`, live
+    2026-11-05) is `rate_limited`: the gateway refused the request before it was processed."""
+    if status == 429:
+        return RATE_LIMITED
     if status == 500:
         err = _json_error(text)
         if err is not None and _NO_INSTANCES in err.lower():
@@ -329,8 +335,10 @@ class RunpodApi:
         timeout_s: float = 20.0,
         rest_base: str = REST_BASE,
         graphql_url: str = GRAPHQL_URL,
+        limiter: RestLimiter | None = None,
     ) -> None:
         self._key = key
+        self.limiter = limiter  # REST only (GraphQL has its own, wider limit)
         self._transport = transport
         self._timeout_s = timeout_s
         self.rest_base = rest_base.rstrip("/")
@@ -373,6 +381,14 @@ class RunpodApi:
         allow_404: bool = False,
     ) -> Any:
         """One request -> decoded JSON; `None` for an allowed 404."""
+        rest = self.limiter is not None and url.startswith(self.rest_base)
+        if rest:
+            assert self.limiter is not None
+            refused = self.limiter.admit(method, path)
+            if refused is not None:  # nothing is sent: a definite refusal
+                raise RunpodHttpError(method=method, path=path, status=None, code=refused,
+                                      retry_after_s=self.limiter.wait_s(refused),
+                                      sent=False)  # fmt: skip
         headers = self._headers(method, path)
         try:
             resp = await self._http().request(
@@ -387,13 +403,19 @@ class RunpodApi:
         except httpx.HTTPError:
             raise RunpodHttpError(method=method, path=path, status=None, code="transport",
                                   retry_after_s=None, sent=True) from None  # fmt: skip
+        retry_after = _retry_after(resp)
+        if rest:
+            assert self.limiter is not None
+            held = self.limiter.on_response(method, resp.status_code, retry_after)
+            if held is not None:
+                retry_after = held
         if resp.status_code == 404 and allow_404:
             return None
         if resp.status_code >= 300:
             st = resp.status_code
             raise RunpodHttpError(
                 method=method, path=path, status=st, code=classify(resp.text, status=st),
-                retry_after_s=_retry_after(resp), sent=True,
+                retry_after_s=retry_after, sent=True,
             )  # fmt: skip
         if resp.status_code == 204 or not resp.content:
             return {}
@@ -540,6 +562,31 @@ class RunpodApi:
                     stock_status=stock,
                 ))  # fmt: skip
         return out
+
+    async def community_stock(self, ids: Sequence[str]) -> dict[str, str | None] | None:
+        """id -> Community `stockStatus` (`lowestPrice(input: {gpuCount: 1, secureCloud:
+        false})`; None = no stock shown) for the asked ids, in ONE GraphQL call over ALL types.
+        Returns None when NO type of the whole answer shows any stock: such an answer carries no
+        stock information (L1 2026-11-04 recorded null for every type, while at night on
+        2026-11-05 the same query showed stock for 3090/4090 most minutes), so it must not
+        block a POST. A value is necessary, not sufficient: a POST may still find no machine."""
+        query = ("query { gpuTypes { id lowestPrice(input: {gpuCount: 1, secureCloud: false})"
+                 " { stockStatus } } }")  # fmt: skip
+        data = await self._graphql(query, "graphql:gpuStock")
+        p = _Parser("POST", "graphql:gpuStock")
+        wanted = set(ids)
+        out: dict[str, str | None] = dict.fromkeys(ids)
+        informative = False
+        for raw in p.arr(data.get("gpuTypes"), "gpuTypes"):
+            d = p.obj(raw, "gpuType")
+            gid = p.req_str(d, "id")
+            low = d.get("lowestPrice")
+            stock = None if low is None else p.string(p.obj(low, "lowestPrice"), "stockStatus",
+                                                       optional=True)  # fmt: skip
+            informative = informative or bool(stock)
+            if gid in wanted:
+                out[gid] = stock or None
+        return out if informative else None
 
     async def myself(self) -> AccountInfo:
         """GraphQL is not in the openapi (R2-10, verified only in L1). `spendLimit` may not

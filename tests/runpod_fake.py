@@ -107,6 +107,7 @@ class FakeRunpod:
         cuda_capacity: set[str] | None = None,
         gpus: dict[str, float | None] | None = None,
         gpu_capacity: set[str] | None = None,
+        community_stock: str | None | dict[str, str | None] = "High",
     ) -> None:
         self.clock = clock
         self.price = price
@@ -129,6 +130,9 @@ class FakeRunpod:
         self.cuda_capacity = cuda_capacity  # None: capacity for every CUDA version
         self.gpus = gpus  # None: only GPU_ID at `price` (and `community`)
         self.gpu_capacity = gpu_capacity  # None: capacity for every GPU type
+        # `gpuTypes { id lowestPrice(input: {gpuCount: 1, secureCloud: false}) { stockStatus } }`
+        # without an id filter (the stock pre-check, live 2026-11-05): one value or per type
+        self.community_stock = community_stock
         self.pods: dict[str, FakePod] = {}
         self.volumes: list[dict[str, Any]] = []
         self.templates: list[dict[str, Any]] = []
@@ -353,13 +357,21 @@ class FakeRunpod:
                                                      "data": None})  # fmt: skip
                 return httpx.Response(fault.status, text=fault.body)
             gid = re.search(r'id: "([^"]+)"', query)
-            assert gid is not None
             known = self.gpus if self.gpus is not None else {GPU_ID: self.price}
+            if gid is None:  # the stock query: every type, Community stockStatus only
+                return httpx.Response(200, json={"data": {"gpuTypes": [
+                    {"id": k, "lowestPrice": {"stockStatus": self.stock_of(k)}} for k in known
+                ]}})  # fmt: skip
             if gid.group(1) not in known:
                 return httpx.Response(200, json={"data": {"gpuTypes": []}})
             item = self._gpu_type(query, gid.group(1))
             return httpx.Response(200, json={"data": {"gpuTypes": [item]}})
         return httpx.Response(400, json={"errors": [{"message": "unknown query"}]})
+
+    def stock_of(self, gid: str) -> str | None:
+        if isinstance(self.community_stock, dict):
+            return self.community_stock.get(gid)
+        return self.community_stock
 
     def gpu_price(self, gid: str) -> float | None:
         if self.gpus is None:

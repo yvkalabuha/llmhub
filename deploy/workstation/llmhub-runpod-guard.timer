@@ -1,11 +1,13 @@
-# T-372 D3: every 60 s while the live test runs (enable in L0 before the first pod,
+# T-372 D3: every 120 s while the live test runs (enable in L0 before the first pod,
 # `systemctl --user disable --now llmhub-runpod-guard.timer` and remove in L8).
+# 120 s, not 60: RunPod REST has an hourly rate limit (429 after ~1 h of 60 s polling,
+# 2026-11-05); a pass costs 1 REST call, every 10th pass 5 (`--extras-every`).
 [Unit]
 Description=llmhub T-372 RunPod guard timer
 
 [Timer]
 OnBootSec=60
-OnUnitActiveSec=60
+OnUnitActiveSec=120
 AccuracySec=5s
 
 [Install]

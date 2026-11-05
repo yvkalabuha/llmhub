@@ -200,7 +200,10 @@ def _real_answer(query: str) -> dict[str, Any]:
         return {"data": {"myself": _fixture("myself_and_3090_secure_false.json")
                          ["data"]["myself"]}}  # fmt: skip
     m = re.search(r'id: "([^"]+)"', query)
-    assert m is not None
+    if m is None:  # the stock pre-check asks every type: the recorded full list (all null)
+        assert "secureCloud: false" in query
+        return {"data": {"gpuTypes": [{"id": t["id"], "lowestPrice": t["lowestPrice"]}
+                                      for t in ALL_TYPES.values()]}}  # fmt: skip
     t = ALL_TYPES.get(m.group(1))
     if t is None:
         return {"data": {"gpuTypes": []}}
@@ -312,7 +315,8 @@ async def test_no_capacity_on_post_is_a_definite_refusal() -> None:
     real = _Real(httpx.Response(500, text="There are no longer any instances available with "
                                           "the requested specifications."))  # fmt: skip
     with pytest.raises(ProviderError) as ei:
-        await real.adapter().create(make_spec(), _label())
+        # the recorded L1 list shows no Community stock for the 3090: pre-check off here
+        await real.adapter(stock_precheck=False).create(make_spec(), _label())
     assert ei.value.err.reason == UnavailableReason.GPU_UNAVAILABLE
     assert not ei.value.err.outcome_unknown and real.posts == 3
 

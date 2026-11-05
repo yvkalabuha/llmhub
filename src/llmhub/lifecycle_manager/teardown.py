@@ -126,7 +126,8 @@ async def _destroy_refs(
     """Call destroy for each ref (outside any tx). True when every call was accepted.
 
     A failure schedules the next try (`next_destroy_at`): exponential backoff capped at 120 s,
-    or the provider's `retry_after_s`. Failures never open a breaker here.
+    or the provider's `retry_after_s` (a rate-limited one capped at `destroy_backoff_max_s`:
+    a rate-limit hold of 15 min must not keep a paid pod alive that long). Failures never open a breaker here.
     """
     assert_not_in_tx()
     ok = True
@@ -140,7 +141,10 @@ async def _destroy_refs(
             ne = adapter.normalize_error(exc)
             err = ne.message[:200]
             if ne.retry_after_s is not None:
-                retry_after = max(retry_after or 0.0, ne.retry_after_s)
+                wait = ne.retry_after_s
+                if ne.rate_limited:  # money first: a destroy waits at most the backoff cap
+                    wait = min(wait, cfg.retry.destroy_backoff_max_s)
+                retry_after = max(retry_after or 0.0, wait)
     with tx(conn):
         row = conn.execute("SELECT destroy_attempts FROM instances WHERE id=?", (inst["id"],))
         attempts = int(row.fetchone()[0])

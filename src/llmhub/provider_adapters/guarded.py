@@ -5,7 +5,11 @@
 - idempotent reads (`get`, `list_owned`, `balance`, `billing_since`) are retried with backoff;
 - `create` and `destroy` are never retried here; a `create` timeout is an unknown outcome;
 - the breaker gates only `create` and `list_offers`; teardown and reads always pass;
-- errors of actor "reaper" never open the controller's breaker.
+- errors of actor "reaper" never open the controller's breaker;
+- rate limits (T-372 L2b): an adapter with a `rest_limiter` shares it through the DB
+  (`rate_limit.sync` before and after each call); a rate-limited error is never retried here
+  and never counts for the breaker; an adapter without a limiter that answers rate-limited
+  sets the shared hold itself (`retry.rate_limit_hold_s` without Retry-After).
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from typing import Any, Literal
 from llmhub.clock import Clock
 from llmhub.configuration.models import RetryConfig
 from llmhub.persistence.db import Busy, assert_not_in_tx, tx
+from llmhub.provider_adapters import rate_limit
 from llmhub.provider_adapters.base import (
     Balance,
     BillingRecord,
@@ -194,21 +199,42 @@ class GuardedAdapter:
         return ProviderError(self.inner.normalize_error(exc))
 
     def _count(self, err: NormalizedError) -> None:
-        if self.actor == "reaper":
+        if self.actor == "reaper" or err.rate_limited:
             return
         if err.reason == UnavailableReason.PROVIDER_API_ERROR:
             self.breaker.record_error()
+
+    @property
+    def rest_limiter(self) -> rate_limit.RestLimiter | None:
+        return getattr(self.inner, "rest_limiter", None)
+
+    def _sync(self) -> None:
+        limiter = self.rest_limiter
+        if limiter is not None:
+            rate_limit.sync(self.breaker.conn, self.name, limiter, self.clock.now())
+
+    def _note_rate_limited(self, err: NormalizedError) -> None:
+        if not err.rate_limited or self.rest_limiter is not None:
+            return  # the limiter keeps its own hold (written back by `_sync`)
+        now = self.clock.now()
+        wait = err.retry_after_s if err.retry_after_s is not None else self.retry.rate_limit_hold_s
+        rate_limit.set_hold(self.breaker.conn, self.name, now + wait, "rate_limited", now)
 
     async def _once[T](
         self, make: Callable[[], Awaitable[T]], *, unknown_on_timeout: bool = False
     ) -> T:
         assert_not_in_tx()
+        self._sync()
         try:
             return await self._with_timeout(make)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            raise self._normalize(exc, unknown_on_timeout=unknown_on_timeout) from exc
+            err = self._normalize(exc, unknown_on_timeout=unknown_on_timeout)
+            self._note_rate_limited(err.err)
+            raise err from exc
+        finally:
+            self._sync()
 
     async def _retried[T](self, make: Callable[[], Awaitable[T]]) -> T:
         attempt = 0
@@ -217,7 +243,8 @@ class GuardedAdapter:
                 return await self._once(make)
             except ProviderError as err:
                 self._count(err.err)
-                if not err.err.retryable or attempt >= self.retry.get_retries:
+                if (not err.err.retryable or err.err.rate_limited
+                        or attempt >= self.retry.get_retries):  # fmt: skip
                     raise
                 delay = self.retry.get_backoff_s * 2**attempt
                 if err.err.retry_after_s is not None:

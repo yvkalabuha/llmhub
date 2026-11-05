@@ -9,8 +9,9 @@ Type=oneshot
 EnvironmentFile=%h/.config/llmhub-guard/guard.env
 ExecStart=/usr/bin/python3 -I %h/.local/lib/llmhub-guard/runpod_guard.py watch --once --auto-destroy --key-file ${GUARD_RO_KEY_FILE} --rw-key-file ${GUARD_RW_KEY_FILE} --before ${GUARD_BEFORE} --state-dir %h/.local/state/llmhub-guard --until ${GUARD_UNTIL}
 # Any non-zero exit after L2 (also 1 = interpreter crash, 2 = key/arguments) is a STOP of the
-# test (R3-4); 4/5/6/7/8 are the guard's own STOP codes (journalctl --user -u llmhub-runpod-guard);
-# 8 = before.json missing/unreadable: the guard is NOT watching. After GUARD_UNTIL (test end
+# test (R3-4); 4/5/6/7/8/9 are the guard's own STOP codes (journalctl --user -u llmhub-runpod-guard);
+# 8 = before.json missing/unreadable: the guard is NOT watching; 9 = RunPod REST rate limit
+# (HTTP 429): the guard is blind until the hour window resets, stop every other REST poller. After GUARD_UNTIL (test end
 # + 6 h) the guard only reports, it never deletes again (REV-S9).
 SuccessExitStatus=0
 Nice=10

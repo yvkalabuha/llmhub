@@ -11,6 +11,7 @@ so a bug in the adapter cannot blind it. Keys come from files (0600/0400) and ar
     runpod_guard.py record --key-file RO --dir tests/fixtures/runpod/recorded
     runpod_guard.py watch --key-file RO --before before.json [--once] [--state-dir DIR]
                           [--auto-destroy --rw-key-file RW --state-dir DIR [--until TIME]]
+                          [--extras-every N] [--interval S]
     runpod_guard.py destroy-leftovers --key-file RW --before before.json [--yes]
 
 Auto-destroy deletes ONLY pods that are not in the "before" snapshot and whose name matches the
@@ -28,10 +29,18 @@ unreadable state file is reset (STOP, exit 4). The guard expires: after `--until
 epoch s; default `before.taken_at + 24 h`) it only reports. Without a readable `before.json`
 it refuses to run (exit 8): auto-destroy would be off, so that is a STOP too.
 
+REST budget (live 2026-11-05: RunPod REST answered 429 "rate limit exceeded for the hour
+window" after ~1 h of a guard pass and a probe every 60 s): a watch pass reads `GET /pods` and
+the account (GraphQL) every time, the report-only kinds (volumes, templates, registry auths,
+endpoints) only every `--extras-every` passes (default 10; the pass counter lives in
+`<state-dir>/passes.json`; without `--state-dir` every pass reads them). The timer runs every
+120 s, so a pass costs 1 REST call and every 10th pass 5 (about 39 REST calls an hour).
+
 Exit codes: 0 ok; 2 usage/key file; 3 new llmhub pods in diff; 4 parse error or guard state
 reset (unexpected answer: STOP the test); 5 a new volume/template/registry auth/endpoint
 (STOP); 6 a threshold fired (STOP); 7 API error, also a failed DELETE (STOP); 8 no usable
-before snapshot: the guard is not watching (STOP).
+before snapshot: the guard is not watching (STOP); 9 REST rate limit (HTTP 429): the guard is
+(partly) blind until the hour window resets (STOP; stop every other REST poller too).
 """
 
 from __future__ import annotations
@@ -60,6 +69,10 @@ TIMEOUT_S = 20
 USER_AGENT = "llmhub-guard/0.3.2"
 DEFAULT_TTL_S = 24 * 3600  # --until default: before.taken_at + 24 h (REV-S9)
 FIRST_SEEN = "first_seen.json"
+PASSES = "passes.json"
+DEFAULT_EXTRAS_EVERY = 10
+DEFAULT_INTERVAL_S = 120
+RATE_LIMITED = 9
 UTC = dt.timezone.utc  # noqa: UP017 -- Python 3.10 (unit: /usr/bin/python3) has no dt.UTC (R3-1)
 
 
@@ -132,6 +145,11 @@ def http_json(method: str, url: str, key: str, body: Any = None) -> Any:
         with OPENER.open(req, timeout=TIMEOUT_S) as resp:
             raw = resp.read()
     except urllib.error.HTTPError as exc:
+        if exc.code == 429:
+            after = exc.headers.get("Retry-After") if exc.headers is not None else None
+            hint = f", Retry-After {after}" if after else ""
+            raise GuardError(RATE_LIMITED, f"{method} {_path(url)} -> HTTP 429 (REST rate limit"
+                             f"{hint})", 429) from None  # fmt: skip
         raise GuardError(7, f"{method} {_path(url)} -> HTTP {exc.code}", exc.code) from None
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         raise GuardError(7, f"{method} {_path(url)} -> {type(exc).__name__}") from None
@@ -294,25 +312,31 @@ def fetch_account(key: str) -> tuple[float, float]:
     return _num(me, "clientBalance", "myself"), _num(me, "currentSpendPerHr", "myself")
 
 
-def take_snapshot(key: str) -> dict[str, Any]:
+def take_snapshot(key: str, *, extras: bool = True) -> dict[str, Any]:
     """Pods first (a failure there is fatal: nothing can be decided); the account and the
-    report-only kinds are soft: a failure is an entry of `errors` (STOP after the checks)."""
+    report-only kinds are soft: a failure is an entry of `errors` (STOP after the checks).
+    `extras=False` skips the report-only kinds (absent from the snapshot: not compared).
+    A 429 anywhere sets `rate_limited` (exit 9 after the checks)."""
     pods, errors = parse_pods_soft(http_json("GET", REST + "/pods", key))
+    limited = False
     balance: float | None = None
     spend: float | None = None
     try:
         balance, spend = fetch_account(key)
     except GuardError as exc:
         errors.append(f"account: {exc}")
+        limited = limited or exc.code == RATE_LIMITED
     snap: dict[str, Any] = {"taken_at": NOW(), "balance": balance, "spend_per_hr": spend,
                             "pods": pods}  # fmt: skip
-    for kind, path in EXTRA_KINDS.items():
+    for kind, path in EXTRA_KINDS.items() if extras else ():
         try:
             snap[kind] = parse_named(http_json("GET", REST + path, key), kind)
         except GuardError as exc:
             snap[kind] = []
             errors.append(f"{kind}: {exc}")
+            limited = limited or exc.code == RATE_LIMITED
     snap["errors"] = errors
+    snap["rate_limited"] = limited
     return snap
 
 
@@ -324,6 +348,9 @@ def _ids(snap: dict[str, Any], kind: str) -> set[str]:
 def diff(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {"new": {}, "gone": {}}
     for kind in ("pods", *EXTRA_KINDS):
+        if kind not in b:  # not read in this pass (`--extras-every`): nothing to compare
+            out["new"][kind], out["gone"][kind] = [], []
+            continue
         ai, bi = _ids(a, kind), _ids(b, kind)
         out["new"][kind] = [x for x in b.get(kind, []) if x["id"] not in ai]
         out["gone"][kind] = [x for x in a.get(kind, []) if x["id"] not in bi]
@@ -546,10 +573,28 @@ def _no_before(path: str, why: str) -> GuardError:
     return GuardError(8, msg)
 
 
+def next_pass(state: Path | None, every: int) -> bool:
+    """Count this pass in `<state>/passes.json`; True when the report-only kinds are due
+    (pass 0, every-th pass, no state dir, or an unreadable counter)."""
+    if state is None or every <= 1:
+        return True
+    path = state / PASSES
+    n = 0
+    if path.exists():
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+            n = int(doc["n"]) if isinstance(doc, dict) else 0
+        except (OSError, ValueError, KeyError, TypeError):
+            n = 0
+    _write_json(path, {"n": n + 1})
+    return n % every == 0
+
+
 def watch_pass(key: str, rw: str | None, before: dict[str, Any], state: Path | None,
-               until: float) -> int:
+               until: float, extras_every: int = DEFAULT_EXTRAS_EVERY) -> int:
     """One pass: snapshot, report, thresholds, deletes; STOP codes only after the deletes."""
-    snap = take_snapshot(key)
+    extras = next_pass(state, extras_every)
+    snap = take_snapshot(key, extras=extras)
     now = NOW()
     d = diff(before, snap)
     seen: dict[str, float] = {}
@@ -562,7 +607,8 @@ def watch_pass(key: str, rw: str | None, before: dict[str, Any], state: Path | N
     stamp = dt.datetime.fromtimestamp(now, UTC).strftime("%H:%M:%SZ")
     extra = sum(len(d["new"][k]) for k in EXTRA_KINDS)
     print(f"{stamp} llmhub_pods={len(ours)} spend/h={_fmt(snap['spend_per_hr'], '.3f')} "
-          f"balance_delta_cents={d['balance_delta_cents']} new_other={extra}", flush=True)  # fmt: skip
+          f"balance_delta_cents={d['balance_delta_cents']} "
+          f"new_other={extra if extras else 'skipped'}", flush=True)  # fmt: skip
     for k in EXTRA_KINDS:
         for x in d["new"][k]:
             print(f"STOP: new {k} {x['id']} {x['name']} (reported, not deleted)")
@@ -578,12 +624,17 @@ def watch_pass(key: str, rw: str | None, before: dict[str, Any], state: Path | N
     if reset:
         print("STOP: guard state reset (first_seen.json unreadable; ages restart now)")
     _report_errors(snap["errors"])
+    if snap.get("rate_limited"):
+        print("STOP: RunPod REST rate limit (HTTP 429): stop other REST pollers and wait for "
+              "the hour window")  # fmt: skip
     if failed:
         return 7
     if fired:
         return 6
     if extra:
         return 5
+    if snap.get("rate_limited"):
+        return RATE_LIMITED
     return 4 if reset or snap["errors"] else 0
 
 
@@ -607,10 +658,10 @@ def cmd_watch(a: argparse.Namespace) -> int:
     if rw is not None and NOW() >= until:
         print(f"guard expired at {until:.0f}: report only")
     while True:
-        code = watch_pass(key, rw, before, state, until)
+        code = watch_pass(key, rw, before, state, until, a.extras_every)
         if a.once or code:
             return code
-        time.sleep(60)
+        time.sleep(a.interval)
 
 
 def cmd_destroy_leftovers(a: argparse.Namespace) -> int:
@@ -652,6 +703,10 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--state-dir", default=None)
     w.add_argument("--until", default=None,
                    help="after this time (ISO-8601 or epoch s) only report, never delete")
+    w.add_argument("--extras-every", type=int, default=DEFAULT_EXTRAS_EVERY,
+                   help="read volumes/templates/registry auths/endpoints every N-th pass")
+    w.add_argument("--interval", type=float, default=DEFAULT_INTERVAL_S,
+                   help="seconds between passes without --once (REST budget)")
     x = sub.add_parser("destroy-leftovers")
     x.add_argument("--key-file", required=True)
     x.add_argument("--before", required=True)
@@ -660,6 +715,9 @@ def main(argv: list[str] | None = None) -> int:
     a = ap.parse_args(argv)
     if a.cmd == "watch" and a.auto_destroy and not a.rw_key_file:
         print("error: --auto-destroy needs --rw-key-file", file=sys.stderr)
+        return 2
+    if a.cmd == "watch" and (a.extras_every < 1 or a.interval < 30):
+        print("error: --extras-every must be >= 1 and --interval >= 30", file=sys.stderr)
         return 2
     if a.cmd == "watch" and a.auto_destroy and not a.state_dir:
         print("error: --auto-destroy needs --state-dir (pod ages persist there)", file=sys.stderr)

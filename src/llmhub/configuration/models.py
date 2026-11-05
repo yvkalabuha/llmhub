@@ -116,6 +116,20 @@ class RetryConfig(_Model):
     # T-372 critic F1: repeated creates after an unknown outcome (same label). A real provider
     # must use 0: a pod that shows up after the grace would otherwise be a paid duplicate.
     create_unknown_max_retries: int = Field(default=1, ge=0, le=3)
+    # T-372 L2b: after a round in which EVERY offer got a definite "no capacity", the pool waits
+    # before the next create round: 2 -> 5 -> 10 min (the last value repeats), +-jitter.
+    capacity_backoff_s: list[float] = Field(default_factory=lambda: [120.0, 300.0, 600.0],
+                                            min_length=1)
+    capacity_backoff_jitter: float = Field(default=0.2, ge=0, le=0.5)
+    # a rate-limited answer without Retry-After holds the provider this long (adapters with
+    # their own limiter use their own value)
+    rate_limit_hold_s: float = Field(default=900, ge=60, le=3600)
+
+    @model_validator(mode="after")
+    def _check_capacity_backoff(self) -> RetryConfig:
+        if any(not (0 < v <= 3600) for v in self.capacity_backoff_s):
+            raise ValueError("retry.capacity_backoff_s: values must be in (0, 3600]")
+        return self
 
 
 KNOWN_PROVIDERS = ("mock", "runpod")
@@ -138,6 +152,12 @@ class RunpodConfig(_Model):
     list_staleness_s: float = Field(default=30, ge=0, le=600)
     container_disk_usd_gb_month: float = Field(default=0.10, ge=0)
     call_timeout_s: float = Field(default=20, gt=0, le=60)
+    # REST rate limit (live 2026-11-05: 429 "rate limit exceeded for the hour window"): the hold
+    # after a 429 without Retry-After, and the POST /pods budget per rolling hour
+    rest_hold_s: float = Field(default=900, ge=60, le=3600)
+    post_budget_per_hour: int = Field(default=60, ge=1, le=600)
+    # GraphQL Community `stockStatus` before the POSTs: types without stock are not POSTed
+    stock_precheck: bool = True
 
     @model_validator(mode="after")
     def _check_gpu_ids(self) -> RunpodConfig:

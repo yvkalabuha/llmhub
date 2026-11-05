@@ -12,7 +12,12 @@ Safety rules (each one has a test in tests/test_t372_runpod_adapter.py):
    offer is an allowed GPU type, at least one type is within the cap, and fewer than `max_live_pods`
    `llmhub-*` pods exist in ANY status except TERMINATED (EXITED/CREATED/RESTARTING count,
    critic F6). A failed pre-check (including a failed listing) is a definite refusal
-   (`outcome_unknown=False`). After a 2xx the answer is checked (REV-S10): name == label,
+   (`outcome_unknown=False`). Stock pre-check (`stock_precheck`, one GraphQL call before the
+   REST pod count): types without Community `stockStatus` get no POST; none in stock ->
+   GPU_UNAVAILABLE without POST; an answer without stock for any type does not block. A 429
+   (or the client's REST limiter: hold, POST budget) is a definite `rate_limited` refusal
+   (the gateway refused before processing), never an unknown outcome; it stops the loop.
+   After a 2xx the answer is checked (REV-S10): name == label,
    `costPerHr` <= ceiling, `volumeInGb` 0, not `interruptible`, no network volume. A mismatch
    raises `CreatedResourceRejected` WITHOUT deleting: the caller stores the ref in the DB,
    records a critical incident and destroys it (a foreign-named pod is found by nothing else).
@@ -51,6 +56,7 @@ from llmhub.provider_adapters.base import (
     UnavailableReason,
 )
 from llmhub.provider_adapters.labels import parse_label
+from llmhub.provider_adapters.rate_limit import POST_BUDGET, RATE_LIMITED, RestLimiter
 from llmhub.provider_adapters.runpod_api import (
     GpuTypeInfo,
     NamedRef,
@@ -166,10 +172,11 @@ def _err(
     unknown: bool = False,
     status: int | None = None,
     retry_after: float | None = None,
+    rate_limited: bool = False,
 ) -> NormalizedError:
     return NormalizedError(reason=reason, retryable=retryable, outcome_unknown=unknown,
                            retry_after_s=retry_after, http_status=status,
-                           message=message[:200])  # fmt: skip
+                           message=message[:200], rate_limited=rate_limited)  # fmt: skip
 
 
 def _refuse(reason: UnavailableReason, message: str, *, retryable: bool = False) -> ProviderError:
@@ -196,9 +203,11 @@ def normalize_runpod_error(exc: BaseException) -> NormalizedError:
             return _err(UnavailableReason.GPU_UNAVAILABLE, msg, retryable=True, status=st)
         if code == "spend_limit":
             return _err(UnavailableReason.QUOTA_EXCEEDED, msg, status=st)
-        if st == 429:
+        if st == 429 or code in (RATE_LIMITED, POST_BUDGET):
+            # The gateway (or our own limiter, nothing sent) refused the request before it was
+            # processed: a definite refusal, also for POST /pods (never an unknown outcome).
             return _err(UnavailableReason.PROVIDER_API_ERROR, msg, retryable=True, status=st,
-                        retry_after=exc.retry_after_s)  # fmt: skip
+                        retry_after=exc.retry_after_s, rate_limited=True)  # fmt: skip
         if st == 200:  # GraphQL errors (reads only)
             return _err(UnavailableReason.PROVIDER_API_ERROR, msg, retryable=True, status=st)
         if st is not None and 400 <= st < 500:
@@ -247,6 +256,11 @@ class RunpodAdapter:
     @property
     def list_staleness_s(self) -> float:
         return float(self.cfg.list_staleness_s)
+
+    @property
+    def rest_limiter(self) -> RestLimiter | None:
+        """The REST limiter of the client (shared through the DB by GuardedAdapter)."""
+        return self.api.limiter
 
     def _trust_unlisted(self, ref: str) -> bool:
         """True when `ref` was first known at least `list_staleness_s` ago (R3-5)."""
@@ -332,6 +346,8 @@ class RunpodAdapter:
         try:
             priced = await self._priced(self.cfg.gpu_ids(gpu_class))
         except RunpodHttpError as exc:
+            if normalize_runpod_error(exc).rate_limited:
+                raise ProviderError(normalize_runpod_error(exc)) from None
             raise _refuse(UnavailableReason.PROVIDER_API_ERROR, f"price check: {exc}",
                           retryable=True) from None  # fmt: skip
         # R3-3: stockStatus is a hint only; no capacity -> POST `no_capacity` (a definite refusal)
@@ -342,9 +358,13 @@ class RunpodAdapter:
             cheapest = priced[0][1].community_price or 0.0
             raise _refuse(UnavailableReason.DEPLOYMENT_ERROR,
                           f"price {cheapest:.3f} above ceiling {ceiling:.3f}")  # fmt: skip
+        if self.cfg.stock_precheck:  # GraphQL, before the REST pod count (REST budget)
+            gpus = await self._in_stock(gpus)
         try:
             pods = await self.api.list_pods()
         except RunpodHttpError as exc:
+            if normalize_runpod_error(exc).rate_limited:
+                raise ProviderError(normalize_runpod_error(exc)) from None
             raise _refuse(UnavailableReason.PROVIDER_API_ERROR, f"live pod count: {exc}",
                           retryable=True) from None  # fmt: skip
         live = [p for p in pods if p.name.startswith("llmhub-") and is_live(p)]
@@ -365,6 +385,28 @@ class RunpodAdapter:
                 f"created pod {pod.id} has unexpected {what}; destroy it", unknown=True,
             ), self._pod(pod, gpu_id), what)  # fmt: skip
         return self._pod(pod, gpu_id)
+
+    async def _in_stock(self, gpus: list[str]) -> list[str]:
+        """Stock pre-check (one GraphQL call): only types whose Community `stockStatus` is
+        set get a POST. No type of the class in stock -> a definite GPU_UNAVAILABLE without any
+        POST. A failed check, or an answer without any stock for ANY type (no information),
+        does not block: the POST decides, as before."""
+        try:
+            stock = await self.api.community_stock(gpus)
+        except RunpodHttpError as exc:
+            log.info("runpod: stock pre-check failed (%s); POSTing anyway", exc)
+            return gpus
+        if stock is None:
+            log.info("runpod: stock pre-check shows no stock for any type; POSTing anyway")
+            return gpus
+        keep = [g for g in gpus if stock.get(g)]
+        for g in gpus:
+            if g not in keep:
+                self.last_create_attempts.append((g, "", "no_stock"))
+        if not keep:
+            raise _refuse(UnavailableReason.GPU_UNAVAILABLE,
+                          f"no community stock ({'; '.join(gpus)})", retryable=True)  # fmt: skip
+        return keep
 
     async def _post_each(
         self,
@@ -388,7 +430,9 @@ class RunpodAdapter:
                     err = normalize_runpod_error(exc)
                     no_cap = exc.code == "no_capacity" and not err.outcome_unknown
                     result = ("no_capacity" if no_cap
-                              else "unknown" if err.outcome_unknown else err.reason.value)  # fmt: skip
+                              else "unknown" if err.outcome_unknown
+                              else str(exc.code) if err.rate_limited and exc.code
+                              else err.reason.value)  # fmt: skip
                     self.last_create_attempts.append((gid, v, result))
                     if not no_cap:
                         raise ProviderError(err) from None

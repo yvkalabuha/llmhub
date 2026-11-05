@@ -30,6 +30,10 @@ providers:
     list_staleness_s: 30      # replace with the value measured in L2b
     container_disk_usd_gb_month: 0.10
     call_timeout_s: 15
+    # 0.3.5 (live 2026-11-05: REST 429 "rate limit exceeded for the hour window")
+    rest_hold_s: 900          # hold after a 429 without Retry-After
+    post_budget_per_hour: 60  # POST /pods per rolling hour
+    stock_precheck: true      # GraphQL Community stockStatus before the POSTs
 
 budget:                     # plan section 4: llmhub ceiling $4.00 for the whole test
   hard_cap_month: 4.00
@@ -53,6 +57,8 @@ leases:
 retry:
   create_unknown_max_retries: 0   # critic F1: never a second paid create after an unknown one
   call_timeout_s: 60              # create = price check + live-pod count + POST (15 s each)
+  capacity_backoff_s: [120, 300, 600]   # wait between create rounds without capacity
+  capacity_backoff_jitter: 0.2
 
 local_backends:             # the existing llama-server units, used as clients (never managed)
   qwen-35b-a3b:
