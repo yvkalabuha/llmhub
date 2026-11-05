@@ -20,7 +20,10 @@ providers:
   enabled: [runpod]         # Mock is off: its ledger is excluded (ledger-exclude, Q5)
   runpod:
     cloud_type: COMMUNITY
-    gpu_type_ids: {RTX3090: "NVIDIA GeForce RTX 3090"}
+    # 2026-11-05: no 3090 with CUDA >= 12.8 on Community -> a 24 GB class, tried cheapest first
+    # (Community 2026-11-04: 3090 0.22, 3090 Ti 0.27, 4090 0.34 $/h)
+    gpu_type_ids:
+      RTX24G: ["NVIDIA GeForce RTX 3090", "NVIDIA GeForce RTX 3090 Ti", "NVIDIA GeForce RTX 4090"]
     allowed_cuda_versions: ["12.8", "12.9", "13.0"]
     price_ceiling_usd_h: 0.50
     max_live_pods: 1
@@ -92,11 +95,11 @@ router:
 pools:
   cloud-27b:
     provider: runpod
-    gpu: RTX3090
+    gpu: RTX24G
     vram_gb: 24
     pp_tps: 1200
     tg_tps: 78
-    max_price_usd_h: 0.30
+    max_price_usd_h: 0.35     # covers the 4090 (0.34); adapter ceiling stays 0.50
     idle_timeout_s: 300
     image: "ghcr.io/yvkalabuha/llmhub-infer@sha256:0000000000000000000000000000000000000000000000000000000000000000"
     disk_gb: 40

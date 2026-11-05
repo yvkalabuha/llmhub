@@ -110,8 +110,8 @@ def test_t372_config_guards() -> None:
     assert (b.budget_session, b.budget_job, b.reserve_usd) == (0.60, 0.10, 1.0)
     (pool,) = cfg.pools.values()
     assert (pool.name, pool.provider, pool.gpu, pool.disk_gb) == ("cloud-27b", "runpod",
-                                                                  "RTX3090", 40)  # fmt: skip
-    assert pool.max_price_usd_h == 0.30 and pool.idle_timeout_s == 300
+                                                                  "RTX24G", 40)  # fmt: skip
+    assert pool.max_price_usd_h == 0.35 and pool.idle_timeout_s == 300
     assert pool.infer.transport == "proxy" and pool.weights == "local-models"
     assert IMAGE_DIGEST_RE.match(pool.image)
     assert pool.image.startswith("ghcr.io/yvkalabuha/llmhub-infer@sha256:")

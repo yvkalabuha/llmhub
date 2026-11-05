@@ -18,6 +18,9 @@ A small state machine on an injected clock:
 - capacity per CUDA version (`cuda_capacity`, L2b): a POST whose `allowedCudaVersions` holds a
   version without capacity answers the real 500 `NO_INSTANCES_BODY` (a list of several
   versions narrows the choice, like the real API: every listed version needs capacity).
+- several GPU types (`gpus`: id -> Community price, None = `communityCloud` false) and
+  capacity per GPU type (`gpu_capacity`): a POST for a type without capacity answers the
+  same 500; the pod cost is the price of its type + disk.
 The fake answers with the pod `env` (like RunPod), so tests can prove the adapter drops it.
 """
 
@@ -102,6 +105,8 @@ class FakeRunpod:
         create_answer_extra: dict[str, Any] | None = None,
         has_spend_limit: bool = True,
         cuda_capacity: set[str] | None = None,
+        gpus: dict[str, float | None] | None = None,
+        gpu_capacity: set[str] | None = None,
     ) -> None:
         self.clock = clock
         self.price = price
@@ -122,6 +127,8 @@ class FakeRunpod:
         self.create_answer_extra = dict(create_answer_extra or {})  # fields of the new pod
         self.has_spend_limit = has_spend_limit  # GraphQL `spendLimit` is unverified (R2-10)
         self.cuda_capacity = cuda_capacity  # None: capacity for every CUDA version
+        self.gpus = gpus  # None: only GPU_ID at `price` (and `community`)
+        self.gpu_capacity = gpu_capacity  # None: capacity for every GPU type
         self.pods: dict[str, FakePod] = {}
         self.volumes: list[dict[str, Any]] = []
         self.templates: list[dict[str, Any]] = []
@@ -263,11 +270,15 @@ class FakeRunpod:
                     not self.cuda_capacity if not cudas
                     else not set(cudas) <= self.cuda_capacity):  # fmt: skip
                 return httpx.Response(500, text=NO_INSTANCES_BODY)
+            gid = (body.get("gpuTypeIds") or [GPU_ID])[0]
+            if self.gpu_capacity is not None and gid not in self.gpu_capacity:
+                return httpx.Response(500, text=NO_INSTANCES_BODY)
             self._n += 1
             pid = f"pod{self._n:04d}abc"
             now = self.clock.now()
+            gpu_price = self.gpu_price(gid)
             cost = self.cost_override if self.cost_override is not None else round(
-                self.price + self.disk_usd_h, 4)
+                (gpu_price if gpu_price is not None else self.price) + self.disk_usd_h, 4)
             pod = FakePod(pid, self.name_override or body["name"], body["imageName"], cost, now,
                           dict(body.get("env", {})), f"mach-{self._n}", body,
                           visible_at=now + self.visible_after_s)  # fmt: skip
@@ -343,19 +354,30 @@ class FakeRunpod:
                 return httpx.Response(fault.status, text=fault.body)
             gid = re.search(r'id: "([^"]+)"', query)
             assert gid is not None
-            if gid.group(1) != GPU_ID:
+            known = self.gpus if self.gpus is not None else {GPU_ID: self.price}
+            if gid.group(1) not in known:
                 return httpx.Response(200, json={"data": {"gpuTypes": []}})
-            return httpx.Response(200, json={"data": {"gpuTypes": [self._gpu_type(query)]}})
+            item = self._gpu_type(query, gid.group(1))
+            return httpx.Response(200, json={"data": {"gpuTypes": [item]}})
         return httpx.Response(400, json={"errors": [{"message": "unknown query"}]})
 
-    def _gpu_type(self, query: str) -> dict[str, Any]:
+    def gpu_price(self, gid: str) -> float | None:
+        if self.gpus is None:
+            return self.price if gid == GPU_ID else None
+        return self.gpus.get(gid)
+
+    def _gpu_type(self, query: str, gid: str = GPU_ID) -> dict[str, Any]:
         """The real answer shape (L1, 2026-11-04): `communityPrice`/`communityCloud` on the
         type; `lowestPrice(input: {gpuCount: 1, secureCloud: false})` -> every field null;
         without `secureCloud` -> a price (possibly Secure) and `stockStatus`. Only the
         selected fields are returned, like GraphQL."""
-        price: Any = str(self.price) if self.price_as_string else self.price
-        full: dict[str, Any] = {"id": GPU_ID, "displayName": "RTX 3090", "memoryInGb": 24,
-                                "communityPrice": price, "communityCloud": self.community,
+        own = self.gpu_price(gid)
+        community = self.community if self.gpus is None else own is not None
+        raw = own if own is not None else self.price
+        price: Any = str(raw) if self.price_as_string else raw
+        full: dict[str, Any] = {"id": gid, "displayName": gid.removeprefix("NVIDIA GeForce "),
+                                "memoryInGb": 24,
+                                "communityPrice": price, "communityCloud": community,
                                 "secureCloud": True, "securePrice": self.secure_price}  # fmt: skip
         item = {k: v for k, v in full.items() if re.search(rf"\b{k}\b", query)}
         m = re.search(r"lowestPrice\(input: *\{([^}]*)\}\)\s*\{([^}]*)\}", query)

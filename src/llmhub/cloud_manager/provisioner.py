@@ -245,6 +245,8 @@ async def _do_create(
         return _create_failed(conn, inst, err, host_id, cfg, now_fn())
     if not await adopt_ref_or_destroy(conn, adapter, iid, res, now_fn()):
         return CreateOutcome.FAILED
+    if res.offer_id is not None and res.offer_id != spec.offer_id:
+        _record_created_offer(conn, iid, res)
     if res.host_id and res.host_id in blacklisted_hosts(conn, inst["provider"], now_fn()):
         return await _reject_blacklisted(conn, adapter, inst, res, cfg, now_fn())
     try:  # a ghost ref is not visible: the PROVISIONING step moves the row to the label
@@ -257,6 +259,23 @@ async def _do_create(
                        "controller", endpoint=seen.endpoint)  # fmt: skip
             delete_key(conn, _exclude_key(iid))
     return CreateOutcome.CREATED
+
+
+def _record_created_offer(conn: sqlite3.Connection, iid: str, res: RemoteResource) -> None:
+    """The adapter created another GPU type of the class than the chosen offer (RunPod GPU
+    list): `offer_json` names the type and price actually created (`price_usd_h` of the row,
+    which the ledger accrues, is already the pod's `costPerHr`)."""
+    with tx(conn):
+        row = conn.execute("SELECT offer_json FROM instances WHERE id=?", (iid,)).fetchone()
+        try:
+            offer = json.loads(row["offer_json"]) if row and row["offer_json"] else {}
+        except ValueError:
+            offer = {}
+        if not isinstance(offer, dict):
+            offer = {}
+        offer.update(offer_id=res.offer_id, price_usd_h=res.price_usd_h)
+        conn.execute("UPDATE instances SET offer_json=? WHERE id=?",
+                     (json.dumps(offer, sort_keys=True), iid))  # fmt: skip
 
 
 CREATED_REJECTED = "created_resource_rejected"

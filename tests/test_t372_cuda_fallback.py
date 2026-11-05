@@ -13,6 +13,7 @@ from llmhub.provider_adapters.base import ProviderError, UnavailableReason
 from llmhub.provider_adapters.labels import make_label, new_op_id
 from llmhub.provider_adapters.runpod import RunpodAdapter, cuda_order, normalize_runpod_error
 from llmhub.provider_adapters.runpod_api import RunpodHttpError, classify
+from runpod_fake import GPU_ID as G
 from runpod_fake import NO_INSTANCES_BODY, FakeRunpod, make_adapter, make_spec, runpod_cfg
 
 SECRET = b"test-secret-0123456789abcdef-test-secret"
@@ -86,7 +87,7 @@ async def test_create_starts_with_the_highest_version() -> None:
     a = make_adapter(fake)
     res = await a.create(make_spec(), _label())
     assert _cudas(fake) == [["13.0"]] and fake.posts() == 1
-    assert a.last_create_attempts == [("13.0", "created")] and res.ref in fake.pods
+    assert a.last_create_attempts == [(G, "13.0", "created")] and res.ref in fake.pods
 
 
 async def test_create_moves_down_on_no_capacity_only() -> None:
@@ -94,8 +95,8 @@ async def test_create_moves_down_on_no_capacity_only() -> None:
     a = make_adapter(fake)
     res = await a.create(make_spec(), _label())
     assert _cudas(fake) == [["13.0"], ["12.9"], ["12.8"]]
-    assert a.last_create_attempts == [("13.0", "no_capacity"), ("12.9", "no_capacity"),
-                                      ("12.8", "created")]  # fmt: skip
+    assert a.last_create_attempts == [(G, "13.0", "no_capacity"), (G, "12.9", "no_capacity"),
+                                      (G, "12.8", "created")]  # fmt: skip
     assert [p.id for p in fake.live_pods()] == [res.ref]
     assert _gets(fake) == 1  # max_live_pods checked once, before the first POST
 
@@ -108,7 +109,7 @@ async def test_all_versions_refused_is_definite_gpu_unavailable() -> None:
     assert ei.value.err.reason == UnavailableReason.GPU_UNAVAILABLE
     assert not ei.value.err.outcome_unknown and ei.value.err.retryable
     assert fake.posts() == 3 and not fake.pods
-    assert [r for _, r in a.last_create_attempts] == ["no_capacity"] * 3
+    assert [r for *_, r in a.last_create_attempts] == ["no_capacity"] * 3
 
 
 @pytest.mark.parametrize("kind", ["timeout_after", "read_timeout"])
@@ -120,7 +121,7 @@ async def test_unknown_after_no_capacity_stops_at_once(kind: str) -> None:
     with pytest.raises(ProviderError) as ei:
         await a.create(make_spec(), _label())
     assert ei.value.err.outcome_unknown and fake.posts() == 2
-    assert a.last_create_attempts == [("13.0", "no_capacity"), ("12.9", "unknown")]
+    assert a.last_create_attempts == [(G, "13.0", "no_capacity"), (G, "12.9", "unknown")]
 
 
 async def test_other_500_on_first_post_stops_unknown() -> None:
@@ -131,7 +132,7 @@ async def test_other_500_on_first_post_stops_unknown() -> None:
     with pytest.raises(ProviderError) as ei:
         await a.create(make_spec(), _label())
     assert ei.value.err.outcome_unknown and fake.posts() == 1
-    assert a.last_create_attempts == [("13.0", "unknown")]
+    assert a.last_create_attempts == [(G, "13.0", "unknown")]
 
 
 async def test_other_definite_refusal_stops_without_next_version() -> None:
@@ -141,7 +142,7 @@ async def test_other_definite_refusal_stops_without_next_version() -> None:
     with pytest.raises(ProviderError) as ei:
         await a.create(make_spec(), _label())
     assert not ei.value.err.outcome_unknown and fake.posts() == 1
-    assert a.last_create_attempts == [("13.0", "deployment_error")]
+    assert a.last_create_attempts == [(G, "13.0", "deployment_error")]
 
 
 async def test_max_posts_is_the_number_of_versions() -> None:
@@ -175,7 +176,7 @@ async def test_probe_reports_attempts(tmp_path: Path) -> None:
     rep = await lifecycle_probe(conn, adapter, b"x" * 32, clock, _cfg(tmp_path), image=SMALL,
                                 gpu_type_id="NVIDIA GeForce RTX 3090", max_s=60, poll_s=5,
                                 hold_s=0)  # fmt: skip
-    assert rep.attempts == [("13.0", "no_capacity"), ("12.9", "created")]
+    assert rep.attempts == [(G, "13.0", "no_capacity"), (G, "12.9", "created")]
     assert rep.destroyed and rep.zero and fake.live_pods() == []
 
 
@@ -191,6 +192,6 @@ async def test_probe_all_refused_is_no_capacity_not_unknown(tmp_path: Path) -> N
     migrate(conn)
     rep = await lifecycle_probe(conn, adapter, b"x" * 32, clock, _cfg(tmp_path), image=SMALL,
                                 gpu_type_id="NVIDIA GeForce RTX 3090", max_s=60, poll_s=5)  # fmt: skip
-    assert [r for _, r in rep.attempts] == ["no_capacity"] * 3
+    assert [r for *_, r in rep.attempts] == ["no_capacity"] * 3
     assert rep.error is not None and "no_capacity" in rep.error
     assert not any("unknown" in n for n in rep.notes) and fake.posts() == 3

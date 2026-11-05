@@ -154,7 +154,8 @@ class ProbeReport:
     error: str | None = None
     notes: list[str] = field(default_factory=list[str])
     # (cuda version, result) per POST /pods: created | no_capacity | unknown | <reason>
-    attempts: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
+    # (gpu type id, cuda version, result) of each POST /pods
+    attempts: list[tuple[str, str, str]] = field(default_factory=list[tuple[str, str, str]])
 
 
 def _insert_probe_row(conn: sqlite3.Connection, provider: str, op_id: str, label: str,
@@ -191,7 +192,7 @@ async def lifecycle_probe(
     image: str,
     gpu_type_id: str,
     disk_gb: int = 20,
-    max_price_usd_h: float = 0.30,
+    max_price_usd_h: float = 0.35,
     max_s: float = 480.0,
     poll_s: float = 5.0,
     hold_s: float = PROBE_HOLD_S,

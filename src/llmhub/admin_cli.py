@@ -340,7 +340,11 @@ def _lifecycle_probe(args: argparse.Namespace) -> int:
 
     cfg = _load(args)
     rp = cfg.providers.runpod
-    if rp is None or args.gpu not in rp.gpu_type_ids:
+    gpu = args.gpu
+    if gpu is None and rp is not None:  # the runpod pool's class, else the first class
+        gpu = next((p.gpu for p in cfg.pools.values() if p.provider == "runpod"),
+                   next(iter(rp.gpu_type_ids), None))  # fmt: skip
+    if rp is None or gpu not in rp.gpu_type_ids:
         raise AdminCliError("--gpu must be a key of providers.runpod.gpu_type_ids", exit_code=2)
     adapter = _adapter(cfg, "runpod")
     try:
@@ -353,7 +357,7 @@ def _lifecycle_probe(args: argparse.Namespace) -> int:
         try:
             return await lifecycle_probe(
                 conn, adapter, secret, SystemClock(), cfg, image=args.image,
-                gpu_type_id=rp.gpu_type_ids[args.gpu], disk_gb=args.disk_gb,
+                gpu_type_id=rp.gpu_ids(gpu)[0], disk_gb=args.disk_gb,
                 max_price_usd_h=args.max_price, max_s=args.max_s, poll_s=args.poll_s,
                 hold_s=args.hold_s,
             )  # fmt: skip
@@ -487,9 +491,10 @@ def add_commands(sub: Any) -> None:
     lp = sub.add_parser("lifecycle-probe", help="one small RunPod pod, timings only (T-372)")
     lp.add_argument("--config", default=DEFAULT_CONFIG)
     lp.add_argument("--image", required=True, help="<name>@sha256:<64 hex>")
-    lp.add_argument("--gpu", default="RTX3090")
+    lp.add_argument("--gpu", default=None,
+                    help="pool gpu class (default: the runpod pool's); its types cheapest first")
     lp.add_argument("--disk-gb", type=int, default=20)
-    lp.add_argument("--max-price", type=float, default=0.30)
+    lp.add_argument("--max-price", type=float, default=0.35)
     lp.add_argument("--max-s", type=float, default=480.0)
     lp.add_argument("--poll-s", type=float, default=5.0)
     lp.add_argument("--hold-s", type=float, default=150.0,

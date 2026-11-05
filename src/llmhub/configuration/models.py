@@ -128,7 +128,9 @@ class RunpodConfig(_Model):
     """RunPod adapter (T-372 plan 3.5): Community Cloud pods only, spend guards as bounds."""
 
     cloud_type: Literal["COMMUNITY"] = "COMMUNITY"
-    gpu_type_ids: dict[str, str] = {"RTX3090": "NVIDIA GeForce RTX 3090"}  # pool gpu -> id
+    # pool gpu class -> one RunPod GPU type id or an ordered list of them (2026-11-05: the
+    # 27B class takes RTX 3090 / 3090 Ti / 4090); a plain string is a one-item list
+    gpu_type_ids: dict[str, str | list[str]] = {"RTX3090": "NVIDIA GeForce RTX 3090"}
     # advocate F7b: the image needs a driver >= 12.8; every such value of the real enum (R2-4)
     allowed_cuda_versions: list[str] = ["12.8", "12.9", "13.0"]
     price_ceiling_usd_h: float = Field(default=0.50, gt=0, le=0.50)
@@ -136,6 +138,30 @@ class RunpodConfig(_Model):
     list_staleness_s: float = Field(default=30, ge=0, le=600)
     container_disk_usd_gb_month: float = Field(default=0.10, ge=0)
     call_timeout_s: float = Field(default=20, gt=0, le=60)
+
+    @model_validator(mode="after")
+    def _check_gpu_ids(self) -> RunpodConfig:
+        for cls in self.gpu_type_ids:
+            ids = self.gpu_ids(cls)
+            if not ids or any(not i.strip() for i in ids):
+                raise ValueError(f"gpu_type_ids.{cls}: empty gpu type id")
+            if len(set(ids)) != len(ids):
+                raise ValueError(f"gpu_type_ids.{cls}: duplicate gpu type id")
+        return self
+
+    def gpu_ids(self, gpu_class: str) -> list[str]:
+        """RunPod GPU type ids of a pool gpu class, in config order ([] if unknown)."""
+        v = self.gpu_type_ids.get(gpu_class)
+        if v is None:
+            return []
+        return [v] if isinstance(v, str) else list(v)
+
+    def all_gpu_ids(self) -> list[str]:
+        return list(dict.fromkeys(i for c in self.gpu_type_ids for i in self.gpu_ids(c)))
+
+    def class_of(self, gpu_type_id: str) -> str | None:
+        """The first pool gpu class listing `gpu_type_id`, or None."""
+        return next((c for c in self.gpu_type_ids if gpu_type_id in self.gpu_ids(c)), None)
 
 
 class ProvidersConfig(_Model):

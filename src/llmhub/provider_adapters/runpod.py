@@ -1,14 +1,15 @@
 """RunpodAdapter (T-372 plan 3.3): Community Cloud GPU pods behind the ProviderAdapter protocol.
 
 Safety rules (each one has a test in tests/test_t372_runpod_adapter.py):
-1. `create` sends at most ONE `POST /pods` per allowed CUDA version, never retried (L2b): the
-   versions are tried one at a time, highest first, each with `allowedCudaVersions: [v]` (a
-   list of several versions narrows the choice on the real API); the next version only after
-   a definite `no_capacity` refusal; success, any unknown outcome or any other refusal stops.
-   Before the first POST (once): the image is pinned by
-   digest, the transport is `proxy`, the offer is an allowed GPU type whose current Community
-   price (`communityPrice` with `communityCloud` true, R3-3) is
-   <= min(spec.max_price_usd_h, price_ceiling_usd_h), and fewer than `max_live_pods`
+1. `create` sends at most ONE `POST /pods` per (GPU type, allowed CUDA version), never retried
+   (L2b): the GPU types of the offer's class (`gpu_type_ids`, a str or an ordered list) whose
+   current Community price (`communityPrice` with `communityCloud` true, R3-3) is
+   <= min(spec.max_price_usd_h, price_ceiling_usd_h) are tried cheapest first, and for each the
+   versions one at a time, highest first, each with `allowedCudaVersions: [v]` (a list of
+   several versions narrows the choice on the real API); the next attempt only after a
+   definite `no_capacity` refusal; success, any unknown outcome or any other refusal stops.
+   Before the first POST (once): the image is pinned by digest, the transport is `proxy`, the
+   offer is an allowed GPU type, at least one type is within the cap, and fewer than `max_live_pods`
    `llmhub-*` pods exist in ANY status except TERMINATED (EXITED/CREATED/RESTARTING count,
    critic F6). A failed pre-check (including a failed listing) is a definite refusal
    (`outcome_unknown=False`). After a 2xx the answer is checked (REV-S10): name == label,
@@ -51,6 +52,7 @@ from llmhub.provider_adapters.base import (
 )
 from llmhub.provider_adapters.labels import parse_label
 from llmhub.provider_adapters.runpod_api import (
+    GpuTypeInfo,
     NamedRef,
     PodInfo,
     RunpodApi,
@@ -236,8 +238,8 @@ class RunpodAdapter:
         # R3-5: pod id -> first time this process knew it (create answer, first get/destroy).
         # "400 and not in the list" means gone only once the list had time to show the pod.
         self._first_known: dict[str, float] = {}
-        # (cuda version, result) of the POSTs of the last `create` (lifecycle-probe report)
-        self.last_create_attempts: list[tuple[str, str]] = []
+        # (gpu type id, cuda version, result) of the POSTs of the last `create` (probe report)
+        self.last_create_attempts: list[tuple[str, str, str]] = []
 
     def __repr__(self) -> str:
         return f"RunpodAdapter(cloud_type={self.cfg.cloud_type!r})"
@@ -260,7 +262,7 @@ class RunpodAdapter:
         return disk_gb * self.cfg.container_disk_usd_gb_month / HOURS_PER_MONTH
 
     # --- conversions -----------------------------------------------------------
-    def _pod(self, pod: PodInfo) -> RemoteResource:
+    def _pod(self, pod: PodInfo, gpu_type_id: str | None = None) -> RemoteResource:
         status = pod_status(pod)
         return RemoteResource(
             provider=self.name, ref=pod.id, label=pod.name, kind=ResourceKind.INSTANCE,
@@ -268,6 +270,7 @@ class RunpodAdapter:
             price_usd_h=pod.cost_per_hr or 0.0,
             spend_rate_usd_h=pod.cost_per_hr if status == RemoteStatus.RUNNING else None,
             created_at=pod.created_at if pod.created_at is not None else self.clock.now(),
+            offer_id=gpu_type_id,
         )  # fmt: skip
 
     def _named(self, ref: NamedRef, prefix: str, kind: ResourceKind) -> RemoteResource:
@@ -284,21 +287,29 @@ class RunpodAdapter:
             raise ProviderError(normalize_runpod_error(exc)) from None
 
     # --- ProviderAdapter ----------------------------------------------------------
+    async def _priced(self, ids: Sequence[str]) -> list[tuple[str, GpuTypeInfo]]:
+        """(id, info) of the types with a Community price (R3-3), cheapest first; ties keep
+        the config order."""
+        infos = await self.api.gpu_types(list(ids))
+        by_id = {g.id: g for g in infos if g.id in ids and g.community_price is not None}
+        ranked = [(i, by_id[i]) for i in ids if i in by_id]
+        return sorted(ranked, key=lambda p: p[1].community_price or 0.0)  # stable: config order
+
     async def list_offers(self, q: OfferQuery) -> list[Offer]:
-        gid = self.cfg.gpu_type_ids.get(q.gpu)
-        if gid is None:
+        """One offer per GPU type of the class with a Community price <= the pool cap."""
+        ids = self.cfg.gpu_ids(q.gpu)
+        if not ids:
             return []
-        infos = await self._call(self.api.gpu_types([gid]))
-        out: list[Offer] = []
-        for g in infos:
-            if g.id != gid or g.community_price is None:
-                continue  # no Community price (communityCloud false/null): no offer (R3-3)
-            out.append(Offer(
+        priced = await self._call(self._priced(ids))
+        return [
+            Offer(
                 provider=self.name, offer_id=g.id, gpu=q.gpu, gpu_count=1, vram_gb=g.memory_gb,
-                price_usd_h=g.community_price, disk_usd_h=self._disk_usd_h(self.disk_gb_hint),
+                price_usd_h=price, disk_usd_h=self._disk_usd_h(self.disk_gb_hint),
                 host_id="", interruptible=False, public_ip=False,
-            ))  # fmt: skip
-        return out
+            )
+            for _, g in priced
+            if (price := g.community_price) is not None and price <= q.max_price_usd_h
+        ]  # fmt: skip
 
     async def create(
         self,
@@ -314,21 +325,23 @@ class RunpodAdapter:
             raise _refuse(UnavailableReason.DEPLOYMENT_ERROR, "image is not pinned by digest")
         if spec.env.get("LLMHUB_TRANSPORT", "proxy") != "proxy":
             raise _refuse(UnavailableReason.DEPLOYMENT_ERROR, "transport must be proxy")
-        if spec.offer_id not in self.cfg.gpu_type_ids.values():
+        gpu_class = self.cfg.class_of(spec.offer_id)
+        if gpu_class is None:
             raise _refuse(UnavailableReason.DEPLOYMENT_ERROR, "gpu type not allowed")
         ceiling = min(spec.max_price_usd_h, self.cfg.price_ceiling_usd_h)
         try:
-            infos = await self.api.gpu_types([spec.offer_id])
+            priced = await self._priced(self.cfg.gpu_ids(gpu_class))
         except RunpodHttpError as exc:
             raise _refuse(UnavailableReason.PROVIDER_API_ERROR, f"price check: {exc}",
                           retryable=True) from None  # fmt: skip
-        info = next((g for g in infos if g.id == spec.offer_id), None)
         # R3-3: stockStatus is a hint only; no capacity -> POST `no_capacity` (a definite refusal)
-        if info is None or info.community_price is None:
+        if not priced:
             raise _refuse(UnavailableReason.GPU_UNAVAILABLE, "no community offer", retryable=True)
-        if info.community_price > ceiling:
+        gpus = [gid for gid, g in priced if (g.community_price or 0.0) <= ceiling]
+        if not gpus:
+            cheapest = priced[0][1].community_price or 0.0
             raise _refuse(UnavailableReason.DEPLOYMENT_ERROR,
-                          f"price {info.community_price:.3f} above ceiling {ceiling:.3f}")  # fmt: skip
+                          f"price {cheapest:.3f} above ceiling {ceiling:.3f}")  # fmt: skip
         try:
             pods = await self.api.list_pods()
         except RunpodHttpError as exc:
@@ -341,7 +354,7 @@ class RunpodAdapter:
         versions = cuda_order(self.cfg.allowed_cuda_versions)
         if not versions:
             raise _refuse(UnavailableReason.DEPLOYMENT_ERROR, "no allowed cuda versions")
-        pod = await self._post_per_cuda(spec, label, versions, docker_start_cmd)
+        gpu_id, pod = await self._post_each(spec, label, gpus, versions, docker_start_cmd)
         self._first_known.setdefault(pod.id, self.clock.now())
         what = created_mismatch(pod, label, ceiling)
         if what is not None:
@@ -350,42 +363,45 @@ class RunpodAdapter:
             raise CreatedResourceRejected(_err(
                 UnavailableReason.DEPLOYMENT_ERROR,
                 f"created pod {pod.id} has unexpected {what}; destroy it", unknown=True,
-            ), self._pod(pod), what)  # fmt: skip
-        return self._pod(pod)
+            ), self._pod(pod, gpu_id), what)  # fmt: skip
+        return self._pod(pod, gpu_id)
 
-    async def _post_per_cuda(
+    async def _post_each(
         self,
         spec: InstanceSpec,
         label: str,
+        gpus: Sequence[str],
         versions: Sequence[str],
         docker_start_cmd: Sequence[str] | None,
-    ) -> PodInfo:
-        """One POST per version (highest first); the next only after a definite
-        `no_capacity`. Never a second POST after an unknown outcome."""
+    ) -> tuple[str, PodInfo]:
+        """One POST per (GPU type, version): types cheapest first, versions highest first;
+        the next only after a definite `no_capacity`. Never a second POST after an unknown
+        outcome."""
         last: NormalizedError | None = None
-        for v in versions:
-            body = create_body(spec, label, self.cfg, spec.offer_id,
-                               docker_start_cmd=docker_start_cmd, cuda_versions=[v])  # fmt: skip
-            try:
-                pod = await self.api.create_pod(body)
-            except RunpodHttpError as exc:
-                err = normalize_runpod_error(exc)
-                no_cap = exc.code == "no_capacity" and not err.outcome_unknown
-                result = ("no_capacity" if no_cap
-                          else "unknown" if err.outcome_unknown else err.reason.value)  # fmt: skip
-                self.last_create_attempts.append((v, result))
-                if not no_cap:
-                    raise ProviderError(err) from None
-                log.info("runpod: no capacity with cuda %s", v)
-                last = err
-                continue
-            self.last_create_attempts.append((v, "created"))
-            return pod
+        for gid in gpus:
+            for v in versions:
+                body = create_body(spec, label, self.cfg, gid,
+                                   docker_start_cmd=docker_start_cmd, cuda_versions=[v])  # fmt: skip
+                try:
+                    pod = await self.api.create_pod(body)
+                except RunpodHttpError as exc:
+                    err = normalize_runpod_error(exc)
+                    no_cap = exc.code == "no_capacity" and not err.outcome_unknown
+                    result = ("no_capacity" if no_cap
+                              else "unknown" if err.outcome_unknown else err.reason.value)  # fmt: skip
+                    self.last_create_attempts.append((gid, v, result))
+                    if not no_cap:
+                        raise ProviderError(err) from None
+                    log.info("runpod: no capacity for %s with cuda %s", gid, v)
+                    last = err
+                    continue
+                self.last_create_attempts.append((gid, v, "created"))
+                return gid, pod
         assert last is not None
         tried = ",".join(versions)
         raise ProviderError(_err(UnavailableReason.GPU_UNAVAILABLE,
-                                 f"{last.message} (cuda {tried})", retryable=True,
-                                 status=last.http_status))  # fmt: skip
+                                 f"{last.message} ({'; '.join(gpus)}; cuda {tried})",
+                                 retryable=True, status=last.http_status))  # fmt: skip
 
     async def get(self, ref: str) -> RemoteResource | None:
         if ref.startswith((REF_VOLUME, REF_TEMPLATE)):

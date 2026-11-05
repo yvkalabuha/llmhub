@@ -99,6 +99,9 @@ class RemoteResource:
     price_usd_h: float
     spend_rate_usd_h: float | None
     created_at: float
+    # the provider offer (GPU type) actually created, when the adapter may pick another one of
+    # the class than `spec.offer_id` (RunPod GPU list); None = `spec.offer_id`
+    offer_id: str | None = None
 
 
 @dataclass(frozen=True)
