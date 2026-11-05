@@ -52,7 +52,7 @@ async def test_create_body_and_resource() -> None:
     assert body["name"] == label and body["imageName"] == spec.image
     assert body["cloudType"] == "COMMUNITY" and body["computeType"] == "GPU"
     assert body["gpuTypeIds"] == [GPU_ID] and body["gpuCount"] == 1
-    assert body["allowedCudaVersions"] == ["12.8", "12.9", "13.0"]
+    assert body["allowedCudaVersions"] == ["13.0"]  # one version per POST, highest first (L2b)
     assert body["volumeInGb"] == 0 and body["containerDiskInGb"] == 40
     assert body["interruptible"] is False and body["ports"] == ["8080/http"]
     assert body["env"]["LLMHUB_API_KEY"] == "pod-secret-1"  # secrets reach the pod only
@@ -87,11 +87,11 @@ async def test_5xx_on_create_unknown_connect_error_definite() -> None:
 async def test_no_capacity_is_gpu_unavailable() -> None:
     fake, _ = _setup()
     fake.inject("POST", "/pods", "status", status=500,
-                body="There are no longer any instances available")  # fmt: skip
+                body="There are no longer any instances available", times=3)  # fmt: skip
     with pytest.raises(ProviderError) as ei:
         await make_adapter(fake).create(make_spec(), _label())
     assert ei.value.err.reason == UnavailableReason.GPU_UNAVAILABLE
-    assert not ei.value.err.outcome_unknown
+    assert not ei.value.err.outcome_unknown and fake.posts() == 3  # one per CUDA version
 
 
 @pytest.mark.parametrize(

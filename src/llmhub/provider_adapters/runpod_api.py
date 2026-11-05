@@ -114,8 +114,28 @@ class BillingBucket:
 
 
 # ------------------------------------------------------------------ parsing helpers
-def classify(text: str) -> str | None:
-    """Short error code from a response text (the text itself is never kept)."""
+_NO_INSTANCES = "no instances currently available"
+
+
+def _json_error(text: str) -> str | None:
+    """The `error` string of a JSON error body, or None."""
+    try:
+        raw = json.loads(text[:_BODY_SCAN])
+    except ValueError:
+        return None
+    err = raw.get("error") if isinstance(raw, dict) else None
+    return err if isinstance(err, str) else None
+
+
+def classify(text: str, *, status: int | None = None) -> str | None:
+    """Short error code from a response text (the text itself is never kept).
+    L2b: the real `POST /pods` without capacity answers 500 with JSON
+    `{"error": "create pod: There are no instances currently available", ...}`: a definite
+    refusal (`no_capacity`); only that exact pair, any other 5xx stays an unknown outcome."""
+    if status == 500:
+        err = _json_error(text)
+        if err is not None and _NO_INSTANCES in err.lower():
+            return "no_capacity"
     t = text[:_BODY_SCAN].lower()
     if "no longer any instances available" in t or "no instances available" in t:
         return "no_capacity"
@@ -370,8 +390,9 @@ class RunpodApi:
         if resp.status_code == 404 and allow_404:
             return None
         if resp.status_code >= 300:
+            st = resp.status_code
             raise RunpodHttpError(
-                method=method, path=path, status=resp.status_code, code=classify(resp.text),
+                method=method, path=path, status=st, code=classify(resp.text, status=st),
                 retry_after_s=_retry_after(resp), sent=True,
             )  # fmt: skip
         if resp.status_code == 204 or not resp.content:

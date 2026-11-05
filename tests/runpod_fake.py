@@ -14,7 +14,10 @@ A small state machine on an injected clock:
   bad JSON shapes, a broken second page;
 - GraphQL `gpuTypes` in the real shape (R3-3): `communityPrice`/`communityCloud`, a null
   `lowestPrice` for `secureCloud: false`;
-- billing: hourly buckets per pod from its lifetime.
+- billing: hourly buckets per pod from its lifetime;
+- capacity per CUDA version (`cuda_capacity`, L2b): a POST whose `allowedCudaVersions` holds a
+  version without capacity answers the real 500 `NO_INSTANCES_BODY` (a list of several
+  versions narrows the choice, like the real API: every listed version needs capacity).
 The fake answers with the pod `env` (like RunPod), so tests can prove the adapter drops it.
 """
 
@@ -39,6 +42,9 @@ from llmhub.provider_adapters.runpod_api import RunpodApi
 FAKE_KEY = "rpa_FAKEKEY_0123456789abcdef"  # fictitious
 GPU_ID = "NVIDIA GeForce RTX 3090"
 IMAGE = "ghcr.io/yvkalabuha/llmhub-infer@sha256:" + "ab" * 32
+# the real answer of POST /pods without capacity (L2b, 2026-11-04)
+NO_INSTANCES_BODY = ('{"error":"create pod: There are no instances currently available",'
+                     '"status":500}')
 
 
 def _iso(ts: float) -> str:
@@ -95,6 +101,7 @@ class FakeRunpod:
         gone_delete_status: int = 404,
         create_answer_extra: dict[str, Any] | None = None,
         has_spend_limit: bool = True,
+        cuda_capacity: set[str] | None = None,
     ) -> None:
         self.clock = clock
         self.price = price
@@ -114,6 +121,7 @@ class FakeRunpod:
         self.gone_delete_status = gone_delete_status
         self.create_answer_extra = dict(create_answer_extra or {})  # fields of the new pod
         self.has_spend_limit = has_spend_limit  # GraphQL `spendLimit` is unverified (R2-10)
+        self.cuda_capacity = cuda_capacity  # None: capacity for every CUDA version
         self.pods: dict[str, FakePod] = {}
         self.volumes: list[dict[str, Any]] = []
         self.templates: list[dict[str, Any]] = []
@@ -250,6 +258,11 @@ class FakeRunpod:
         if path == "/pods" and m == "POST":
             body = json.loads(request.content)
             self.created_bodies.append(body)
+            cudas = body.get("allowedCudaVersions")
+            if self.cuda_capacity is not None and (
+                    not self.cuda_capacity if not cudas
+                    else not set(cudas) <= self.cuda_capacity):  # fmt: skip
+                return httpx.Response(500, text=NO_INSTANCES_BODY)
             self._n += 1
             pid = f"pod{self._n:04d}abc"
             now = self.clock.now()

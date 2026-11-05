@@ -153,6 +153,8 @@ class ProbeReport:
     zero: bool = False
     error: str | None = None
     notes: list[str] = field(default_factory=list[str])
+    # (cuda version, result) per POST /pods: created | no_capacity | unknown | <reason>
+    attempts: list[tuple[str, str]] = field(default_factory=list[tuple[str, str]])
 
 
 def _insert_probe_row(conn: sqlite3.Connection, provider: str, op_id: str, label: str,
@@ -213,7 +215,10 @@ async def lifecycle_probe(
     )  # fmt: skip
     try:
         try:
-            res = await adapter.create(spec, label, docker_start_cmd=list(start_cmd))
+            try:
+                res = await adapter.create(spec, label, docker_start_cmd=list(start_cmd))
+            finally:
+                rep.attempts = list(getattr(adapter, "last_create_attempts", []))
         except CreatedResourceRejected as exc:  # REV-S10: ref to the DB first, teardown next
             rep.error = exc.err.message
             rep.ref = exc.resource.ref

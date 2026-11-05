@@ -627,10 +627,13 @@ config_check() {  # config_check [PATH under $CONF] (default: the live config.ya
     if [ -s "$ETC/secrets/runpod" ]; then  # T-372: config-check reads the key file (never prints it)
         rp=(-v "$ETC/secrets/runpod:/run/s/runpod:ro" -e LLMHUB_RUNPOD_API_KEY_FILE=/run/s/runpod)
     fi
-    out=$(drun_once --network none --user "$UID_API:$UID_API" \
+    # same groups as llmhub-api: the weights secret is 0640 root:$UID_WAUTH
+    out=$(drun_once --network none --user "$UID_API:$UID_API" --group-add "$UID_WAUTH" \
         -v "$CONF:$CONF:ro" \
         -v "$ETC/secrets/label:/run/s/label:ro" -v "$ETC/secrets/instance:/run/s/instance:ro" \
+        -v "$ETC/secrets/weights:/run/s/weights:ro" \
         -e LLMHUB_LABEL_SECRET_FILE=/run/s/label -e LLMHUB_INSTANCE_SECRET_FILE=/run/s/instance \
+        -e LLMHUB_WEIGHTS_SECRET_FILE=/run/s/weights \
         "${rp[@]}" "$(image_id)" python -m llmhub config-check --config "$path") \
         || { fail "config-check"; return 1; }
     [ "$out" = ok ] || fail "config-check: $out"

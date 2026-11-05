@@ -1,7 +1,11 @@
 """RunpodAdapter (T-372 plan 3.3): Community Cloud GPU pods behind the ProviderAdapter protocol.
 
 Safety rules (each one has a test in tests/test_t372_runpod_adapter.py):
-1. `create` sends at most ONE `POST /pods`, never retried. Before it: the image is pinned by
+1. `create` sends at most ONE `POST /pods` per allowed CUDA version, never retried (L2b): the
+   versions are tried one at a time, highest first, each with `allowedCudaVersions: [v]` (a
+   list of several versions narrows the choice on the real API); the next version only after
+   a definite `no_capacity` refusal; success, any unknown outcome or any other refusal stops.
+   Before the first POST (once): the image is pinned by
    digest, the transport is `proxy`, the offer is an allowed GPU type whose current Community
    price (`communityPrice` with `communityCloud` true, R3-3) is
    <= min(spec.max_price_usd_h, price_ceiling_usd_h), and fewer than `max_live_pods`
@@ -110,6 +114,18 @@ def spec_port(spec: InstanceSpec) -> int:
         return DEFAULT_PORT
 
 
+def _cuda_key(v: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(x) for x in v.split("."))
+    except ValueError:
+        return ()
+
+
+def cuda_order(versions: Sequence[str]) -> list[str]:
+    """Allowed CUDA versions, highest first, without duplicates ("12.10" > "12.9")."""
+    return sorted(dict.fromkeys(versions), key=_cuda_key, reverse=True)
+
+
 def create_body(
     spec: InstanceSpec,
     label: str,
@@ -117,6 +133,7 @@ def create_body(
     gpu_type_id: str,
     *,
     docker_start_cmd: Sequence[str] | None = None,
+    cuda_versions: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """`POST /pods` body. Never `networkVolumeId`, `templateId`, `containerRegistryAuthId`."""
     body: dict[str, Any] = {
@@ -130,7 +147,8 @@ def create_body(
         "volumeInGb": 0,
         "ports": [f"{spec_port(spec)}/http"],
         "interruptible": False,
-        "allowedCudaVersions": list(cfg.allowed_cuda_versions),
+        "allowedCudaVersions": list(cfg.allowed_cuda_versions if cuda_versions is None
+                                    else cuda_versions),
         "env": {**dict(spec.env), **dict(spec.secret_env)},
     }
     if docker_start_cmd is not None:
@@ -218,6 +236,8 @@ class RunpodAdapter:
         # R3-5: pod id -> first time this process knew it (create answer, first get/destroy).
         # "400 and not in the list" means gone only once the list had time to show the pod.
         self._first_known: dict[str, float] = {}
+        # (cuda version, result) of the POSTs of the last `create` (lifecycle-probe report)
+        self.last_create_attempts: list[tuple[str, str]] = []
 
     def __repr__(self) -> str:
         return f"RunpodAdapter(cloud_type={self.cfg.cloud_type!r})"
@@ -287,6 +307,7 @@ class RunpodAdapter:
         *,
         docker_start_cmd: Sequence[str] | None = None,
     ) -> RemoteResource:
+        self.last_create_attempts = []
         if parse_label(label) is None:
             raise _refuse(UnavailableReason.DEPLOYMENT_ERROR, "label is not an llmhub label")
         if not IMAGE_DIGEST_RE.match(spec.image):
@@ -317,11 +338,10 @@ class RunpodAdapter:
         if len(live) >= self.cfg.max_live_pods:
             raise _refuse(UnavailableReason.QUOTA_EXCEEDED,
                           f"{len(live)} llmhub pods exist (max_live_pods={self.cfg.max_live_pods})")  # fmt: skip
-        body = create_body(spec, label, self.cfg, spec.offer_id, docker_start_cmd=docker_start_cmd)
-        try:
-            pod = await self.api.create_pod(body)
-        except RunpodHttpError as exc:
-            raise ProviderError(normalize_runpod_error(exc)) from None
+        versions = cuda_order(self.cfg.allowed_cuda_versions)
+        if not versions:
+            raise _refuse(UnavailableReason.DEPLOYMENT_ERROR, "no allowed cuda versions")
+        pod = await self._post_per_cuda(spec, label, versions, docker_start_cmd)
         self._first_known.setdefault(pod.id, self.clock.now())
         what = created_mismatch(pod, label, ceiling)
         if what is not None:
@@ -332,6 +352,40 @@ class RunpodAdapter:
                 f"created pod {pod.id} has unexpected {what}; destroy it", unknown=True,
             ), self._pod(pod), what)  # fmt: skip
         return self._pod(pod)
+
+    async def _post_per_cuda(
+        self,
+        spec: InstanceSpec,
+        label: str,
+        versions: Sequence[str],
+        docker_start_cmd: Sequence[str] | None,
+    ) -> PodInfo:
+        """One POST per version (highest first); the next only after a definite
+        `no_capacity`. Never a second POST after an unknown outcome."""
+        last: NormalizedError | None = None
+        for v in versions:
+            body = create_body(spec, label, self.cfg, spec.offer_id,
+                               docker_start_cmd=docker_start_cmd, cuda_versions=[v])  # fmt: skip
+            try:
+                pod = await self.api.create_pod(body)
+            except RunpodHttpError as exc:
+                err = normalize_runpod_error(exc)
+                no_cap = exc.code == "no_capacity" and not err.outcome_unknown
+                result = ("no_capacity" if no_cap
+                          else "unknown" if err.outcome_unknown else err.reason.value)  # fmt: skip
+                self.last_create_attempts.append((v, result))
+                if not no_cap:
+                    raise ProviderError(err) from None
+                log.info("runpod: no capacity with cuda %s", v)
+                last = err
+                continue
+            self.last_create_attempts.append((v, "created"))
+            return pod
+        assert last is not None
+        tried = ",".join(versions)
+        raise ProviderError(_err(UnavailableReason.GPU_UNAVAILABLE,
+                                 f"{last.message} (cuda {tried})", retryable=True,
+                                 status=last.http_status))  # fmt: skip
 
     async def get(self, ref: str) -> RemoteResource | None:
         if ref.startswith((REF_VOLUME, REF_TEMPLATE)):

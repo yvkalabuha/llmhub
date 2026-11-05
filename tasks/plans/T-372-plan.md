@@ -149,7 +149,7 @@ def pod_status(pod: PodInfo) -> RemoteStatus: ...
 def create_body(spec: InstanceSpec, label: str, cfg: RunpodConfig, gpu_type_id: str) -> dict[str, Any]: ...
 ```
 Правила (каждое — тест A4/A6):
-1. **create** — ровно один POST, без повторов.
+1. **create** — ровно один POST, без повторов. *Уточнено L2b (2026-11-04):* один POST на каждую версию из `allowed_cuda_versions` (по одной, от старшей; `allowedCudaVersions: [v]`); к следующей версии — только после определённого отказа `no_capacity` (реальный 500 `"no instances currently available"`); успех, неизвестный исход или иной отказ — стоп. Максимум POST = число версий.
    - До POST проверяется:
      - `spec.image` содержит `@sha256:<64 hex>`;
      - `transport == "proxy"`;
@@ -183,7 +183,7 @@ def create_body(spec: InstanceSpec, label: str, cfg: RunpodConfig, gpu_type_id: 
 class RunpodConfig(_Model):
     cloud_type: Literal["COMMUNITY"] = "COMMUNITY"
     gpu_type_ids: dict[str, str] = {"RTX3090": "NVIDIA GeForce RTX 3090"}
-    allowed_cuda_versions: list[str] = ["12.8", "12.9"]   # advocate F7b; field name checked in openapi
+    allowed_cuda_versions: list[str] = ["12.8", "12.9", "13.0"]   # advocate F7b; tried one by one, highest first (L2b)
     price_ceiling_usd_h: float = Field(default=0.50, gt=0, le=0.50)
     max_live_pods: int = Field(default=1, ge=1, le=4)
     list_staleness_s: float = Field(default=30, ge=0, le=600)
@@ -409,6 +409,7 @@ def build_provider_adapters(cfg: Config, env: Mapping[str, str], clock: Clock, *
 - [x] **I1.** Экспорт в `provider_adapters/__init__.py`. `docs/t372-live-test.md`: §6 как чек-лист с командами, правило конца сессии, включение и снятие сторожа. `docs/runbook.md` §8. `deploy/README.md` (§5).
 - [x] **I2.** `uv run pytest tests/test_t372_*.py tests/test_b_contract.py tests/test_f_provisioner.py tests/test_c_recovery.py tests/test_f_reaper.py tests/test_f_killswitch.py tests/test_e_ledger.py tests/test_fix2_t370.py -q`, затем `uv run ruff check` и `uv run pyright`. Полный прогон — перед релизом 0.3.0.
 - [x] **I3.** Релиз `nice -n 10 deploy/docker/build.sh` → 0.3.0. Деплой делает координатор.
+- [x] **L2b-fix.** Реальный 500 «no instances currently available» → `GPU_UNAVAILABLE` (определённый отказ); create перебирает версии CUDA по одной (13.0 → 12.9 → 12.8); `lifecycle-probe` пишет `attempts`; фейк моделирует ёмкость по версиям (`tests/test_t372_cuda_fallback.py`). dist/0.3.2 пересобран на месте.
 
 Ревью create/reconcile (A4–A6, C2): 2 независимых цикла (логика и гонки; сбои и перезапуски), ≤ 3 раундов.
 

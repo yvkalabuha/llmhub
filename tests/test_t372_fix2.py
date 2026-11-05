@@ -308,13 +308,13 @@ async def test_bad_community_price_is_a_parse_error(bad: Any) -> None:
 
 async def test_no_capacity_on_post_is_a_definite_refusal() -> None:
     """With stockStatus only a hint, capacity is decided by the POST: `no_capacity`
-    -> GPU_UNAVAILABLE, not an unknown outcome, exactly one POST."""
+    -> GPU_UNAVAILABLE, not an unknown outcome, exactly one POST per CUDA version (L2b)."""
     real = _Real(httpx.Response(500, text="There are no longer any instances available with "
                                           "the requested specifications."))  # fmt: skip
     with pytest.raises(ProviderError) as ei:
         await real.adapter().create(make_spec(), _label())
     assert ei.value.err.reason == UnavailableReason.GPU_UNAVAILABLE
-    assert not ei.value.err.outcome_unknown and real.posts == 1
+    assert not ei.value.err.outcome_unknown and real.posts == 3
 
 
 async def test_cost_after_create_still_checked() -> None:

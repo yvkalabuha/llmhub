@@ -4,7 +4,7 @@
 
 | ID | Задача | Тип | Статус | Зависит |
 |---|---|---|---|---|
-| T-372 | Этап 4: RunpodAdapter + тест RunPod ≤ $5 (код — review, исправления раунда 2, dist 0.3.2; живые P0, L0–L8 — координатор) | test | review | T-371 |
+| T-372 | Этап 4: RunpodAdapter + тест RunPod ≤ $5 (код — review, исправления раунда 2 + L2b (CUDA по одной, 500 no instances = no_capacity), dist 0.3.2 пересобран; живые P0, L0–L8 — координатор) | test | review | T-371 |
 
 ## Входящие
 <!-- "YYYY-MM-DD от <источник>: <что> (T-XXX)". -->
