@@ -8,6 +8,7 @@
 
 ## Входящие
 <!-- "YYYY-MM-DD от <источник>: <что> (T-XXX)". -->
+- 2026-11-05 от координатора T-372: sweeps reaper (15 с) и контроллера (60 с) ≈ 1080 REST/ч к RunPod; интервалы не настраиваются — архитектурная задача (новая).
 - 2026-11-04 от reviewer T-368: `integrity._try_open` считает «database is locked» порчей → карантин; отличать при старте (T-371).
 - 2026-11-04 от ворот T-369: nginx перед API — `proxy_read_timeout` > 480 с и `proxy_buffering off` для SSE (T-371).
 - 2026-11-04 от T-370: развернуть сервер весов по `deploy/README.md` — nginx-юнит, `llmhub-weights-auth` (`llmhub-wauth`, группа `llmhub`), сертификат, `LLMHUB_INSTANCE_SECRET`/`LLMHUB_WEIGHTS_SECRET`, суммы `sha256-T365.txt`, группа `llmhub` у `weights-acct.log`, опрос `/metrics`; tc/QoS — вопрос (T-371).
